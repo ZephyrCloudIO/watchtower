@@ -14,12 +14,12 @@ Create one durable, implementation-ready GitHub record per independently impleme
 - Follow all active system, developer, repository, and scoped `AGENTS.md` instructions. List `docs/` before investigating in this repository and treat applicable contracts as authoritative.
 - Use `gh` for the bounded GitHub writes defined by this skill when possible. Resolve the target from an explicit repository or issue URL, otherwise use the current Git remote.
 - Do not implement the recorded work, leave permanent source or documentation changes, update dependencies, generate committed artifacts, commit, push, create a pull request, deploy, or mutate production.
-- Do not transition into implementation later in the same invocation. Finish the issue record and require a separate explicit implementation task such as `$fix-issue`.
+- Do not transition into implementation later in the same invocation. Finish the issue record and require a separate explicit implementation task.
 - Treat creating an issue, correcting an open duplicate to the selected issue type, or adding one implementation-handoff comment to that duplicate as the only intended persistent mutations.
 - Prefer read-only investigation. Obtain separate authorization before any state-changing reproduction outside a local or isolated test environment.
 - Preserve secrets, credentials, personal data, customer data, and sensitive request values. Redact them from commands, logs, screenshots, artifacts, comments, and issue bodies.
 - Treat provider-console links, log queries, database rows, customer environments, reporter sessions, and local artifacts as supplementary evidence. Make the GitHub record actionable after those sources become inaccessible.
-- Do not invoke `$write-prd`, apply its `PRD` label, or set labels, assignees, milestones, projects, or other metadata unless the human explicitly invokes that skill or an applicable repository contract requires the metadata.
+- Do not apply a `PRD` label or set labels, assignees, milestones, projects, or other metadata unless an applicable repository contract requires the metadata.
 
 ## Investigation Tool Selection
 
