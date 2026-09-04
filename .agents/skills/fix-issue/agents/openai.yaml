@@ -1,7 +1,0 @@
-interface:
-  display_name: "Fix Issue"
-  short_description: "Fix GitHub issues into ready PRs"
-  default_prompt: "Use $fix-issue to resolve issues #123 and #124 and open ready PRs."
-
-policy:
-  allow_implicit_invocation: false
