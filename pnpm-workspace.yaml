@@ -1,0 +1,11 @@
+enableGlobalVirtualStore: true
+minimumReleaseAge: 2880
+
+packages:
+  - "apps/*"
+  - "packages/*"
+  - "crates/*"
+  - "servers/*"
+minimumReleaseAgeExclude:
+  # Renovate security update: yaml@2.8.3
+  - yaml@2.8.3

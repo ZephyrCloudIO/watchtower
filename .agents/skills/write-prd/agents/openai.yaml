@@ -1,0 +1,7 @@
+interface:
+  display_name: "Write PRD"
+  short_description: "Turn feature decisions into PRD issues"
+  default_prompt: "Use $write-prd to define a feature completely and file a GitHub issue."
+
+policy:
+  allow_implicit_invocation: false

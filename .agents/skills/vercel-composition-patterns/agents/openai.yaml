@@ -1,0 +1,4 @@
+interface:
+  display_name: "React Composition Patterns"
+  short_description: "Design scalable React component APIs"
+  default_prompt: "Use $vercel-composition-patterns to refactor these React components into a scalable API."

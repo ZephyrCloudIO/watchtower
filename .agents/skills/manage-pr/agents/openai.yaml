@@ -1,0 +1,7 @@
+interface:
+  display_name: "Manage PR"
+  short_description: "Monitor and repair GitHub PRs"
+  default_prompt: "Use $manage-pr to monitor and repair PR #123."
+
+policy:
+  allow_implicit_invocation: false

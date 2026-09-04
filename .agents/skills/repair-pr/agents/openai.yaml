@@ -1,0 +1,7 @@
+interface:
+  display_name: "Repair PR"
+  short_description: "Repair one GitHub PR pass"
+  default_prompt: "Use $repair-pr to repair PR #123 once."
+
+policy:
+  allow_implicit_invocation: false

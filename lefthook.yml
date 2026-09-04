@@ -1,0 +1,15 @@
+pre-commit:
+  parallel: false
+  jobs:
+    - name: biome
+      glob: "*.{js,ts,cjs,mjs,d.cts,d.mts,jsx,tsx,json,jsonc,css}"
+      run: pnpm exec biome check --write --unsafe --no-errors-on-unmatched {staged_files}
+      stage_fixed: true
+    - name: taplo
+      glob: "*.toml"
+      run: pnpm exec taplo format {staged_files}
+      stage_fixed: true
+    - name: cargo-fmt
+      glob: "*.rs"
+      run: cargo fmt -- {staged_files}
+      stage_fixed: true

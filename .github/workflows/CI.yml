@@ -1,0 +1,75 @@
+name: CI
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    types: [opened, synchronize, reopened]
+  merge_group:
+
+env:
+  CI: 1
+
+permissions:
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  repository-policy:
+    name: Repository policy
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out code
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Set up workspace
+        uses: ./.github/actions/setup-env
+
+      - name: Test immutable action reference validator
+        run: node --test scripts/validate-github-action-pins.test.mjs
+
+      - name: Validate immutable action references
+        run: node scripts/validate-github-action-pins.mjs
+
+  workspace-checks:
+    name: Workspace checks
+    needs: repository-policy
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out code
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Set up workspace
+        uses: ./.github/actions/setup-env
+
+      - name: Set up Rust
+        uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
+
+      - name: Check Biome
+        run: pnpm check:biome
+
+      - name: Check TOML formatting
+        run: pnpm check:toml
+
+      - name: Check Rust workspace
+        run: pnpm check:rust
+
+  ci-done:
+    name: Ok
+    needs:
+      - repository-policy
+      - workspace-checks
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fail when a required job failed
+        if: ${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') }}
+        run: exit 1
+
+      - name: Confirm required jobs
+        if: ${{ !(contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')) }}
+        run: echo "All required jobs completed."

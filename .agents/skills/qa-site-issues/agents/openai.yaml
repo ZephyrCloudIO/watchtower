@@ -1,0 +1,7 @@
+interface:
+  display_name: "QA Site Issues"
+  short_description: "Find site bugs and UX/UI issues"
+  default_prompt: "Use $qa-site-issues to QA <url>, capture screenshots, and create GitHub issues as you find bugs or UX/UI problems."
+
+policy:
+  allow_implicit_invocation: false

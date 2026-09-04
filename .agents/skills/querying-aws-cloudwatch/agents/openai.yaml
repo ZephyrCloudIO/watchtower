@@ -1,0 +1,4 @@
+interface:
+  display_name: "Query AWS CloudWatch"
+  short_description: "Query exported CloudWatch logs with SQL"
+  default_prompt: "Use $querying-aws-cloudwatch to analyze this exported CloudWatch log dataset with SQL."

@@ -1,0 +1,42 @@
+name: Claude Code Review
+
+on:
+  pull_request:
+    types: [opened, synchronize]
+
+permissions:
+  contents: read
+  pull-requests: read
+  issues: read
+  id-token: write
+
+jobs:
+  claude-review:
+    runs-on: ubuntu-latest
+    env:
+      CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+    steps:
+      - name: Skip when Claude OAuth is not configured
+        if: ${{ env.CLAUDE_CODE_OAUTH_TOKEN == '' }}
+        run: echo "Skipping Claude Code Review because CLAUDE_CODE_OAUTH_TOKEN is not configured."
+
+      - name: Check out repository
+        if: ${{ env.CLAUDE_CODE_OAUTH_TOKEN != '' }}
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 1
+
+      - name: Run Claude Code Review
+        if: ${{ env.CLAUDE_CODE_OAUTH_TOKEN != '' }}
+        uses: anthropics/claude-code-action@be7b93b1907a4abad570368f3c74b6fe3807510b # v1
+        with:
+          claude_code_oauth_token: ${{ env.CLAUDE_CODE_OAUTH_TOKEN }}
+          use_sticky_comment: true
+          prompt: |
+            REPO: ${{ github.repository }}
+            PR NUMBER: ${{ github.event.pull_request.number }}
+
+            Review this pull request for correctness, security, performance,
+            maintainability, and test coverage. Follow the applicable AGENTS.md
+            files and leave constructive, actionable feedback.
+          claude_args: "--allowed-tools Bash,WebSearch,WebFetch"

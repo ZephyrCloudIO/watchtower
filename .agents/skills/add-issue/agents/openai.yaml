@@ -1,0 +1,7 @@
+interface:
+  display_name: "Add Issue"
+  short_description: "Create deployment-aware GitHub issues"
+  default_prompt: "Use $add-issue to compare deployed behavior with latest main and create a decision-complete Bug, Feature, or Task issue only when work remains."
+
+policy:
+  allow_implicit_invocation: false

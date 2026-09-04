@@ -1,0 +1,7 @@
+interface:
+  display_name: "Handle QA Issue"
+  short_description: "QA existing issues and close passes"
+  default_prompt: "Use $handle-qa-issue to QA issue #123, comment the result, and close it if it passes."
+
+policy:
+  allow_implicit_invocation: false

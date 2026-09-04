@@ -1,0 +1,4 @@
+interface:
+  display_name: "PostgreSQL"
+  short_description: "Optimize and troubleshoot PostgreSQL"
+  default_prompt: "Use $postgres to review this PostgreSQL schema or query and recommend safe improvements."

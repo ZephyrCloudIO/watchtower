@@ -1,0 +1,34 @@
+{
+  "name": "watchtower",
+  "version": "0.0.0",
+  "private": true,
+  "packageManager": "pnpm@10.17.1",
+  "engines": {
+    "node": "24"
+  },
+  "scripts": {
+    "prepare": "./scripts/install-git-hooks.sh",
+    "check": "pnpm check:actions && pnpm check:biome && pnpm check:toml && pnpm check:rust",
+    "check:actions": "node --test scripts/validate-github-action-pins.test.mjs && node scripts/validate-github-action-pins.mjs",
+    "check:biome": "biome check .",
+    "check:toml": "taplo fmt --check",
+    "check:rust": "./scripts/check-rust.sh",
+    "lint": "biome lint .",
+    "lint:fix": "biome check --write --unsafe .",
+    "format": "biome format --write . && taplo fmt",
+    "format:check": "biome format . && taplo fmt --check",
+    "test": "node --test scripts/validate-github-action-pins.test.mjs && pnpm check:rust"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "2.4.16",
+    "@taplo/cli": "0.7.0",
+    "lefthook": "1.13.6",
+    "turbo": "2.9.14",
+    "yaml": "2.8.3"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "lefthook"
+    ]
+  }
+}

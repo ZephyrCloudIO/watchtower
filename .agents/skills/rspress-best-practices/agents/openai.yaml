@@ -1,0 +1,4 @@
+interface:
+  display_name: "Rspress Best Practices"
+  short_description: "Apply reliable Rspress documentation practices"
+  default_prompt: "Use $rspress-best-practices to review and improve this Rspress documentation site."

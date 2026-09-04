@@ -1,0 +1,9 @@
+[workspace]
+members  = ["crates/*", "servers/*"]
+resolver = "2"
+
+[workspace.package]
+authors    = ["Zephyr Cloud"]
+edition    = "2021"
+repository = "https://github.com/ZephyrCloudIO/Watchtower"
+version    = "0.0.0"
