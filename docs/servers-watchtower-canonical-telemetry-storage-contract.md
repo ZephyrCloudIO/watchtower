@@ -43,7 +43,7 @@ Every canonical record contains the following typed fields:
 | Field | Contract |
 | --- | --- |
 | `tenant_id` | The authorized tenant owning the record. |
-| `project_id` | The authorized project owning the record. |
+| `project_id` | The authorized project owning the record, serialized as a canonical lowercase UUID v7 at external boundaries and stored as PostgreSQL `uuid` in repository-owned relational state. |
 | `watchtower_id` | A Watchtower-generated canonical lowercase UUID v7 logical-record identifier. It is stable across reprocessing and is never supplied by an external protocol. |
 | `processing_generation` | A Processor-assigned immutable canonical lowercase UUID v7 identifier for a canonical result. It is serialized as a canonical lowercase UUID v7 at external boundaries and stored as PostgreSQL `uuid` in Processor selection state. Together with `watchtower_id`, it identifies a canonical row version. |
 | `accepted_at` | The time Watchtower durably accepts the record, serialized as UTC RFC 3339 with nanosecond precision. It is the retention and partitioning clock. |
@@ -69,10 +69,12 @@ or span ID, or any other external ID cannot be used interchangeably with
 ### Extension attributes
 
 Extension attributes are a flat, typed, namespaced collection. A value is only
-one of `null`, boolean, string, integer, float, or a homogeneous array of one
-primitive kind. Arrays cannot contain nested arrays or objects. Attribute names
-must include an owning namespace, and the namespace does not permit an
-unbounded raw structure.
+one of `null`, boolean, string, integer, finite float, or a homogeneous array of
+one primitive kind. Arrays cannot contain nested arrays or objects. Attribute
+names must include an owning namespace, and the namespace does not permit an
+unbounded raw structure. `NaN`, positive infinity, and negative infinity are
+rejected during normalization and never enter canonical storage, replay,
+reconciliation digests, or exports.
 
 Arbitrary nested JSON, opaque maps, unbounded payload fragments, credentials,
 and unrestricted customer payloads do not enter canonical storage. Values that
@@ -97,7 +99,7 @@ canonical telemetry.
 | Compatibility-only representations | The sole owning adapter for each protocol interface; authoritative only for that boundary | Request-scoped memory or an adapter-owned boundary defined by #16 or its signal contract | No canonical retention; never a shared persistence model |
 | Query projections | Query; authoritative only for read projection state | Query-owned ClickHouse databases or schemas | Rebuildable canonical-signal projections are retained for 90 days; derived-aggregate projections use their authoritative aggregate's lifecycle and retention window; all are purged with the project |
 | Query cache | Query; never authoritative | Encrypted Query-owned cache | At most 15 minutes; immediately invalidated for retention, deletion, or authorization changes |
-| Export objects | Query; non-authoritative customer-download artifacts | Encrypted Query-owned project-scoped S3 export prefix | Seven days from API `completed_at`; canceled, expired, retention-fenced, and deleted-project exports are removed or made inaccessible |
+| Export objects | Query; non-authoritative customer-download artifacts | Encrypted Query-owned project-scoped S3 export prefix | Seven days from API `completed_at` for successful artifacts; artifacts from any attempt that terminates without successful `completed`, including failed or canceled attempts, are removed or made inaccessible at terminal transition, and retention-fenced or deleted-project exports are removed or made inaccessible immediately |
 | Audit events | API for contract-level lifecycle and access audit authority | API-owned append-only PostgreSQL audit boundary | Detailed history follows #15; deleted projects retain only minimal anonymous evidence |
 | Retention policy registry | API; authoritative for shortened-retention duration policies, their current-time effective cutoffs, and restore cleanup | API-owned encrypted immutable S3 control-registry prefix, independent of API PostgreSQL backups | The active policy persists until superseded and its effective cutoff is computed from that duration at enforcement time; superseded versioned policy records are retained for 13 months and the active policy is loaded before restored owners accept traffic |
 | Deletion tombstone registry | API; authoritative for deletion fencing and restore cleanup | API-owned encrypted immutable S3 control-registry prefix, independent of API PostgreSQL backups | Non-customer-readable keyed tombstones retained for 13 months; loaded before restored owners accept traffic |
@@ -221,11 +223,14 @@ derived change and replay metadata. Query and every recovery or rebuild consumer
 retain the highest applied revision for each aggregate, ignore lower revisions,
 and apply an equal revision only when the aggregate state and selected source
 set match; a conflicting equal revision is rejected as an integrity conflict.
-Query projection rebuilds submit an authorized request for Processor to
-republish the eligible versioned canonical or derived changes. Query never reads
-Processor S3, Processor PostgreSQL, or Processor ClickHouse directly. Rebuilds
-are idempotent and cannot republish a deleted project. Consumers must understand
-every message schema version retained in the applicable replay horizon.
+Query projection rebuilds submit an authorized versioned `ProjectionRebuildV1`
+request for Processor to republish the eligible canonical or derived changes.
+Processor durably accepts an idempotent request before acknowledging it and
+publishes the existing versioned changes through the normal Processor-to-Query
+path. Query never reads Processor S3, Processor PostgreSQL, or Processor
+ClickHouse directly. Rebuilds are idempotent and cannot republish a deleted
+project. Consumers must understand every message schema version retained in the
+applicable replay horizon.
 
 ## Retention, Deletion, and Reprocessing
 
@@ -258,28 +263,32 @@ policy. Jobs owns scheduling and retrying each purge dispatch; on every run, the
 data owner applies the current-time effective cutoff and idempotently purges all
 newly expired data within 14 days. Before any restored or rebuilt API, Ingest,
 Processor, Query, or Jobs owner becomes ready, it obtains current retention-policy
-and deletion-tombstone registry snapshots from API and enforces them: each data
-owner reapplies its effective cutoff, fences excess data, and submits its durable
-recurring active-store purge schedule to Jobs; Jobs restores the associated
-scheduling and deletion fences. There is no cold archive.
+and deletion-tombstone registry snapshots from API and enforces them. Jobs obtains
+its snapshot through the versioned `ControlRegistrySnapshotV1` handoff and must
+persist it before readiness. Each data owner reapplies its effective cutoff,
+fences excess data, and submits its durable recurring active-store purge schedule
+to Jobs; Jobs restores the associated scheduling and deletion fences. There is no
+cold archive.
 
 Project deletion is project-wide. API creates a versioned deletion generation
 and keyed project tombstone in its append-only restore-independent registry,
 then requires durable acknowledgement from Ingest, Processor, Query, and Jobs
-before accepting the deletion; it fails closed until all acknowledge. Each owner
-fences the project for that generation before acknowledgement: Ingest rejects
-collection and pending raw handoffs, Processor rejects pending or replayed work
-and canonical or derived republishing, Query rejects reads, restoration, exports,
-and new projection rebuilds, and Jobs cancels and fences queued, retry,
-dead-letter, dispatchable, leased, and in-flight project work. Before Jobs
-acknowledges, it prevents further dispatch for that generation and rejects late
-execution outcomes so they cannot recreate project-scoped execution state. Query
-invalidates cache entries immediately. Active stores, including raw, canonical,
-derived, projections,
+that each has installed its fence and that project purge work is durably
+registered with Jobs before accepting the deletion; it fails closed until all
+acknowledge. Each owner fences the project for that generation before
+acknowledgement: Ingest rejects collection and pending raw handoffs, Processor
+rejects pending or replayed work and canonical or derived republishing, Query
+rejects reads, restoration, exports, and new projection rebuilds, and Jobs
+cancels and fences queued, retry, dead-letter, dispatchable, leased, and
+in-flight non-purge project work. Jobs persists the versioned purge schedule,
+dispatches idempotent owner-specific purge or anonymization commands, retries
+them until completion, and rejects late non-purge execution outcomes so they
+cannot recreate project-scoped execution state. Query invalidates cache entries
+immediately. Active stores, including raw, canonical, derived, projections,
 replay batches, export objects, and Jobs project-scoped operational state, are
 purged or irreversibly anonymized within 14 days. Backups are purged within 90
-days, and deleted project data is not restored from a backup. Before a restored API
-database accepts traffic, API loads the current registry and reapplies every
+days, and deleted project data is not restored from a backup. Before a restored
+API database accepts traffic, API loads the current registry and reapplies every
 current tombstone to identify, fence, and purge deleted-project rows. Before
 accepting deletion, API irreversibly removes every retention-policy registry
 version for the project. API retains the non-customer-readable registry tombstone
@@ -368,14 +377,20 @@ interface with the authorized actor, action, project, export context, and capped
 lifetime. Query independently validates the caller, current authorization
 projection, export ownership, and lifecycle state before issuing the opaque
 gateway URL and again for every download request; the URL expiry never exceeds
-object expiry. Authorization changes invalidate outstanding gateway URLs, and
-Query denies subsequent download requests. API never accesses Query object
-storage or signing credentials, and gateway URLs never grant direct object-store
-access. The URL is never issued for a deleted, unauthorized, revoked, or expired
-export. Deletion cancels active exports and revokes issued download access.
-Cancellation prevents publication of incomplete results and removes or
-invalidates the associated objects according to the seven-day export lifecycle
-anchored at `completed_at`.
+object expiry. For immediate revocation, API and Query use a synchronous
+revision-fenced handoff: every issued URL carries the API authorization
+revision, and API waits for Query to durably install an
+`AuthorizationRevocationFenceV1` revision before acknowledging an actor,
+project, or export revocation. Query rejects every issuance or download whose
+authorization revision is at or below the installed fence, regardless of
+asynchronous projection freshness. API never accesses Query object storage or
+signing credentials, and gateway URLs never grant direct object-store access.
+The URL is never issued for a deleted, unauthorized, revoked, or expired export.
+Deletion cancels active exports and revokes issued download access. Any attempt
+that terminates without successful `completed` prevents publication of
+incomplete results, fences late writes, and removes or invalidates all partial
+objects at terminal transition; only a successful artifact uses the seven-day
+lifecycle anchored at `completed_at`.
 
 Safe status and error responses expose no raw payload, secret, or unauthorized
 tenant/project information. The export-specific active-export and daily-request
@@ -496,7 +511,9 @@ platform-wide targets.
 The owning implementation contracts must make these scenarios testable:
 
 1. Store equivalent external event, trace, or span identifiers for two tenants
-   without Watchtower ID collision or cross-tenant disclosure.
+   without Watchtower ID collision or cross-tenant disclosure; verify project IDs
+   use the canonical UUID v7/PostgreSQL `uuid` representation and reject
+   non-finite extension floats before canonicalization.
 2. Fail S3, PostgreSQL, ClickHouse, and MSK operations before and after local
    commits; verify no false successful acceptance and idempotent recovery.
 3. Verify raw-object immutability, SHA-256 and size reconciliation, required
@@ -504,8 +521,10 @@ The owning implementation contracts must make these scenarios testable:
    enforcement, redelivery of unprocessed work after the MSK window expires,
    and generation-aware reconciliation of each completed handoff to a promoted
    canonical default or durable terminal disposition before raw retirement.
-4. Rebuild eligible canonical and derived Query projections through authorized
-   Processor republishing without direct Processor storage access; verify that
+4. Rebuild eligible canonical and derived Query projections through an
+   authorized, durably acknowledged Query-to-Processor `ProjectionRebuildV1`
+   request and Processor republishing without direct Processor storage access;
+   verify that
    canonical replay copies remain non-authoritative, have retention-homogeneous
    expiry, reconcile to their represented canonical versions, and reject a
    changed non-key canonical field when its identity pair is unchanged.
@@ -516,7 +535,8 @@ The owning implementation contracts must make these scenarios testable:
    disposition and retirement of policy-fenced raw handoffs;
    derived-aggregate recomputation without expired contributions; current-time
    duration enforcement; durable Jobs schedule registration before each owner
-   acknowledges a shortened policy; recurring Jobs-scheduled, owner-run active
+   acknowledges a shortened policy; durable project-purge registration before
+   deletion acknowledgement; recurring Jobs-scheduled, owner-run active
    purges of data that expires after policy installation within 14 days;
    purge or irreversible anonymization of Jobs project-scoped operational state;
    backup purge within 90 days; removal of every project retention-policy registry
@@ -532,9 +552,10 @@ The owning implementation contracts must make these scenarios testable:
    versioned completion outcomes and API-only lifecycle persistence, rejection
    of stale outcomes after cancellation or another terminal transition,
    Query-issued URLs no longer than their remaining object lifetime and
-   seven-day object expiry anchored at `completed_at`,
-   authorization recheck, rate limits, and oversized-request `resource_exhausted`
-   behavior.
+   seven-day object expiry anchored at `completed_at`, immediate cleanup of
+   failed or canceled partial objects, revision-fenced authorization revocation,
+   authorization recheck, rate limits, and oversized-request
+   `resource_exhausted` behavior.
 7. Reprocess a successful and a partially failed range; verify provenance,
    distinct processing generations, full-range promotion, preservation of the
    prior default result, ordered per-record selection revisions with stale

@@ -95,20 +95,28 @@ The allowed protocol and data-flow direction is:
 3. API accepts control-plane, release, artifact, and Sentry management
    commands. It publishes versioned change events. API may call Query's
    authenticated internal interfaces for Sentry management reads and authorized
-   export download-gateway issuance, and Processor's authenticated
+   export download-gateway issuance and `AuthorizationRevocationFenceV1` for
+   immediate export-download revocation, and Processor's authenticated
    `ExportWatermarkV1` interface at export creation, but never reads another
    component's persistence directly.
 4. Processor consumes Ingest handoff work and relevant API changes. It
-   publishes canonical and derived changes and answers API's versioned
-   export-watermark requests.
+   publishes canonical and derived changes, answers API's versioned
+   export-watermark requests, and accepts Query's authorized
+   `ProjectionRebuildV1` requests.
 5. Query consumes API changes and Processor changes into its own projections,
    indexes, and caches. It consumes API-authorized export work carrying
    Processor's watermark, publishes versioned export outcomes for API to record
-   customer-visible lifecycle transitions, and does not call another component
-   for persistence fallback.
+   customer-visible lifecycle transitions, submits authorized
+   `ProjectionRebuildV1` requests to Processor, and does not call another
+   component for persistence fallback.
 6. Jobs receives durable requests, owns scheduling and retry state, and
    dispatches versioned commands to the component owning the affected data.
-   That owner performs the idempotent side effect and publishes the outcome.
+   Data owners durably register retention and project-deletion purge work with
+   Jobs before acknowledging the corresponding policy or deletion. Jobs also
+   obtains the current retention-policy and deletion-tombstone snapshots through
+   its authenticated `ControlRegistrySnapshotV1` request to API before
+   readiness or after restoration. The owner performs the idempotent side effect
+   and publishes the outcome.
 7. Ingest, Processor, Query, and Jobs submit required evidence for break-glass,
    restoration, key, replication, backup, and restore actions to API through a
    versioned durable audit-evidence message. API validates the producer,
@@ -189,6 +197,32 @@ change watermark for that scope and, when applicable, the authoritative
 derived-state revision watermark. API persists the response and includes the
 watermarks in the versioned work sent to Jobs and Query; Query never infers an
 authoritative watermark from its local projection.
+
+The projection-rebuild handoff is a versioned unary Protobuf-over-HTTP call
+under `/internal/v1` from Query to Processor. Query sends a canonical lowercase
+UUID v7 `rebuild_id`, authorized tenant and project scope, `accepted_at` range,
+selected signals, derived-selection flag, correlation identifier, and
+idempotency key. Processor validates the authorization, retention, and deletion
+fences, durably records the request idempotently before acknowledging it, and
+republishes eligible versioned canonical or derived changes through its normal
+change path. The correlated response reports durable acceptance or a terminal
+safe error; Query never accesses Processor persistence directly.
+
+The registry-snapshot handoff is a versioned unary Protobuf-over-HTTP call under
+`/internal/v1` from Jobs to API. Jobs requests the current retention-policy and
+deletion-tombstone snapshots with its correlation and idempotency context. API
+returns the versioned snapshots and their highest generations; Jobs persists
+them before readiness and fails closed if the snapshot cannot be installed.
+Subsequent policy and deletion mutations use the same generation-aware durable
+handoffs, while this request repairs state after restoration or rebuild.
+
+The authorization-revocation fence is a versioned unary Protobuf-over-HTTP call
+under `/internal/v1` from API to Query. API sends the affected actor, project or
+export scope, the monotonic authorization revision, correlation identifier, and
+idempotency key before acknowledging the revocation. Query durably persists the
+highest fence and acknowledges it; gateway issuance and every download request
+must reject URLs at or below that fence even when the asynchronous security
+projection is still within its normal freshness boundary.
 
 | Canonical code | HTTP status |
 | --- | ---: |
@@ -325,8 +359,9 @@ become runtime acceptance criteria for the owning implementation issues:
    unary Protobuf HTTP to Query without direct Query persistence access.
 5. Perform a native or compatible query during API outage with a valid
    security projection, then cross its freshness boundary and fail closed.
-6. Redeliver a retention or deletion request and verify Jobs schedules it while
-   the data owner performs one idempotent effect without Jobs writing its store.
+6. Redeliver a retention or deletion request and verify Jobs durably schedules
+   it before acknowledgement while the data owner performs one idempotent
+   effect without Jobs writing its store.
 7. Reject forged tenant context, invalid workload identity, unauthorized
    broker access, and cross-tenant projection data.
 8. Exercise every canonical error mapping, deadline, cancellation, retryable
@@ -344,10 +379,16 @@ become runtime acceptance criteria for the owning implementation issues:
     returned values.
 14. Race export cancellation and terminal completion or failure, then verify
     revision fencing prevents a stale outcome from changing API state or
-    making an invalid artifact issuable.
+    making an invalid artifact issuable, and partial failed or canceled objects
+    are removed at terminal transition.
 15. Perform a required component break-glass or backup action while API is
     unavailable, retry its versioned audit evidence, and verify API alone
     appends the resulting audit event without direct storage writes.
+16. Revoke export authorization after URL issuance and verify the synchronous
+    revision fence blocks the next issuance and download despite stale
+    asynchronous projection state.
+17. Restore Jobs independently and verify it obtains and persists current
+    retention-policy and deletion-tombstone snapshots before readiness.
 
 ## Deferred Decisions and Non-Goals
 
