@@ -92,7 +92,7 @@ canonical telemetry.
 | Enriched records | Processor; authoritative only as processing input | Processor-owned encrypted S3 replay-batch prefix, with separate class metadata | Retained only as needed for replay, no longer than 90 days |
 | Canonical telemetry | Processor; authoritative for the four signal histories | Four independent ClickHouse canonical table families | Immutable history for 90 days from `accepted_at` |
 | Canonical replay representations | Processor; non-authoritative, immutable replay copies of canonical changes | Processor-owned encrypted project-scoped S3 replay-batch prefix with separate class metadata | 90 days from each represented record's `accepted_at`; purged with its project |
-| Default-generation selections | Processor; authoritative mapping of each `watchtower_id` to its promoted `processing_generation` | Processor-owned PostgreSQL selection state and versioned selection changes in Processor canonical replay batches | Retained while its canonical record is eligible; rebuilt from retained selection changes and validated against canonical history before Processor republishes it to Query after recovery |
+| Default-generation selections | Processor; authoritative mapping of each `watchtower_id` to its promoted `processing_generation` | Processor-owned PostgreSQL selection state and monotonically revisioned selection changes in Processor canonical replay batches | Retained while its canonical record is eligible; rebuilt from retained selection changes and validated against canonical history before Processor republishes it to Query after recovery |
 | Derived aggregates | Processor; authoritative for mutable derived results | Processor-owned PostgreSQL schemas and encrypted project-scoped derived replay batches | Retention-windowed to thirteen months from `accepted_at` by default or the shortened project policy; expired contributions are removed before they can remain represented in the aggregate, replay batches, or Query projections |
 | Compatibility-only representations | The sole owning adapter for each protocol interface; authoritative only for that boundary | Request-scoped memory or an adapter-owned boundary defined by #16 or its signal contract | No canonical retention; never a shared persistence model |
 | Query projections | Query; authoritative only for read projection state | Query-owned ClickHouse databases or schemas | Rebuildable canonical-signal projections are retained for 90 days; derived-aggregate projections use their authoritative aggregate's lifecycle and retention window; all are purged with the project |
@@ -246,13 +246,15 @@ handoff; Ingest records that disposition as completed, retires its outbox entry,
 and purges the corresponding raw object and acceptance metadata under the new
 policy. After installing its fence, each owner submits a durable recurring
 active-store purge schedule to Jobs for as long as the shortened policy remains
-active. Jobs owns scheduling and retrying each purge dispatch; on every run, the
+active. Jobs must durably persist that schedule before the owner acknowledges the
+policy. Jobs owns scheduling and retrying each purge dispatch; on every run, the
 data owner applies the current-time effective cutoff and idempotently purges all
-newly expired data within 14 days. Before a restored API database accepts
-traffic, API loads the current retention registry and republishes each policy;
-every restored owner reapplies its effective cutoff, fences excess data, and
-submits its durable recurring active-store purge schedule to Jobs before
-readiness. There is no cold archive.
+newly expired data within 14 days. Before any restored or rebuilt API, Ingest,
+Processor, Query, or Jobs owner becomes ready, it obtains current retention-policy
+and deletion-tombstone registry snapshots from API and enforces them: each data
+owner reapplies its effective cutoff, fences excess data, and submits its durable
+recurring active-store purge schedule to Jobs; Jobs restores the associated
+scheduling and deletion fences. There is no cold archive.
 
 Project deletion is project-wide. API creates a versioned deletion generation
 and keyed project tombstone in its append-only restore-independent registry,
@@ -292,11 +294,14 @@ updates that mapping only after full-range success. A partial or failed range
 never becomes the default and the prior default result remains active. Derived
 aggregate computation and publication use only rows selected by the authoritative
 default-generation mapping; candidate generations are excluded until promotion.
-Processor persists the mapping in its selection state and emits versioned
-selection changes with canonical replay metadata. After recovery or rebuild, it
-replays retained selection changes, validates the resulting mapping against
-canonical history, and only then republishes the selection to Query. External
-historical imports are not supported.
+Processor assigns every selection change a strictly monotonic per-`watchtower_id`
+selection revision, persists that revision with the mapping, and emits it with
+canonical replay metadata. Query and every recovery or rebuild consumer retain
+the highest applied revision for each record, ignore lower revisions, and treat
+an equal revision as an idempotent replay only when it has the same selection.
+After recovery or rebuild, Processor replays retained selection changes,
+validates the resulting mapping against canonical history, and only then
+republishes the selection to Query. External historical imports are not supported.
 
 ## Export Contract
 
@@ -305,10 +310,11 @@ work. Query produces selected-signal canonical and derived snapshots from its
 own projections into its encrypted project-scoped S3 export prefix. At export
 creation, Processor supplies the requested range's canonical change watermark
 and, when derived results are selected, the authoritative derived-state revision
-watermark. Query may mark the export complete only after its applicable
-projections reach those watermarks. The manifest records the watermarks and
-Query snapshot generation. Exports never include raw data, caches, or audit
-records.
+watermark. After its applicable projections reach those watermarks, Query emits
+a versioned export outcome containing the export identity, outcome, manifest,
+watermarks, and snapshot generation; API alone records the resulting lifecycle
+transition. The manifest records the watermarks and Query snapshot generation.
+Exports never include raw data, caches, or audit records.
 
 An export contains Parquet data and a JSON manifest with the schema version,
 authorized scope, selected signals, `accepted_at` range, object sizes, and
@@ -471,23 +477,27 @@ The owning implementation contracts must make these scenarios testable:
    leased, and in-flight work; rejection of late execution outcomes; terminal
    disposition and retirement of policy-fenced raw handoffs;
    derived-aggregate recomputation without expired contributions; current-time
-   duration enforcement; recurring Jobs-scheduled, owner-run active purges of
-   data that expires after policy installation within 14 days;
+   duration enforcement; durable Jobs schedule registration before each owner
+   acknowledges a shortened policy; recurring Jobs-scheduled, owner-run active
+   purges of data that expires after policy installation within 14 days;
    purge or irreversible anonymization of Jobs project-scoped operational state;
    backup purge within 90 days; removal of every project retention-policy registry
    record; restore-independent retention and tombstone-registry recovery before
-   restored owners accept traffic; export cancellation; cache invalidation; and
+   any restored or rebuilt owner accepts traffic; export cancellation; cache
+   invalidation; and
    minimal anonymous evidence.
 6. Export permitted signals and verify Parquet output, manifest checksums, row
    counts, independently recomputable canonical digest tuples, generation-aware
    canonical and revision-aware derived reconciliation summaries,
-   default-generation selection, Processor-to-Query watermark
-   completion, Query-issued URLs no longer than their remaining object lifetime,
+   default-generation selection, Processor-to-Query watermark completion,
+   Query-to-API versioned completion outcomes and API-only lifecycle persistence,
+   Query-issued URLs no longer than their remaining object lifetime,
    authorization recheck, rate limits, and oversized-request
    `resource_exhausted` behavior.
 7. Reprocess a successful and a partially failed range; verify provenance,
    distinct processing generations, full-range promotion, preservation of the
-   prior default result, selection-state recovery and republishing after a
+   prior default result, ordered per-record selection revisions with stale
+   delivery rejection, selection-state recovery and republishing after a
    Processor rebuild, generation-aware cross-stage reconciliation, derived
    aggregates exclude candidate generations, and consistent derived-aggregate
    lifecycle anchors after later contributions; reject a corrupted or truncated

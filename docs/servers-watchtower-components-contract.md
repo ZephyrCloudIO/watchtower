@@ -94,13 +94,14 @@ The allowed protocol and data-flow direction is:
    handoff work.
 3. API accepts control-plane, release, artifact, and Sentry management
    commands. It publishes versioned change events. API may call Query's
-   internal read interface for Sentry management reads, but never reads Query
-   persistence directly.
+   authenticated internal interfaces for Sentry management reads and authorized
+   export download-gateway issuance, but never reads Query persistence directly.
 4. Processor consumes Ingest handoff work and relevant API changes. It
    publishes canonical and derived changes.
 5. Query consumes API changes and Processor changes into its own projections,
-   indexes, and caches. It does not call another component for persistence
-   fallback.
+   indexes, and caches. It publishes versioned export outcomes for API to record
+   customer-visible lifecycle transitions and does not call another component for
+   persistence fallback.
 6. Jobs receives durable requests, owns scheduling and retry state, and
    dispatches versioned commands to the component owning the affected data.
    That owner performs the idempotent side effect and publishes the outcome.
