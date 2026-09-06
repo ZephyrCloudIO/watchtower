@@ -93,7 +93,7 @@ canonical telemetry.
 | Canonical telemetry | Processor; authoritative for the four signal histories | Four independent ClickHouse canonical table families | Immutable history for 90 days from `accepted_at` |
 | Canonical replay representations | Processor; non-authoritative, immutable replay copies of canonical changes | Processor-owned encrypted project-scoped S3 replay-batch prefix with separate class metadata | 90 days from each represented record's `accepted_at`; purged with its project |
 | Default-generation selections | Processor; authoritative mapping of each `watchtower_id` to its promoted `processing_generation` | Processor-owned PostgreSQL selection state and versioned selection changes in Processor canonical replay batches | Retained while its canonical record is eligible; rebuilt from retained selection changes and validated against canonical history before Processor republishes it to Query after recovery |
-| Derived aggregates | Processor; authoritative for mutable derived results | Processor-owned PostgreSQL schemas and encrypted project-scoped derived replay batches | Thirteen months from the greatest `accepted_at` of their currently represented source records; a shortened project policy requires retention-windowed recomputation that removes expired contributions |
+| Derived aggregates | Processor; authoritative for mutable derived results | Processor-owned PostgreSQL schemas and encrypted project-scoped derived replay batches | Retention-windowed to thirteen months from `accepted_at` by default or the shortened project policy; expired contributions are removed before they can remain represented in the aggregate, replay batches, or Query projections |
 | Compatibility-only representations | The sole owning adapter for each protocol interface; authoritative only for that boundary | Request-scoped memory or an adapter-owned boundary defined by #16 or its signal contract | No canonical retention; never a shared persistence model |
 | Query projections | Query; authoritative only for read projection state | Query-owned ClickHouse databases or schemas | Rebuildable canonical-signal projections are retained for 90 days; derived-aggregate projections use their authoritative aggregate's lifecycle and retention window; all are purged with the project |
 | Query cache | Query; never authoritative | Encrypted Query-owned cache | At most 15 minutes; immediately invalidated for retention, deletion, or authorization changes |
@@ -205,12 +205,11 @@ has the same effective lifecycle expiry, and Processor does not place items
 with different expiry deadlines in one object.
 Canonical replay batches are non-authoritative immutable copies, not a second
 canonical store; their separate metadata identifies the represented canonical
-versions for reconciliation and deletion. A derived aggregate's lifecycle anchor
-is the greatest `accepted_at` of its currently represented source records; each
-newer contribution advances that anchor. A shortened project policy instead
-requires a retention-windowed aggregate: Processor removes expired contributions
-by recomputing or deleting the aggregate before acknowledging the policy, and
-its replay batches and Query projections contain only that recomputed result.
+versions for reconciliation and deletion. Derived aggregates are
+retention-windowed: Processor removes expired contributions by recomputing or
+deleting each aggregate before they can outlive the applicable thirteen-month
+default or shortened project policy. Their replay batches and Query projections
+contain only that recomputed result.
 Query projection rebuilds submit an authorized request for Processor to
 republish the eligible versioned canonical or derived changes. Query never reads
 Processor S3, Processor PostgreSQL, or Processor ClickHouse directly. Rebuilds
@@ -246,15 +245,17 @@ to Jobs before readiness. There is no cold archive.
 
 Project deletion is project-wide. API creates a versioned deletion generation
 and keyed project tombstone in its append-only restore-independent registry,
-then requires durable acknowledgement from Ingest, Processor, and Query before
-accepting the deletion; it fails closed until all acknowledge. Each owner fences
-the project for that generation before acknowledgement: Ingest rejects collection
-and pending raw handoffs, Processor rejects pending or replayed work and
-canonical or derived republishing, and Query rejects reads, restoration, exports,
-and new projection rebuilds. Query invalidates cache entries immediately. Active
-stores, including raw, canonical, derived, projections, replay batches, and
-export objects, are purged within 14 days. Backups are purged within 90 days,
-and deleted project data is not restored from a backup. Before a restored API
+then requires durable acknowledgement from Ingest, Processor, Query, and Jobs
+before accepting the deletion; it fails closed until all acknowledge. Each owner
+fences the project for that generation before acknowledgement: Ingest rejects
+collection and pending raw handoffs, Processor rejects pending or replayed work
+and canonical or derived republishing, Query rejects reads, restoration, exports,
+and new projection rebuilds, and Jobs cancels and fences queued, retry,
+dead-letter, and dispatchable project work. Query invalidates cache entries
+immediately. Active stores, including raw, canonical, derived, projections,
+replay batches, export objects, and Jobs project-scoped operational state, are
+purged or irreversibly anonymized within 14 days. Backups are purged within 90
+days, and deleted project data is not restored from a backup. Before a restored API
 database accepts traffic, API loads the current registry and reapplies every
 current tombstone to identify, fence, and purge deleted-project rows. Before
 accepting deletion, API irreversibly removes every retention-policy registry
@@ -372,14 +373,17 @@ operational boundary.
 
 Raw and export objects are checksum-validated. Reconciliation compares
 like-for-like dimensions: raw acceptance and handoff compare logical
-`watchtower_id` counts and ordered ID digests; canonical histories and replay
-compare physical `(watchtower_id, processing_generation)` counts and ordered
-pair digests; and Query projections and canonical exports compare the
-authoritative default-generation selection at a common watermark. Derived
-projections and exports compare the selected aggregate state, aggregate
-revisions, and retention-windowed source set at a common derived-state revision
-watermark. Correlation-ID digests are compared only for represented records in
-the same dimension. A mismatch is not silently repaired or treated as successful
+`watchtower_id` counts and ordered ID digests; before Ingest retires its
+recoverable state, each successfully completed handoff is generation-aware
+reconciled to the authoritative default-generation selection or a durable
+terminal disposition; canonical histories and replay compare physical
+`(watchtower_id, processing_generation)` counts and ordered pair digests; and
+Query projections and canonical exports compare the authoritative
+default-generation selection at a common watermark. Derived projections and
+exports compare the selected aggregate state, aggregate revisions, and
+retention-windowed source set at a common derived-state revision watermark.
+Correlation-ID digests are compared only for represented records in the same
+dimension. A mismatch is not silently repaired or treated as successful
 completion.
 
 Immutable audit events are required for break-glass access, exports, deletion,
@@ -434,20 +438,24 @@ The owning implementation contracts must make these scenarios testable:
    commits; verify no false successful acceptance and idempotent recovery.
 3. Verify raw-object immutability, SHA-256 and size reconciliation, required
    MSK durability and seven-day default retention settings, shortened-policy
-   enforcement, and redelivery of unprocessed work after the MSK window expires.
+   enforcement, redelivery of unprocessed work after the MSK window expires,
+   and generation-aware reconciliation of each completed handoff to a promoted
+   canonical default or durable terminal disposition before raw retirement.
 4. Rebuild eligible canonical and derived Query projections through authorized
    Processor republishing without direct Processor storage access; verify that
    canonical replay copies remain non-authoritative, have retention-homogeneous
    expiry, and reconcile to their represented canonical versions.
-5. Shorten retention and delete a project; verify Ingest, Processor, and Query
-   install and enforce each policy fence before acknowledgement; fencing of
-   pending, handoff, or replayed excess work; terminal disposition and retirement
-   of policy-fenced raw handoffs; derived-aggregate recomputation without expired
-   contributions; current-time duration enforcement; Jobs-scheduled, owner-run
-   active purge within 14 days; backup purge within 90 days; removal of every
-   project retention-policy registry record; restore-independent retention and
-   tombstone-registry recovery before restored owners accept traffic; export
-   cancellation; cache invalidation; and minimal anonymous evidence.
+5. Shorten retention and delete a project; verify Ingest, Processor, Query, and
+   Jobs install and enforce each deletion fence before acknowledgement; fencing
+   of pending, handoff, replayed, queued, retry, dead-letter, and dispatchable
+   work; terminal disposition and retirement of policy-fenced raw handoffs;
+   derived-aggregate recomputation without expired contributions; current-time
+   duration enforcement; Jobs-scheduled, owner-run active purge within 14 days;
+   purge or irreversible anonymization of Jobs project-scoped operational state;
+   backup purge within 90 days; removal of every project retention-policy registry
+   record; restore-independent retention and tombstone-registry recovery before
+   restored owners accept traffic; export cancellation; cache invalidation; and
+   minimal anonymous evidence.
 6. Export permitted signals and verify Parquet output, manifest checksums, row
    counts, independently recomputable canonical digest tuples, generation-aware
    canonical and revision-aware derived reconciliation summaries,
