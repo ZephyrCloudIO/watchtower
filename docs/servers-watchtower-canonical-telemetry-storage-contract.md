@@ -44,7 +44,8 @@ Every canonical record contains the following typed fields:
 | --- | --- |
 | `tenant_id` | The authorized tenant owning the record. |
 | `project_id` | The authorized project owning the record. |
-| `watchtower_id` | A Watchtower-generated canonical lowercase UUID v7 record identifier. It is the canonical record key and is never supplied by an external protocol. |
+| `watchtower_id` | A Watchtower-generated canonical lowercase UUID v7 logical-record identifier. It is stable across reprocessing and is never supplied by an external protocol. |
+| `processing_generation` | A Processor-assigned immutable generation for a canonical result. Together with `watchtower_id`, it identifies a canonical row version. |
 | `accepted_at` | The time Watchtower durably accepts the record, serialized as UTC RFC 3339 with nanosecond precision. It is the retention and partitioning clock. |
 | `observed_at` | The source observation time serialized as UTC RFC 3339 with nanosecond precision, or an explicit typed `not_applicable` value. A missing field is not a not-applicable value. |
 | `environment` | A typed environment value. |
@@ -86,13 +87,13 @@ canonical telemetry.
 
 | Data class | Writer and authority | Storage boundary | Lifecycle |
 | --- | --- | --- | --- |
-| Raw accepted records and attachments | Ingest; authoritative for raw acceptance | Encrypted immutable S3 objects plus Ingest PostgreSQL acceptance metadata and outbox state | Seven days from `accepted_at`; never customer-downloadable |
+| Raw accepted records and attachments | Ingest; authoritative for raw acceptance | Encrypted immutable S3 objects plus Ingest PostgreSQL acceptance metadata and outbox state | At least seven days from `accepted_at`, and longer until Processor durably confirms handoff completion; never customer-downloadable |
 | Normalized records | Processor; authoritative only as processing input | Processor-owned encrypted S3 replay-batch prefix, with separate class metadata | Retained only as needed for replay, no longer than 90 days |
 | Enriched records | Processor; authoritative only as processing input | Processor-owned encrypted S3 replay-batch prefix, with separate class metadata | Retained only as needed for replay, no longer than 90 days |
 | Canonical telemetry | Processor; authoritative for the four signal histories | Four independent ClickHouse canonical table families | Immutable history for 90 days from `accepted_at` |
 | Derived aggregates | Processor; authoritative for mutable derived results | Processor-owned PostgreSQL schemas | Thirteen months unless a downstream contract selects a shorter policy |
 | Compatibility-only representations | The sole owning adapter for each protocol interface; authoritative only for that boundary | Request-scoped memory or an adapter-owned boundary defined by #16 or its signal contract | No canonical retention; never a shared persistence model |
-| Query projections | Query; authoritative only for read projection state | Query-owned ClickHouse databases or schemas | Rebuildable, retained for 90 days, and purged with the project |
+| Query projections | Query; authoritative only for read projection state | Query-owned ClickHouse databases or schemas | Rebuildable canonical-signal projections are retained for 90 days; derived-aggregate projections for 13 months unless their authoritative aggregate selects a shorter policy; all are purged with the project |
 | Query cache | Query; never authoritative | Encrypted Query-owned cache | At most 15 minutes; immediately invalidated for retention, deletion, or authorization changes |
 | Audit events | API for contract-level lifecycle and access audit authority | API-owned append-only PostgreSQL audit boundary | Detailed history follows #15; deleted projects retain only minimal anonymous evidence |
 | Processing and operational state | The component performing the operation | Its own PostgreSQL database or explicitly owned state boundary | Owned and retained by that component; no cross-component writer |
@@ -149,13 +150,16 @@ size, `accepted_at`, tenant, project, Watchtower ID, and outbox state. A raw
 record is not successfully acknowledged unless the immutable object exists,
 its digest and size have been verified, and the acceptance metadata and
 transactional outbox commit. Orphaned or incomplete attempts are reconciled
-without being reported as successful acceptance.
+without being reported as successful acceptance. The raw object, acceptance
+metadata, and recoverable handoff remain until Processor durably confirms
+completion; Ingest redelivers and reconciles pending handoffs if the seven-day
+MSK window expires.
 
 Canonical ClickHouse tables are partitioned monthly by `accepted_at` and
 ordered by:
 
 ```text
-tenant_id, project_id, signal, observed_at, watchtower_id
+tenant_id, project_id, observed_at, watchtower_id, processing_generation
 ```
 
 Every PostgreSQL multi-tenant table enables row-level security and requires
@@ -193,23 +197,29 @@ Processor owns encrypted, project-scoped canonical replay batches in S3 for 90
 days. Query projection rebuilds submit an authorized request for Processor to
 republish the eligible versioned changes. Query never reads Processor S3,
 Processor PostgreSQL, or Processor ClickHouse directly. Rebuilds are
-idempotent and cannot republish a deleted project.
+idempotent and cannot republish a deleted project. Consumers must understand
+every message schema version retained in this 90-day replay horizon.
 
 ## Retention, Deletion, and Reprocessing
 
 Retention is calculated from `accepted_at`. Authorized project administrators
 may shorten a project retention policy but may not extend it through this
-contract. A shortened policy immediately makes excess data inaccessible and
-schedules active-store purge within 14 days. There is no cold archive.
+contract. API records a versioned shortened policy and reports success only
+after Ingest and Query acknowledge it. Until acknowledgement, the mutation
+fails closed; once acknowledged, Ingest and Query apply the local policy
+projection to deny access to excess data while active-store purge is scheduled
+within 14 days. There is no cold archive.
 
 Project deletion is project-wide. Before deletion acceptance, collection,
 reads, restoration, exports, and new projection rebuilds are disabled. Query
 cache entries are invalidated immediately. Active stores, including raw,
 canonical, derived, projections, replay batches, and export objects, are purged
 within 14 days. Backups are purged within 90 days, and deleted project data is
-not restored from a backup. Only irreversible minimal evidence remains after
-project deletion: deletion timestamp, result, and correlation ID, retained for
-13 months without tenant-identifying or customer-payload content.
+not restored from a backup. API retains a non-customer-readable, keyed project
+deletion tombstone for 13 months so every restore can identify and purge rows
+for deleted projects. Only irreversible minimal evidence remains after project
+deletion: deletion timestamp, result, correlation ID, and the keyed tombstone,
+without tenant-identifying or customer-payload content.
 
 Reprocessing is bounded by project and `accepted_at` range. Each attempt records
 source data class, source and target schema or normalization versions,
@@ -217,17 +227,22 @@ processor release, request or job identity, correlation ID, checksums, counts,
 and outcome. Raw data is the source for ranges within its seven-day retention;
 after that, an eligible retained safe normalized replay batch is the source.
 
-A new result is a candidate until the complete requested range passes
-integrity validation. Promotion occurs only after full-range success. A
-partial or failed range never becomes the default and the prior default result
-remains active. External historical imports are not supported.
+A new result uses a new `processing_generation` and is a candidate until the
+complete requested range passes integrity validation. Processor records the
+authoritative default-generation mapping for each `watchtower_id`; promotion
+updates that mapping only after full-range success. A partial or failed range
+never becomes the default and the prior default result remains active. External
+historical imports are not supported.
 
 ## Export Contract
 
 API owns export authorization and customer-visible status. Jobs schedules the
 work. Query produces selected-signal canonical and derived snapshots from its
-own projections into a Query-owned encrypted S3 prefix. Exports never include
-raw data, caches, or audit records.
+own projections into a Query-owned encrypted S3 prefix. At export creation,
+Processor supplies the requested range's canonical change watermark; Query may
+mark the export complete only after its projection reaches that watermark. The
+manifest records the watermark and Query snapshot generation. Exports never
+include raw data, caches, or audit records.
 
 An export contains Parquet data and a JSON manifest with the schema version,
 authorized scope, selected signals, `accepted_at` range, object sizes, and
@@ -239,14 +254,20 @@ and a correlation ID.
 Export lifecycle states are `queued`, `running`, `completed`, `failed`,
 `canceled`, and `expired`. Export objects are retained for seven days. API
 rechecks authorization immediately before issuing a one-hour download URL;
-the URL is never issued for a deleted, unauthorized, or revoked project.
+it then calls Query's authenticated internal signing interface with the
+authorized actor, action, project, and export context. Query independently
+validates the caller, current authorization projection, export ownership, and
+lifecycle state before issuing the one-hour URL; API never accesses Query
+object storage or signing credentials. The URL is never issued for a deleted,
+unauthorized, or revoked project.
 Deletion cancels active exports and revokes issued download access. Cancellation
 prevents publication of incomplete results and removes or invalidates the
 associated objects according to the seven-day export lifecycle.
 
 Safe status and error responses expose no raw payload, secret, or unauthorized
-tenant/project information. Detailed authorization, roles, quotas, and
-credential behavior remain owned by #15.
+tenant/project information. The export-specific active-export and daily-request
+limits above are authoritative here; detailed authorization, roles,
+non-export quotas, and credential behavior remain owned by #15.
 
 ## Integrity, Observability, Audit, and Security
 
@@ -300,7 +321,7 @@ issues:
 
 | Issue | Remaining authority |
 | --- | --- |
-| #15 | Control-plane resources, WorkOS authentication, authorization, roles, project lifecycle, credentials, quotas, and detailed audit access |
+| #15 | Control-plane resources, WorkOS authentication, authorization, roles, project lifecycle, credentials, non-export quotas, and detailed audit access |
 | #16 | Sentry-compatible routes, DTOs, request semantics, and protocol compatibility mappings |
 | #17 | Ingestion admission, capacity behavior, and detailed durable raw-to-processing handoff |
 | #18 | Normalization, privacy processing, enrichment, and processing policy |
@@ -327,18 +348,22 @@ The owning implementation contracts must make these scenarios testable:
    without Watchtower ID collision or cross-tenant disclosure.
 2. Fail S3, PostgreSQL, ClickHouse, and MSK operations before and after local
    commits; verify no false successful acceptance and idempotent recovery.
-3. Verify raw-object immutability, SHA-256 and size reconciliation, and the
-   required MSK durability and seven-day retention settings.
+3. Verify raw-object immutability, SHA-256 and size reconciliation, required
+   MSK durability and seven-day retention settings, and redelivery of
+   unprocessed work after the MSK window expires.
 4. Rebuild an eligible Query projection through authorized Processor
    republishing without direct Processor storage access.
-5. Shorten retention and delete a project; verify immediate inaccessibility,
-   active purge within 14 days, backup purge within 90 days, export
-   cancellation, cache invalidation, and minimal anonymous evidence.
+5. Shorten retention and delete a project; verify policy acknowledgement and
+   immediate access denial, active purge within 14 days, backup purge within
+   90 days, tombstone-enforced restore cleanup, export cancellation, cache
+   invalidation, and minimal anonymous evidence.
 6. Export permitted signals and verify Parquet output, manifest checksums,
-   authorization recheck, one-hour URLs, rate limits, and oversized-request
-   `resource_exhausted` behavior.
+   Processor-to-Query watermark completion, Query-issued one-hour URLs,
+   authorization recheck, rate limits, and oversized-request `resource_exhausted`
+   behavior.
 7. Reprocess a successful and a partially failed range; verify provenance,
-   full-range promotion, and preservation of the prior default result.
+   distinct processing generations, full-range promotion, and preservation of
+   the prior default result.
 8. Attempt cross-tenant access through PostgreSQL, ClickHouse, S3, MSK,
    projections, exports, and break-glass workflows; verify denial and required
    audit evidence.
