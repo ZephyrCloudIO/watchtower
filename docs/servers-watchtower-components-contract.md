@@ -227,9 +227,10 @@ Live reload is limited to mTLS certificates, CA bundles, and broker, storage,
 or service credentials. Invalid reloads retain the last-known-good value and
 emit an operational alert. All other configuration changes require deployment.
 
-Detailed roles, WorkOS behavior, credential lifecycle, PII handling, retention,
-deletion, abuse controls, and compliance gates remain owned by issues #15 and
-#18.
+Detailed roles, WorkOS behavior, credential lifecycle, abuse controls, and
+compliance gates remain owned by issue #15; PII handling remains owned by issue
+#18. Telemetry retention and deletion lifecycle rules are authoritative in
+`docs/servers-watchtower-canonical-telemetry-storage-contract.md`.
 
 ## Deployment and Operations
 

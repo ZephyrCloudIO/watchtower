@@ -137,15 +137,15 @@ writes another component's authority.
 
 | Data class | Sole writer and authority | Lifecycle and storage boundary |
 | --- | --- | --- |
-| Raw accepted data | Ingest | Immutable accepted protocol bytes and bounded metadata in Ingest-owned S3 raw-object resources. Retained seven days from `accepted_at`; inaccessible to customers and Query. |
-| Attachments | Ingest | Ingest-owned S3 resources, subject to the same seven-day retention and deletion rules as raw data. |
-| Handoff and outbox state | Ingest | Ingest-owned PostgreSQL state and Ingest-owned MSK handoff namespace. Retained seven days from `accepted_at`, or until the shorter applicable project policy, with reconciliation state retained for that lifecycle. |
+| Raw accepted data | Ingest | Immutable accepted protocol bytes and bounded metadata in Ingest-owned S3 raw-object resources. Retained seven days from `accepted_at`; an acknowledged record awaiting successful normalization is retained with its recoverable handoff until that normalization completes. Inaccessible to customers and Query. |
+| Attachments | Ingest | Ingest-owned S3 resources, subject to the same seven-day retention and deletion rules as raw data, including retention with an acknowledged incomplete handoff until successful normalization. |
+| Handoff and outbox state | Ingest | Ingest-owned PostgreSQL state and Ingest-owned MSK handoff namespace. Retained seven days from `accepted_at`, or until the shorter applicable project policy, except that an acknowledged incomplete handoff and its reconciliation state are retained until successful normalization. |
 | Normalized data | Processor | Processor-owned safe-normalized records and processing state. Raw reprocessing is available for seven days; safe-normalized records are retained for reprocessing otherwise, within the 90-day canonical/replay horizon. |
 | Enriched data | Processor | Processor-owned processing artifacts. Enrichment is not an independent authority; retained enriched artifacts follow the 90-day Processor processing horizon and are deleted with the project. |
 | Canonical telemetry | Processor | The four physical canonical schemas in Processor-owned ClickHouse resources. Retained 90 days from `accepted_at`. |
 | Derived data | Processor | Processor-owned mutable aggregates and derived domain state. Retained 13 months from `accepted_at`; semantics remain with the owning downstream domain issue. |
 | Compatibility-only data | The external adapter that creates it | Transient protocol DTOs and bounded compatibility mappings at API or Query boundaries. They are never canonical persistence, never a raw-payload escape hatch, and are not a shared storage class. |
-| Query projection | Query | Query-owned read projections and indexes derived from authorized Processor or API messages. Retained 90 days from the source record's `accepted_at`, subject to earlier project policy. |
+| Query projection | Query | Query-owned read projections and indexes derived from authorized Processor or API messages. Processor-canonical projections follow the source record's 90-day `accepted_at` retention; Processor-derived projections follow the source's 13-month retention; API control and security projections remain until replaced or tombstoned by their authority. All are subject to earlier project policy. |
 | Query cache | Query | Query-owned cache entries derived from Query projections. Entries never outlive their source retention, are invalidated on deletion or shortening, and are not authoritative. |
 | Replay batch | Processor | Project-scoped encrypted Processor S3 batches used for authorized replay and Query rebuild. Retained 90 days from the records' `accepted_at`; Query receives republished messages and never reads these objects. |
 | Audit evidence | The component that owns the audited action | Component-local audit stores or streams, with one writer per component-local audit boundary. Audit records contain actor/action/scope/result/correlation and integrity evidence, never raw customer payloads or credentials. Operational history and minimal irreversible deletion evidence are retained 13 months. |
@@ -160,7 +160,9 @@ projection rather than persisting a protocol-shaped copy of canonical data.
 All managed RDS PostgreSQL, ClickHouse Cloud on AWS, Amazon S3, and Amazon MSK
 resources for this contract are in `us-east-1`. Resource ownership is
 exclusive: a component receives credentials and ACLs for its own database,
-tables, buckets/prefixes, topics, consumer groups, and operational state only.
+tables, buckets/prefixes, topics, consumer groups, and operational state. A
+designated downstream consumer additionally receives read-only access to its
+producer's MSK topic; the consumer owns its consumer groups.
 Logical separation is not permission to bypass the owner of another logical
 resource.
 
@@ -173,10 +175,12 @@ resource.
 | Jobs | PostgreSQL scheduling, lease, dead-letter, and execution-history state. Jobs does not write domain-owned telemetry, projection, or control-plane stores. |
 | Web | No server-authoritative storage. Browser-local state is bounded and cannot contain a server-authoritative telemetry copy. |
 
-No component reads or writes another component's RDS, ClickHouse, S3, or MSK
-resource directly. Recovery uses a versioned owner interface or durable
-message. A component outage never authorizes a persistence fallback in another
-component.
+No component reads or writes another component's RDS, ClickHouse, or S3
+resource directly. Producer-owned MSK topics are read only by their designated
+downstream consumers: Processor consumes Ingest handoffs, and Query consumes
+authorized Processor and API changes. Recovery uses a versioned owner interface
+or durable message. A component outage never authorizes a persistence fallback
+in another component.
 
 ### Environment and tenant isolation
 
@@ -261,9 +265,9 @@ partition; it must not be inferred from broker arrival order.
 
 Canonical schema versions and normalization versions are immutable. A behavior
 change creates a new version and preserves the provenance and source range
-that produced each record. Consumers support N and N-1 message and canonical
-versions throughout the replay horizon; rollout and rollback cannot require a
-consumer to understand a version older than that horizon.
+that produced each record. Consumers support every message and canonical
+version retained within the replay horizon; rollout and rollback cannot require
+a consumer to understand a version older than that horizon.
 
 Raw records are reprocessable for seven days. After raw retention expires,
 Processor uses retained safe-normalized records for eligible reprocessing. A
@@ -287,12 +291,15 @@ non-default until validation and reconciliation complete.
 
 ## Retention and Deletion
 
-All retention periods are measured from `accepted_at`.
+Telemetry-derived retention periods are measured from `accepted_at`. API
+control and security projections instead follow their authority's replacement
+or tombstone lifecycle.
 
 | Data | Default maximum retention |
 | --- | ---: |
 | Raw data, attachments, and handoff state | 7 days |
-| Canonical telemetry, safe-normalized reprocessing records, replay batches, and Query projections | 90 days |
+| Canonical telemetry, safe-normalized reprocessing records, and replay batches | 90 days |
+| Query projections | Their source authority's lifetime: 90 days for canonical telemetry, 13 months for derived data, and until replacement or tombstone for API control and security state |
 | Mutable aggregates and operational history | 13 months |
 
 Caches, enriched artifacts, compatibility mappings, and export artifacts must
@@ -303,14 +310,15 @@ excess data from authorized reads, exports, and rebuilds, then schedules active
 store purge within 14 days.
 
 Deletion is project-wide only; per-record, per-signal, and partial deletion
-are not canonical lifecycle operations. Before deletion acceptance is
-recorded, the project is placed behind a deletion gate that disables:
+are not canonical lifecycle operations. When deletion acceptance is recorded,
+every owner persists the project deletion tombstone and checks it before every
+write. The project is placed behind a deletion gate that disables:
 
 - new collection;
 - reads and query projections;
 - restoration and replay;
 - exports and download renewal; and
-- cache refreshes or rebuilds.
+- cache refreshes, rebuilds, and all processing writes from delayed handoffs.
 
 After acceptance, the owners coordinate idempotent deletion through versioned
 messages and local outboxes:
@@ -328,9 +336,10 @@ messages and local outboxes:
   metadata, timestamps, correlation, and integrity evidence.
 
 Deletion completion is not acknowledged until each owner reports its local
-purge or an explicit safe terminal outcome. Re-delivery is idempotent. Any
-failure leaves collection, reads, restoration, exports, and rebuilds disabled
-and pages the owning operators.
+purge or an explicit safe terminal outcome, and the owner has established a
+durable queue and reconciliation barrier proving delayed work cannot recreate
+the project. Re-delivery is idempotent. Any failure leaves collection, reads,
+restoration, exports, and rebuilds disabled and pages the owning operators.
 
 ## Security and Export Boundaries
 
@@ -404,22 +413,26 @@ tests:
    both valid and invalid `observed_at`/`observed_at_status` combinations.
 4. Stop Processor before and after Ingest acknowledgement. Confirm that only
    durable raw acceptance plus handoff produces success, that canonical and
-   Query visibility remain asynchronous, and that reconciliation recovers the
-   handoff without a distributed transaction.
+   Query visibility remain asynchronous, that only designated consumers can
+   read producer-owned topics with their own consumer groups, and that
+   reconciliation recovers the handoff without a distributed transaction.
 5. Redeliver messages and replay ranges. Confirm at-least-once idempotency,
-   no global-order assumption, N/N-1 compatibility, duplicate/gap detection,
+   no global-order assumption, compatibility with every version retained in the
+   replay horizon, duplicate/gap detection,
    provenance, and range-level validation before defaulting a new version.
 6. Rebuild a Query projection through Processor republishing, confirm Query
    never reads Processor S3, and verify that deleted projects are not
    republished or restored after their deletion deadline.
-7. Exercise seven-day raw retention, safe-normalized reprocessing, 90-day
-   canonical/replay/projection retention, 13-month aggregate/operational
-   history, and an authorized shortened policy with immediate hiding and a
-   14-day purge deadline.
-8. Accept a project-wide deletion and verify collection, reads, restoration,
-   exports, cache refresh, and rebuild are disabled before acceptance; active
-   purge, backup purge, export cancellation, cache invalidation, and minimal
-   evidence follow their deadlines.
+7. Exercise seven-day raw retention after successful normalization, recovery of
+   an acknowledged handoff delayed beyond seven days, 90-day canonical/replay
+   retention, source-authority projection retention, 13-month aggregate/
+   operational history, and an authorized shortened policy with immediate
+   hiding and a 14-day purge deadline.
+8. Accept a project-wide deletion and verify the persistent tombstone blocks
+   collection, reads, restoration, exports, cache refresh, rebuild, and delayed
+   processing writes before purge completion; active purge, backup purge, export
+   cancellation, queue barriers, cache invalidation, and minimal evidence follow
+   their deadlines.
 9. Exercise authorized and unauthorized exports, tenant/project filter
    failures, size limits, Parquet manifests, checksum validation, URL expiry
    and reauthorization, rate limits, cancellation, and safe oversized-request
