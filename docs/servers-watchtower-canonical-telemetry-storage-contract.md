@@ -91,7 +91,7 @@ canonical telemetry.
 | Normalized records | Processor; authoritative only as processing input | Processor-owned encrypted S3 replay-batch prefix, with separate class metadata | Retained only as needed for replay, no longer than 90 days |
 | Enriched records | Processor; authoritative only as processing input | Processor-owned encrypted S3 replay-batch prefix, with separate class metadata | Retained only as needed for replay, no longer than 90 days |
 | Canonical telemetry | Processor; authoritative for the four signal histories | Four independent ClickHouse canonical table families | Immutable history for 90 days from `accepted_at` |
-| Derived aggregates | Processor; authoritative for mutable derived results | Processor-owned PostgreSQL schemas | Thirteen months unless a downstream contract selects a shorter policy |
+| Derived aggregates | Processor; authoritative for mutable derived results | Processor-owned PostgreSQL schemas and encrypted project-scoped derived replay batches | Thirteen months unless a downstream contract selects a shorter policy |
 | Compatibility-only representations | The sole owning adapter for each protocol interface; authoritative only for that boundary | Request-scoped memory or an adapter-owned boundary defined by #16 or its signal contract | No canonical retention; never a shared persistence model |
 | Query projections | Query; authoritative only for read projection state | Query-owned ClickHouse databases or schemas | Rebuildable canonical-signal projections are retained for 90 days; derived-aggregate projections for 13 months unless their authoritative aggregate selects a shorter policy; all are purged with the project |
 | Query cache | Query; never authoritative | Encrypted Query-owned cache | At most 15 minutes; immediately invalidated for retention, deletion, or authorization changes |
@@ -194,11 +194,12 @@ MSK handoff and canonical-change topics retain data for seven days and use:
 - producer `acks=all`.
 
 Processor owns encrypted, project-scoped canonical replay batches in S3 for 90
-days. Query projection rebuilds submit an authorized request for Processor to
-republish the eligible versioned changes. Query never reads Processor S3,
-Processor PostgreSQL, or Processor ClickHouse directly. Rebuilds are
-idempotent and cannot republish a deleted project. Consumers must understand
-every message schema version retained in this 90-day replay horizon.
+days and derived replay batches for 13 months. Query projection rebuilds submit
+an authorized request for Processor to republish the eligible versioned
+canonical or derived changes. Query never reads Processor S3, Processor
+PostgreSQL, or Processor ClickHouse directly. Rebuilds are idempotent and
+cannot republish a deleted project. Consumers must understand every message
+schema version retained in the applicable replay horizon.
 
 ## Retention, Deletion, and Reprocessing
 
@@ -210,16 +211,21 @@ fails closed; once acknowledged, Ingest and Query apply the local policy
 projection to deny access to excess data while active-store purge is scheduled
 within 14 days. There is no cold archive.
 
-Project deletion is project-wide. Before deletion acceptance, collection,
-reads, restoration, exports, and new projection rebuilds are disabled. Query
-cache entries are invalidated immediately. Active stores, including raw,
-canonical, derived, projections, replay batches, and export objects, are purged
-within 14 days. Backups are purged within 90 days, and deleted project data is
-not restored from a backup. API retains a non-customer-readable, keyed project
-deletion tombstone for 13 months so every restore can identify and purge rows
-for deleted projects. Only irreversible minimal evidence remains after project
-deletion: deletion timestamp, result, correlation ID, and the keyed tombstone,
-without tenant-identifying or customer-payload content.
+Project deletion is project-wide. API creates a versioned deletion generation
+and keyed project tombstone, then requires durable acknowledgement from Ingest,
+Processor, and Query before accepting the deletion; it fails closed until all
+acknowledge. Each owner fences the project for that generation before
+acknowledgement: Ingest rejects collection and pending raw handoffs, Processor
+rejects pending or replayed work and canonical or derived republishing, and
+Query rejects reads, restoration, exports, and new projection rebuilds. Query
+invalidates cache entries immediately. Active stores, including raw, canonical,
+derived, projections, replay batches, and export objects, are purged within 14
+days. Backups are purged within 90 days, and deleted project data is not
+restored from a backup. API retains the non-customer-readable tombstone for 13
+months so every restore can identify and purge rows for deleted projects. Only
+irreversible minimal evidence remains after project deletion: deletion
+timestamp, result, correlation ID, and the keyed tombstone, without
+tenant-identifying or customer-payload content.
 
 Reprocessing is bounded by project and `accepted_at` range. Each attempt records
 source data class, source and target schema or normalization versions,
@@ -246,10 +252,14 @@ include raw data, caches, or audit records.
 
 An export contains Parquet data and a JSON manifest with the schema version,
 authorized scope, selected signals, `accepted_at` range, object sizes, and
-SHA-256 checksums. A project may have one active export and at most three
+SHA-256 checksums. For every Parquet object, the manifest also records a row
+count and deterministic reconciliation summaries: ordered Watchtower-ID and
+correlation-ID digests where those fields are represented, or ordered derived
+aggregate-key digests for derived rows. These summaries are the export
+reconciliation source. A project may have one active export and at most three
 export requests per UTC day. Each signal range is limited to 31 days and 100
-GiB uncompressed. A larger request fails safely with `resource_exhausted`
-and a correlation ID.
+GiB uncompressed. A larger request fails safely with `resource_exhausted` and
+a correlation ID.
 
 Export lifecycle states are `queued`, `running`, `completed`, `failed`,
 `canceled`, and `expired`. Export objects are retained for seven days. API
@@ -351,13 +361,16 @@ The owning implementation contracts must make these scenarios testable:
 3. Verify raw-object immutability, SHA-256 and size reconciliation, required
    MSK durability and seven-day retention settings, and redelivery of
    unprocessed work after the MSK window expires.
-4. Rebuild an eligible Query projection through authorized Processor
-   republishing without direct Processor storage access.
-5. Shorten retention and delete a project; verify policy acknowledgement and
+4. Rebuild eligible canonical and thirteen-month derived Query projections
+   through authorized Processor republishing without direct Processor storage
+   access.
+5. Shorten retention and delete a project; verify policy acknowledgement,
+   deletion-generation acknowledgement and fencing of pending or replayed work,
    immediate access denial, active purge within 14 days, backup purge within
    90 days, tombstone-enforced restore cleanup, export cancellation, cache
    invalidation, and minimal anonymous evidence.
-6. Export permitted signals and verify Parquet output, manifest checksums,
+6. Export permitted signals and verify Parquet output, manifest checksums, row
+   counts, deterministic identifier reconciliation summaries,
    Processor-to-Query watermark completion, Query-issued one-hour URLs,
    authorization recheck, rate limits, and oversized-request `resource_exhausted`
    behavior.

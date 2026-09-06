@@ -77,9 +77,9 @@ route versions. Compatibility DTOs remain at external adapters and never
 become canonical Watchtower domain or persistence models.
 
 This project does not yet define the supported Sentry version, individual
-endpoint catalog, detailed authorization behavior, canonical data model,
-persistence topology, query semantics, UI state, or migration behavior. Each
-must be established in its owning downstream contract before implementation.
+endpoint catalog, detailed authorization behavior, query semantics, UI state,
+or migration behavior. Each must be established in its owning downstream
+contract before implementation.
 
 ## Current Status
 
