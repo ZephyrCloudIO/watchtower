@@ -45,7 +45,7 @@ Every canonical record contains the following typed fields:
 | `tenant_id` | The authorized tenant owning the record. |
 | `project_id` | The authorized project owning the record. |
 | `watchtower_id` | A Watchtower-generated canonical lowercase UUID v7 logical-record identifier. It is stable across reprocessing and is never supplied by an external protocol. |
-| `processing_generation` | A Processor-assigned immutable generation for a canonical result. Together with `watchtower_id`, it identifies a canonical row version. |
+| `processing_generation` | A Processor-assigned immutable canonical lowercase UUID v7 identifier for a canonical result. It is serialized as a canonical lowercase UUID v7 at external boundaries and stored as PostgreSQL `uuid` in Processor selection state. Together with `watchtower_id`, it identifies a canonical row version. |
 | `accepted_at` | The time Watchtower durably accepts the record, serialized as UTC RFC 3339 with nanosecond precision. It is the retention and partitioning clock. |
 | `observed_at` | The source observation time serialized as UTC RFC 3339 with nanosecond precision, or an explicit typed `not_applicable` value. A missing field is not a not-applicable value. |
 | `environment` | A typed environment value. |
@@ -92,7 +92,7 @@ canonical telemetry.
 | Enriched records | Processor; authoritative only as processing input | Processor-owned encrypted S3 replay-batch prefix, with separate class metadata | Retained only as needed for replay, no longer than 90 days |
 | Canonical telemetry | Processor; authoritative for the four signal histories | Four independent ClickHouse canonical table families | Immutable history for 90 days from `accepted_at` |
 | Canonical replay representations | Processor; non-authoritative, immutable replay copies of canonical changes | Processor-owned encrypted project-scoped S3 replay-batch prefix with separate class metadata | 90 days from each represented record's `accepted_at`; purged with its project |
-| Default-generation selections | Processor; authoritative mapping of each `watchtower_id` to its promoted `processing_generation` | Processor-owned PostgreSQL selection state and monotonically revisioned selection changes in Processor canonical replay batches | Retained while its canonical record is eligible; rebuilt from retained selection changes and validated against canonical history before Processor republishes it to Query after recovery |
+| Default-generation selections | Processor; authoritative mapping of each `watchtower_id` to its promoted `processing_generation` | Processor-owned PostgreSQL selection state with `processing_generation` stored as `uuid`, plus monotonically revisioned selection changes in Processor canonical replay batches | Retained while its canonical record is eligible; rebuilt from retained selection changes and validated against canonical history before Processor republishes it to Query after recovery |
 | Derived aggregates | Processor; authoritative for mutable derived results | Processor-owned PostgreSQL schemas and encrypted project-scoped derived replay batches | Retention-windowed to thirteen months from `accepted_at` by default or the shortened project policy; expired contributions are removed before they can remain represented in the aggregate, replay batches, or Query projections |
 | Compatibility-only representations | The sole owning adapter for each protocol interface; authoritative only for that boundary | Request-scoped memory or an adapter-owned boundary defined by #16 or its signal contract | No canonical retention; never a shared persistence model |
 | Query projections | Query; authoritative only for read projection state | Query-owned ClickHouse databases or schemas | Rebuildable canonical-signal projections are retained for 90 days; derived-aggregate projections use their authoritative aggregate's lifecycle and retention window; all are purged with the project |
@@ -287,8 +287,8 @@ and outcome. Raw data is the source for ranges within the project's applicable
 raw-retention window, which is seven days by default; after that, an eligible
 retained safe normalized replay batch is the source.
 
-A new result uses a new `processing_generation` and is a candidate until the
-complete requested range passes integrity validation. Processor records the
+A new result uses a new UUID v7 `processing_generation` and is a candidate until
+the complete requested range passes integrity validation. Processor records the
 authoritative default-generation mapping for each `watchtower_id`; promotion
 updates that mapping only after full-range success. A partial or failed range
 never becomes the default and the prior default result remains active. Derived
@@ -308,20 +308,27 @@ republishes the selection to Query. External historical imports are not supporte
 API owns export authorization and customer-visible status. Jobs schedules the
 work. Query produces selected-signal canonical and derived snapshots from its
 own projections into its encrypted project-scoped S3 export prefix. At export
-creation, Processor supplies the requested range's canonical change watermark
-and, when derived results are selected, the authoritative derived-state revision
-watermark. After its applicable projections reach those watermarks, Query emits
-a versioned export outcome containing the export identity, outcome, manifest,
-watermarks, and snapshot generation; API alone records the resulting lifecycle
-transition. The manifest records the watermarks and Query snapshot generation.
-Exports never include raw data, caches, or audit records.
+creation, API sends Processor an authenticated, versioned export-watermark
+request containing the export identity and revision, authorized tenant and
+project scope, `accepted_at` range, selected signals, and whether derived
+results are selected. Processor returns a correlated, versioned response with
+the canonical change watermark for that scope and, when applicable, the
+authoritative derived-state revision watermark. API persists those watermarks
+and carries them in the versioned work dispatched to Jobs and Query; Query does
+not infer them from its local projection. After its applicable projections
+reach those watermarks, Query emits a versioned export outcome containing the
+export identity, revision, outcome, manifest, watermarks, and snapshot
+generation; API alone records the resulting lifecycle transition. The manifest
+records the watermarks and Query snapshot generation. Exports never include raw
+data, caches, or audit records.
 
 An export contains Parquet data and a JSON manifest with the schema version,
 authorized scope, selected signals, `accepted_at` range, object sizes, and
 SHA-256 checksums. For every Parquet object, the manifest also records a row
 count and deterministic reconciliation summaries: ordered Watchtower-ID,
-processing-generation, and correlation-ID digests where those fields are
-represented. For derived rows, it records an ordered digest of aggregate keys,
+processing-generation, canonical-content-digest, and correlation-ID digests
+where those fields are represented. For derived rows, it records an ordered
+digest of aggregate keys,
 authoritative derived revisions, selected aggregate state, and deterministic
 selected-canonical-source-set digests at the derived watermark. For canonical
 rows, the manifest additionally records the
@@ -333,7 +340,15 @@ is limited to 31 days and 100 GiB uncompressed. A larger request fails safely
 with `resource_exhausted` and a correlation ID.
 
 Export lifecycle states are `queued`, `running`, `completed`, `failed`,
-`canceled`, and `expired`. Export objects are retained for seven days. API
+`canceled`, and `expired`. Every export attempt has a strictly monotonic
+`export_revision` persisted by API. Jobs commands and Query outcomes carry the
+export identity and revision. API accepts an outcome only when its revision
+matches the current non-terminal export state; it ignores lower, mismatched,
+or otherwise stale outcomes and every outcome received after a terminal state
+has been recorded. Cancellation advances the revision and fences in-flight
+work, so a late completion cannot restore a canceled export and a late failure
+cannot overwrite a successful one. Query stops or invalidates the associated
+artifact when cancellation is fenced. Export objects are retained for seven days. API
 rechecks authorization immediately before requesting a Query-owned authorized
 download-gateway URL of up to one hour, capped at the export object's remaining
 retention lifetime; it then calls Query's authenticated internal issuance
@@ -361,10 +376,18 @@ byte stream. The stream contains one RFC 8785 canonical-JSON tuple per line,
 sorted by the bytewise UTF-8 value of that canonical tuple and terminated by a
 single line-feed. Missing values use JSON `null`; each represented row emits
 one tuple, so repeated correlation values are preserved rather than deduplicated.
+For every canonical row, `canonical_content_digest` is lowercase hexadecimal
+SHA-256 over the RFC 8785 canonical-JSON encoding of the complete typed
+canonical record, including common fields, signal-specific fields, and
+extension attributes, but excluding storage-engine metadata, reconciliation
+metadata, and the digest itself. Every authoritative canonical row, replay
+copy, Query projection row, and exported canonical row carries or deterministically
+recomputes the same content digest.
 The required tuples are `{"watchtower_id": ...}` for raw acceptance and
-handoff; `{"watchtower_id": ..., "processing_generation": ...}` for canonical
-history, replay, and default-generation selection; that identity tuple plus
-`"correlation_id"` for correlation summaries; and
+handoff; `{"watchtower_id": ..., "processing_generation": ..., "canonical_content_digest": ...}`
+for canonical history, replay, Query projections, default-generation selection,
+and canonical exports; that identity tuple plus `"correlation_id"` for
+correlation summaries; and
 `{"aggregate_key": ..., "authoritative_revision": ..., "selected_state": ...,
 "source_set_digest": ...}` for derived summaries. `selected_state` is itself
 RFC 8785 canonical JSON. Each `source_set_digest` is SHA-256 over the same
@@ -403,11 +426,12 @@ like-for-like dimensions: raw acceptance and handoff compare logical
 recoverable state, each successfully completed handoff is generation-aware
 reconciled to the authoritative default-generation selection or a durable
 terminal disposition; canonical histories and replay compare physical
-`(watchtower_id, processing_generation)` counts and ordered pair digests; and
-Query projections and canonical exports compare the authoritative
-default-generation selection at a common watermark. Derived projections and
-exports compare the selected aggregate state, aggregate revisions, and
-retention-windowed source set at a common derived-state revision watermark.
+`(watchtower_id, processing_generation, canonical_content_digest)` counts and
+ordered content-aware digests; and Query projections and canonical exports
+compare the authoritative default-generation selection and canonical content
+digests at a common watermark. Derived projections and exports compare the
+selected aggregate state, aggregate revisions, and retention-windowed source
+set at a common derived-state revision watermark.
 Correlation-ID digests are compared only for represented records in the same
 dimension. A mismatch is not silently repaired or treated as successful
 completion.
@@ -470,7 +494,8 @@ The owning implementation contracts must make these scenarios testable:
 4. Rebuild eligible canonical and derived Query projections through authorized
    Processor republishing without direct Processor storage access; verify that
    canonical replay copies remain non-authoritative, have retention-homogeneous
-   expiry, and reconcile to their represented canonical versions.
+   expiry, reconcile to their represented canonical versions, and reject a
+   changed non-key canonical field when its identity pair is unchanged.
 5. Shorten retention and delete a project; verify Ingest, Processor, Query, and
    Jobs install and enforce each deletion fence before acknowledgement; fencing
    of pending, handoff, replayed, queued, retry, dead-letter, dispatchable,
@@ -488,12 +513,14 @@ The owning implementation contracts must make these scenarios testable:
    minimal anonymous evidence.
 6. Export permitted signals and verify Parquet output, manifest checksums, row
    counts, independently recomputable canonical digest tuples, generation-aware
-   canonical and revision-aware derived reconciliation summaries,
-   default-generation selection, Processor-to-Query watermark completion,
-   Query-to-API versioned completion outcomes and API-only lifecycle persistence,
+   canonical-content and revision-aware derived reconciliation summaries,
+   default-generation selection, API-to-Processor correlated watermark
+   request/response, Processor-to-Query watermark completion, Query-to-API
+   versioned completion outcomes and API-only lifecycle persistence, rejection
+   of stale outcomes after cancellation or another terminal transition,
    Query-issued URLs no longer than their remaining object lifetime,
-   authorization recheck, rate limits, and oversized-request
-   `resource_exhausted` behavior.
+   authorization recheck, rate limits, and oversized-request `resource_exhausted`
+   behavior.
 7. Reprocess a successful and a partially failed range; verify provenance,
    distinct processing generations, full-range promotion, preservation of the
    prior default result, ordered per-record selection revisions with stale

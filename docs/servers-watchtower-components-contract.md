@@ -40,7 +40,7 @@ listed in `docs/project-watchtower.md`.
 | Component | Public surface and responsibilities | Must not own |
 | --- | --- | --- |
 | `watchtower-ingest` | Public write-only telemetry routes, protocol admission, raw accepted records, and the recoverable handoff/outbox to processing. | Normalization, enrichment, grouping, control-plane state, analytical queries, or another component's storage. |
-| `watchtower-api` | Native `/api/v1` control-plane and release/artifact commands, every Sentry-compatible management REST route, control-plane and artifact authority, and versioned change events. | Telemetry admission, canonical telemetry processing, analytical storage, or direct query-store access. |
+| `watchtower-api` | Native `/api/v1` control-plane and release/artifact commands, every Sentry-compatible management REST route, control-plane and artifact authority, versioned change events, and contract-level audit authority. | Telemetry admission, canonical telemetry processing, analytical storage, or direct query-store access. |
 | `watchtower-processor` | Asynchronous normalization, privacy processing, enrichment, symbolication execution, canonical telemetry, processing state, and derived domain aggregates. | Public business routes, control-plane authority, query serving, job scheduling, or another owner's store. |
 | `watchtower-query` | Native `/api/v1` read/query routes, Prometheus-, Loki-, and Tempo-compatible query routes, read projections, search and analytical indexes, caches, and provider query orchestration. | Canonical, control-plane, or raw writes, and fallback persistence access. |
 | `watchtower-jobs` | Scheduling, leases, retries, dead-letter state, execution history, and asynchronous orchestration. | Public business routes, domain business logic, or direct writes to domain-owned storage. |
@@ -60,7 +60,7 @@ They have no public business routes.
 | Component | Authoritative state, owned projection, or cache |
 | --- | --- |
 | Ingest | Raw accepted records, recoverable processing handoff/outbox, and local projections of API-published security or control changes. |
-| API | Control-plane state, artifact authority, and versioned change events describing those authoritative changes. |
+| API | Control-plane state, artifact authority, versioned change events describing those authoritative changes, and the append-only contract-level audit event boundary. |
 | Processor | Canonical telemetry, processing state, and derived domain aggregates. |
 | Query | Query-owned read projections, search and analytical indexes, caches, and provider query orchestration state. |
 | Jobs | Durable scheduling requests, leases, retry state, dead-letter state, and execution history. |
@@ -95,16 +95,26 @@ The allowed protocol and data-flow direction is:
 3. API accepts control-plane, release, artifact, and Sentry management
    commands. It publishes versioned change events. API may call Query's
    authenticated internal interfaces for Sentry management reads and authorized
-   export download-gateway issuance, but never reads Query persistence directly.
+   export download-gateway issuance, and Processor's authenticated
+   `ExportWatermarkV1` interface at export creation, but never reads another
+   component's persistence directly.
 4. Processor consumes Ingest handoff work and relevant API changes. It
-   publishes canonical and derived changes.
+   publishes canonical and derived changes and answers API's versioned
+   export-watermark requests.
 5. Query consumes API changes and Processor changes into its own projections,
-   indexes, and caches. It publishes versioned export outcomes for API to record
-   customer-visible lifecycle transitions and does not call another component for
-   persistence fallback.
+   indexes, and caches. It consumes API-authorized export work carrying
+   Processor's watermark, publishes versioned export outcomes for API to record
+   customer-visible lifecycle transitions, and does not call another component
+   for persistence fallback.
 6. Jobs receives durable requests, owns scheduling and retry state, and
    dispatches versioned commands to the component owning the affected data.
    That owner performs the idempotent side effect and publishes the outcome.
+7. Ingest, Processor, Query, and Jobs submit required evidence for break-glass,
+   restoration, key, replication, backup, and restore actions to API through a
+   versioned durable audit-evidence message. API validates the producer,
+   context, correlation, and idempotency data and is the only component that
+   appends the contract-level audit event; components do not write API audit
+   storage directly.
 
 This direction contains no circular protocol or persistence dependency. API
 outages do not immediately stop valid Ingest admission or Query reads while
@@ -168,6 +178,16 @@ consumers. Internal errors use a safe Protobuf envelope containing a canonical
 code, safe message, retryability, and correlation identifier. Original causes
 remain in structured logs.
 
+The export-time watermark handoff is a versioned unary Protobuf-over-HTTP call
+under `/internal/v1` from API to Processor. API sends the export identity and
+revision, authorized tenant and project scope, `accepted_at` range, selected
+signals, derived-selection flag, correlation identifier, and idempotency key.
+Processor returns a correlated versioned response containing the canonical
+change watermark for that scope and, when applicable, the authoritative
+derived-state revision watermark. API persists the response and includes the
+watermarks in the versioned work sent to Jobs and Query; Query never infers an
+authoritative watermark from its local projection.
+
 | Canonical code | HTTP status |
 | --- | ---: |
 | `canceled` | 499 |
@@ -207,6 +227,14 @@ Credentials and unrestricted customer payloads are prohibited. Delivery is at
 least once and consumers are idempotent. There is no global ordering guarantee
 unless a downstream domain PRD explicitly declares ordering for an aggregate
 partition.
+
+Required component audit evidence uses the same at-least-once delivery model
+through a versioned durable message to API. The evidence includes the producer,
+action, target resource, actor or workload identity, tenant and project context
+when applicable, event time, outcome, correlation identifier, and idempotency
+key, but never raw payloads or secrets. A component may retain and retry its
+local outbox while API is unavailable; API remains the sole audit writer, and
+component logs or Jobs execution history are not audit records.
 
 ## Security and Configuration
 
@@ -309,6 +337,15 @@ become runtime acceptance criteria for the owning implementation issues:
     adapter and downstream domain contract, not canonical ownership.
 12. Review every ownership and failure entry for an unowned path, shared
     writer, circular dependency, or undocumented fallback.
+13. Create an export while Processor is publishing, verify the correlated
+    API-to-Processor watermark request/response and that Jobs and Query use the
+    returned values.
+14. Race export cancellation and terminal completion or failure, then verify
+    revision fencing prevents a stale outcome from changing API state or
+    making an invalid artifact issuable.
+15. Perform a required component break-glass or backup action while API is
+    unavailable, retry its versioned audit evidence, and verify API alone
+    appends the resulting audit event without direct storage writes.
 
 ## Deferred Decisions and Non-Goals
 
