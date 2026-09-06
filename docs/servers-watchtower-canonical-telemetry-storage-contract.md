@@ -53,7 +53,7 @@ versioned messages that hand records to downstream consumers.
 | `signal` | Required fixed value identifying the physical signal schema: `error_occurrence`, `metric_point`, `log_record`, or `span`. |
 | `accepted_at` | Required UTC timestamp recording durable raw acceptance. It is the basis for retention, replay, deletion, and lifecycle calculations. Boundary representations are RFC 3339 with nanosecond precision. |
 | `observed_at` | A UTC RFC 3339 timestamp with nanosecond precision when the source signal has an observation time. |
-| `observed_at_status` | Required enum `present` or `not_applicable`. `present` requires `observed_at`; `not_applicable` requires `observed_at = null`. `accepted_at` must not be substituted for an unavailable observation time. |
+| `observed_at_status` | Required enum `present`, `not_applicable`, or `unavailable`. `present` requires `observed_at`; `not_applicable` requires `observed_at = null` when the signal has no observation-time concept; `unavailable` requires `observed_at = null` when an expected source time is missing or unparseable. `accepted_at` must not be substituted for an unavailable observation time. |
 | `canonical_schema_version` | Required immutable version of the physical canonical schema. |
 | `normalization_version` | Required immutable version of the normalization rules that produced the row. |
 
@@ -137,13 +137,13 @@ writes another component's authority.
 
 | Data class | Sole writer and authority | Lifecycle and storage boundary |
 | --- | --- | --- |
-| Raw accepted data | Ingest | Immutable accepted protocol bytes and bounded metadata in Ingest-owned S3 raw-object resources. Retained seven days from `accepted_at`; an acknowledged record awaiting successful normalization is retained with its recoverable handoff until that normalization completes. Inaccessible to customers and Query. |
-| Attachments | Ingest | Ingest-owned S3 resources, subject to the same seven-day retention and deletion rules as raw data, including retention with an acknowledged incomplete handoff until successful normalization. |
-| Handoff and outbox state | Ingest | Ingest-owned PostgreSQL state and Ingest-owned MSK handoff namespace. Retained seven days from `accepted_at`, or until the shorter applicable project policy, except that an acknowledged incomplete handoff and its reconciliation state are retained until successful normalization. |
+| Raw accepted data | Ingest | Immutable accepted protocol bytes and bounded metadata in Ingest-owned S3 raw-object resources. Retained for at most seven days from `accepted_at`, or the shorter applicable project policy. An acknowledged record awaiting normalization is encrypted-quarantined with its recoverable handoff only within that window. On terminal failure or expiry, payload data is purged and only bounded non-payload failure evidence remains. Inaccessible to customers and Query. |
+| Attachments | Ingest | Ingest-owned S3 resources subject to the same bounded quarantine, retention, terminal-failure, and deletion rules as raw data. |
+| Handoff and outbox state | Ingest | Ingest-owned PostgreSQL state and Ingest-owned MSK handoff namespace. Retained for at most seven days from `accepted_at`, or the shorter applicable project policy. An acknowledged incomplete handoff is retained for reconciliation only within that window; terminal failure or expiry purges payload-bearing state and preserves only bounded non-payload failure evidence. |
 | Normalized data | Processor | Processor-owned safe-normalized records and processing state. Raw reprocessing is available for seven days; safe-normalized records are retained for reprocessing otherwise, within the 90-day canonical/replay horizon. |
 | Enriched data | Processor | Processor-owned processing artifacts. Enrichment is not an independent authority; retained enriched artifacts follow the 90-day Processor processing horizon and are deleted with the project. |
 | Canonical telemetry | Processor | The four physical canonical schemas in Processor-owned ClickHouse resources. Retained 90 days from `accepted_at`. |
-| Derived data | Processor | Processor-owned mutable aggregates and derived domain state. Retained 13 months from `accepted_at`; semantics remain with the owning downstream domain issue. |
+| Derived data | Processor | Processor-owned mutable aggregates and derived domain state. Mutable aggregates use fixed `accepted_at` time buckets; each bucket expires independently after 13 months, or an earlier project policy, and reads recompute from retained buckets. Semantics remain with the owning downstream domain issue. |
 | Compatibility-only data | The external adapter that creates it | Transient protocol DTOs and bounded compatibility mappings at API or Query boundaries. They are never canonical persistence, never a raw-payload escape hatch, and are not a shared storage class. |
 | Query projection | Query | Query-owned read projections and indexes derived from authorized Processor or API messages. Processor-canonical projections follow the source record's 90-day `accepted_at` retention; Processor-derived projections follow the source's 13-month retention; API control and security projections remain until replaced or tombstoned by their authority. All are subject to earlier project policy. |
 | Query cache | Query | Query-owned cache entries derived from Query projections. Entries never outlive their source retention, are invalidated on deletion or shortening, and are not authoritative. |
@@ -177,10 +177,11 @@ resource.
 
 No component reads or writes another component's RDS, ClickHouse, or S3
 resource directly. Producer-owned MSK topics are read only by their designated
-downstream consumers: Processor consumes Ingest handoffs, and Query consumes
-authorized Processor and API changes. Recovery uses a versioned owner interface
-or durable message. A component outage never authorizes a persistence fallback
-in another component.
+downstream consumers: Ingest consumes authorized API changes for local
+authorization projections; Processor consumes Ingest handoffs and relevant API
+changes; and Query consumes authorized Processor and API changes. Recovery uses
+a versioned owner interface or durable message. A component outage never
+authorizes a persistence fallback in another component.
 
 ### Environment and tenant isolation
 
@@ -217,7 +218,8 @@ ORDER BY (tenant_id, project_id, signal, observed_at, watchtower_id)
 ```
 
 The order is a storage and scan contract, not a global ordering guarantee.
-`observed_at` remains explicitly nullable for `not_applicable` records.
+`observed_at` remains explicitly nullable for `not_applicable` and
+`unavailable` records.
 
 ### Transactions, outboxes, and reconciliation
 
@@ -275,12 +277,12 @@ replay batch is project-scoped, encrypted with platform-managed KMS, and
 retained for 90 days from `accepted_at`.
 
 Processor is the only component that reads replay batches. For an authorized
-Query rebuild, Processor validates the requested tenant/project scope and
-deletion state, then republishes versioned authorized records. Query rebuilds
-its own projections from those messages and never accesses Processor S3
-directly. Processor and Query reject batches or messages for projects whose
-deletion deadline has passed, so a rebuild cannot restore deleted-project data
-after the deadline.
+Query rebuild, Processor validates the requested tenant/project scope and that
+no deletion acceptance has been recorded, then republishes versioned authorized
+records. Query rebuilds its own projections from those messages and never
+accesses Processor S3 directly. Processor and Query reject batches or messages
+for projects with a recorded deletion acceptance, so a rebuild cannot recreate
+or expose deleted-project data during the purge window or afterward.
 
 Before a new canonical or normalization version becomes the default, the
 owner performs range-level integrity validation. Validation covers the source
@@ -300,7 +302,7 @@ or tombstone lifecycle.
 | Raw data, attachments, and handoff state | 7 days |
 | Canonical telemetry, safe-normalized reprocessing records, and replay batches | 90 days |
 | Query projections | Their source authority's lifetime: 90 days for canonical telemetry, 13 months for derived data, and until replacement or tombstone for API control and security state |
-| Mutable aggregates and operational history | 13 months |
+| Mutable aggregate buckets and operational history | 13 months |
 
 Caches, enriched artifacts, compatibility mappings, and export artifacts must
 not outlive the authoritative data from which they were derived. A project
@@ -410,24 +412,29 @@ tests:
    UUID v7 identity, external-ID scoping, PostgreSQL UUID storage, uniqueness,
    RLS/row-policy enforcement, and explicit authorized Query filters.
 3. Verify UTC nanosecond timestamps, accepted-time retention calculations, and
-   both valid and invalid `observed_at`/`observed_at_status` combinations.
+   valid `present`, `not_applicable`, and `unavailable`
+   `observed_at`/`observed_at_status` combinations, including missing or
+   unparseable expected source times without substituting `accepted_at`.
 4. Stop Processor before and after Ingest acknowledgement. Confirm that only
    durable raw acceptance plus handoff produces success, that canonical and
-   Query visibility remain asynchronous, that only designated consumers can
-   read producer-owned topics with their own consumer groups, and that
-   reconciliation recovers the handoff without a distributed transaction.
+   Query visibility remain asynchronous, that Ingest and Processor consume
+   their authorized API changes while only designated consumers read each
+   producer-owned topic with their own consumer groups, and that reconciliation
+   recovers the handoff without a distributed transaction.
 5. Redeliver messages and replay ranges. Confirm at-least-once idempotency,
    no global-order assumption, compatibility with every version retained in the
    replay horizon, duplicate/gap detection,
    provenance, and range-level validation before defaulting a new version.
 6. Rebuild a Query projection through Processor republishing, confirm Query
-   never reads Processor S3, and verify that deleted projects are not
-   republished or restored after their deletion deadline.
+   never reads Processor S3, and verify that a recorded deletion acceptance
+   immediately blocks republishing, restoration, and rebuild before purge
+   completion.
 7. Exercise seven-day raw retention after successful normalization, recovery of
-   an acknowledged handoff delayed beyond seven days, 90-day canonical/replay
-   retention, source-authority projection retention, 13-month aggregate/
-   operational history, and an authorized shortened policy with immediate
-   hiding and a 14-day purge deadline.
+   an acknowledged handoff within its bounded quarantine, terminal failure and
+   expiry purge with only non-payload evidence retained, 90-day canonical/replay
+   retention, source-authority projection retention, independently expiring
+   13-month aggregate buckets, and an authorized shortened policy with
+   immediate hiding and a 14-day purge deadline.
 8. Accept a project-wide deletion and verify the persistent tombstone blocks
    collection, reads, restoration, exports, cache refresh, rebuild, and delayed
    processing writes before purge completion; active purge, backup purge, export
