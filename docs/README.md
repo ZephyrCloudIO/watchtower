@@ -22,6 +22,7 @@ when their owning project or domain is introduced.
 
 - `docs/project-watchtower.md`
 - `docs/servers-watchtower-components-contract.md`
+- `docs/servers-watchtower-canonical-telemetry-storage-contract.md`
 - `docs/servers-watchtower-runtime-contract.md`
 
 ## Adding a Contract

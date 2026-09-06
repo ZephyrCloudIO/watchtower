@@ -1,0 +1,349 @@
+# Watchtower Canonical Telemetry and Storage Contract
+
+## Scope and Authority
+
+This contract defines Watchtower's protocol-neutral canonical telemetry model,
+data classes, storage topology, ownership, lifecycle, replay, export, and
+integrity rules. It is documentation only; it does not create services,
+schemas, migrations, buckets, topics, adapters, routes, or deployment
+infrastructure.
+
+The component and deployment boundary is authoritative in
+[`servers-watchtower-components-contract.md`](servers-watchtower-components-contract.md).
+The shared runtime, message envelope, security, health, and shutdown rules are
+authoritative in
+[`servers-watchtower-runtime-contract.md`](servers-watchtower-runtime-contract.md).
+This contract selects the canonical data and storage decisions those contracts
+leave to downstream ownership. A downstream contract may refine behavior in
+its assigned domain but must not move ownership across the component boundary.
+
+## Canonical Model
+
+### Physical signal schemas
+
+Processor owns four separate physical canonical table families in ClickHouse:
+
+| Physical canonical schema | Signal-specific authority | Required common context |
+| --- | --- | --- |
+| `canonical_error_occurrences` | #19, error intelligence and issue lifecycle | Yes |
+| `canonical_metric_points` | #23, metrics ingestion, storage, and querying | Yes |
+| `canonical_log_records` | #24, log ingestion, storage, and querying | Yes |
+| `canonical_spans` | #25, tracing and application performance monitoring | Yes |
+
+Each family has its own physical schema, signal-specific columns, validation,
+and semantics. There is no generic physical event table, generic payload column,
+or cross-signal row shape. Signal contracts may add fields and semantics inside
+their family, but may not replace the shared context or make another protocol's
+DTO the canonical model.
+
+### Required common fields
+
+Every canonical record contains the following typed fields:
+
+| Field | Contract |
+| --- | --- |
+| `tenant_id` | The authorized tenant owning the record. |
+| `project_id` | The authorized project owning the record. |
+| `watchtower_id` | A Watchtower-generated canonical lowercase UUID v7 record identifier. It is the canonical record key and is never supplied by an external protocol. |
+| `accepted_at` | The time Watchtower durably accepts the record, serialized as UTC RFC 3339 with nanosecond precision. It is the retention and partitioning clock. |
+| `observed_at` | The source observation time serialized as UTC RFC 3339 with nanosecond precision, or an explicit typed `not_applicable` value. A missing field is not a not-applicable value. |
+| `environment` | A typed environment value. |
+| `service` | A typed service identity and version context. |
+| `resource` | A typed resource context; it is not an arbitrary JSON object. |
+| `instrumentation_scope` | A typed instrumentation library or scope context. |
+| `correlation` | Typed request, operation, trace, span, parent, causation, and correlation context where supplied. |
+| `source_timezone` | Optional compatibility metadata only. It never changes UTC interpretation or ordering. |
+| `external_keys` | Scoped compatibility or correlation keys, each bound to a protocol and scope. They are never Watchtower primary keys. |
+
+Canonical and message timestamps use UTC RFC 3339 with nanosecond precision.
+Storage must preserve nanosecond precision even where the physical type is not
+the wire representation. Watchtower IDs are globally non-reused across tenants
+and the four signal families. External keys are scoped by tenant, project,
+protocol, and source namespace, so equal external values in different scopes
+remain distinct. W3C trace context and external protocol identifiers remain
+correlation or compatibility material; a Sentry event ID, OpenTelemetry trace
+or span ID, or any other external ID cannot be used interchangeably with
+`watchtower_id`.
+
+### Extension attributes
+
+Extension attributes are a flat, typed, namespaced collection. A value is only
+one of `null`, boolean, string, integer, float, or a homogeneous array of one
+primitive kind. Arrays cannot contain nested arrays or objects. Attribute names
+must include an owning namespace, and the namespace does not permit an
+unbounded raw structure.
+
+Arbitrary nested JSON, opaque maps, unbounded payload fragments, credentials,
+and unrestricted customer payloads do not enter canonical storage. Values that
+cannot be represented by the extension type set are handled by the owning
+normalization and privacy contract rather than retained as raw canonical data.
+
+## Data Classes and Ownership
+
+Each class has one authoritative writer and one storage boundary. A projection,
+cache, compatibility representation, or audit record is never treated as
+canonical telemetry.
+
+| Data class | Writer and authority | Storage boundary | Lifecycle |
+| --- | --- | --- | --- |
+| Raw accepted records and attachments | Ingest; authoritative for raw acceptance | Encrypted immutable S3 objects plus Ingest PostgreSQL acceptance metadata and outbox state | Seven days from `accepted_at`; never customer-downloadable |
+| Normalized records | Processor; authoritative only as processing input | Processor-owned encrypted S3 replay-batch prefix, with separate class metadata | Retained only as needed for replay, no longer than 90 days |
+| Enriched records | Processor; authoritative only as processing input | Processor-owned encrypted S3 replay-batch prefix, with separate class metadata | Retained only as needed for replay, no longer than 90 days |
+| Canonical telemetry | Processor; authoritative for the four signal histories | Four independent ClickHouse canonical table families | Immutable history for 90 days from `accepted_at` |
+| Derived aggregates | Processor; authoritative for mutable derived results | Processor-owned PostgreSQL schemas | Thirteen months unless a downstream contract selects a shorter policy |
+| Compatibility-only representations | The sole owning adapter for each protocol interface; authoritative only for that boundary | Request-scoped memory or an adapter-owned boundary defined by #16 or its signal contract | No canonical retention; never a shared persistence model |
+| Query projections | Query; authoritative only for read projection state | Query-owned ClickHouse databases or schemas | Rebuildable, retained for 90 days, and purged with the project |
+| Query cache | Query; never authoritative | Encrypted Query-owned cache | At most 15 minutes; immediately invalidated for retention, deletion, or authorization changes |
+| Audit events | API for contract-level lifecycle and access audit authority | API-owned append-only PostgreSQL audit boundary | Detailed history follows #15; deleted projects retain only minimal anonymous evidence |
+| Processing and operational state | The component performing the operation | Its own PostgreSQL database or explicitly owned state boundary | Owned and retained by that component; no cross-component writer |
+
+Jobs owns scheduling, leases, execution history, and other job operational
+state in its own PostgreSQL boundary. Jobs does not write Processor, Query,
+Ingest, or API domain data. API owns the contract-level audit event authority;
+Jobs execution history is operational state, not a second audit writer.
+
+## Storage Topology and Isolation
+
+Watchtower uses the following managed services in `us-east-1`:
+
+- Amazon RDS for PostgreSQL with multi-AZ deployment;
+- ClickHouse Cloud on AWS with replicated clusters or organizations;
+- Amazon S3 Standard; and
+- Amazon MSK with multi-AZ deployment.
+
+S3 Standard durability, multi-AZ RDS and MSK, and replicated ClickHouse are
+selected for in-region resilience. Watchtower makes no cross-region recovery,
+RPO, RTO, or scheduled-restore commitment. Cross-region replication and
+customer-managed keys are out of scope.
+
+Production and non-production use separate AWS accounts, storage resources,
+ClickHouse organizations or clusters, KMS keys, and workload credentials.
+Customer data is never copied into non-production; non-production uses
+synthetic or independently sourced data.
+
+Shared infrastructure is permitted only when each component has exclusive
+databases or schemas, S3 buckets or prefixes, MSK topics, ACLs, and workload
+credentials. A shared physical service does not create shared ownership.
+Cross-component SQL, object-store access, persistence fallbacks, and direct
+access to another component's storage are prohibited.
+
+### Component storage boundaries
+
+| Component | Owned storage and writes |
+| --- | --- |
+| Ingest | Encrypted immutable raw S3 objects, PostgreSQL acceptance metadata, and the transactional processing outbox. |
+| Processor | The four immutable canonical ClickHouse histories, encrypted project-scoped replay batches, PostgreSQL processing state, and mutable derived aggregates. |
+| Query | Independently owned ClickHouse read projections and the encrypted non-authoritative cache. |
+| API | Authoritative control-plane and audit state in its own PostgreSQL boundary. |
+| Jobs | Scheduling, leases, retries, dead-letter state, execution history, and orchestration state in its own PostgreSQL boundary. |
+| Web | No server-authoritative storage. |
+
+Raw S3 writes use immutable UUID v7-keyed objects under:
+
+```text
+environment/component/tenant/project/accepted-date/<watchtower-uuid-v7>
+```
+
+The Ingest PostgreSQL acceptance record stores the object key, SHA-256 digest,
+size, `accepted_at`, tenant, project, Watchtower ID, and outbox state. A raw
+record is not successfully acknowledged unless the immutable object exists,
+its digest and size have been verified, and the acceptance metadata and
+transactional outbox commit. Orphaned or incomplete attempts are reconciled
+without being reported as successful acceptance.
+
+Canonical ClickHouse tables are partitioned monthly by `accepted_at` and
+ordered by:
+
+```text
+tenant_id, project_id, signal, observed_at, watchtower_id
+```
+
+Every PostgreSQL multi-tenant table enables row-level security and requires
+authorized tenant and project predicates. Application queries must also apply
+explicit authorized tenant/project filters; RLS is defense in depth, not a
+replacement for authorization. Equivalent tenant and project isolation is
+required in ClickHouse policies, S3 prefixes and KMS permissions, MSK ACLs,
+exports, and break-glass workflows.
+
+## Consistency, Messages, and Replay
+
+Storage changes use local storage transactions, transactional outboxes,
+versioned messages, idempotent retry, and reconciliation. There are no
+distributed transactions and no best-effort cross-store writes.
+
+Ingest acknowledgement means only that durable raw acceptance and durable
+handoff have succeeded. It does not mean that canonical telemetry or a Query
+projection is visible. Canonical and Query visibility are asynchronous and
+eventually consistent.
+
+The existing versioned message envelope remains authoritative for message
+identity, producer, tenant/project context, event time, causation,
+correlation, W3C trace context, idempotency, and bounded payload or authorized
+payload reference. Message timestamps use the same UTC RFC 3339 nanosecond
+format as canonical timestamps. Delivery is at least once and consumers are
+idempotent.
+
+MSK handoff and canonical-change topics retain data for seven days and use:
+
+- replication factor `3`;
+- `min.insync.replicas=2`; and
+- producer `acks=all`.
+
+Processor owns encrypted, project-scoped canonical replay batches in S3 for 90
+days. Query projection rebuilds submit an authorized request for Processor to
+republish the eligible versioned changes. Query never reads Processor S3,
+Processor PostgreSQL, or Processor ClickHouse directly. Rebuilds are
+idempotent and cannot republish a deleted project.
+
+## Retention, Deletion, and Reprocessing
+
+Retention is calculated from `accepted_at`. Authorized project administrators
+may shorten a project retention policy but may not extend it through this
+contract. A shortened policy immediately makes excess data inaccessible and
+schedules active-store purge within 14 days. There is no cold archive.
+
+Project deletion is project-wide. Before deletion acceptance, collection,
+reads, restoration, exports, and new projection rebuilds are disabled. Query
+cache entries are invalidated immediately. Active stores, including raw,
+canonical, derived, projections, replay batches, and export objects, are purged
+within 14 days. Backups are purged within 90 days, and deleted project data is
+not restored from a backup. Only irreversible minimal evidence remains after
+project deletion: deletion timestamp, result, and correlation ID, retained for
+13 months without tenant-identifying or customer-payload content.
+
+Reprocessing is bounded by project and `accepted_at` range. Each attempt records
+source data class, source and target schema or normalization versions,
+processor release, request or job identity, correlation ID, checksums, counts,
+and outcome. Raw data is the source for ranges within its seven-day retention;
+after that, an eligible retained safe normalized replay batch is the source.
+
+A new result is a candidate until the complete requested range passes
+integrity validation. Promotion occurs only after full-range success. A
+partial or failed range never becomes the default and the prior default result
+remains active. External historical imports are not supported.
+
+## Export Contract
+
+API owns export authorization and customer-visible status. Jobs schedules the
+work. Query produces selected-signal canonical and derived snapshots from its
+own projections into a Query-owned encrypted S3 prefix. Exports never include
+raw data, caches, or audit records.
+
+An export contains Parquet data and a JSON manifest with the schema version,
+authorized scope, selected signals, `accepted_at` range, object sizes, and
+SHA-256 checksums. A project may have one active export and at most three
+export requests per UTC day. Each signal range is limited to 31 days and 100
+GiB uncompressed. A larger request fails safely with `resource_exhausted`
+and a correlation ID.
+
+Export lifecycle states are `queued`, `running`, `completed`, `failed`,
+`canceled`, and `expired`. Export objects are retained for seven days. API
+rechecks authorization immediately before issuing a one-hour download URL;
+the URL is never issued for a deleted, unauthorized, or revoked project.
+Deletion cancels active exports and revokes issued download access. Cancellation
+prevents publication of incomplete results and removes or invalidates the
+associated objects according to the seven-day export lifecycle.
+
+Safe status and error responses expose no raw payload, secret, or unauthorized
+tenant/project information. Detailed authorization, roles, quotas, and
+credential behavior remain owned by #15.
+
+## Integrity, Observability, Audit, and Security
+
+All service-to-service and storage transport uses TLS. At-rest encryption uses
+platform-managed KMS envelope encryption. Raw payloads are inaccessible to
+customers and Query; automated processing may access them only within the
+Ingest-to-Processor boundary. Approved, time-limited, audited operator
+break-glass access is the only exception, and operator guidance is required
+before implementation release.
+
+Raw customer payloads, credentials, bearer tokens, private keys, and opaque
+session material are never logged. Metrics, distributed traces, and safe
+structured logs must cover:
+
+- acceptance-to-canonical-to-projection lag and MSK lag;
+- storage errors, capacity, and backup operations;
+- cache population and immediate invalidation;
+- retention, deletion, export, and lifecycle jobs; and
+- checksum, count, UUID, and correlation-ID reconciliation.
+
+Accepted-data-loss risk, unrecoverable handoff, and tenant-isolation risk page
+immediately. Lifecycle failures, deletion-deadline risk, backup-purge failure,
+and unreconciled integrity differences alert and escalate through the owning
+operational boundary.
+
+Raw and export objects are checksum-validated. Reconciliation compares counts,
+Watchtower UUIDs, and correlation IDs across raw acceptance, handoff,
+canonical histories, projections, replay, and export manifests. A mismatch is
+not silently repaired or treated as successful completion.
+
+Immutable audit events are required for break-glass access, exports, deletion,
+restoration attempts, reprocessing, retention changes, and key, replication,
+backup, or restore actions. API remains the contract-level audit writer;
+component logs and Jobs execution history do not replace the audit boundary.
+
+Threat-model review is required before accepting this contract and before each
+implementation release. Customer-facing retention, deletion, export, and
+support documentation, including support limits, must exist before
+implementation release. This contract makes no named regulatory certification
+commitment.
+
+This issue creates documentation only, so a feature flag is not applicable.
+Future executable work must define its own rollout and operational controls.
+
+## Downstream Authority and Non-Goals
+
+The Watchtower project index in
+[`project-watchtower.md`](project-watchtower.md) remains the authority map.
+This contract specifically leaves the following decisions to their owning
+issues:
+
+| Issue | Remaining authority |
+| --- | --- |
+| #15 | Control-plane resources, WorkOS authentication, authorization, roles, project lifecycle, credentials, quotas, and detailed audit access |
+| #16 | Sentry-compatible routes, DTOs, request semantics, and protocol compatibility mappings |
+| #17 | Ingestion admission, capacity behavior, and detailed durable raw-to-processing handoff |
+| #18 | Normalization, privacy processing, enrichment, and processing policy |
+| #19 | Error grouping, issue aggregates, and issue lifecycle |
+| #21 | Query routes, query language, read semantics, limits, freshness, and error exploration |
+| #23 | Metric identity, temporal and aggregation semantics, cardinality, and metric querying |
+| #24 | Log body, severity, parsing, indexing, search, and log querying |
+| #25 | Span and trace semantics, sampling, service modeling, and APM behavior |
+| #29 | Job types, scheduling, leases, retries, cancellation, dead letters, and execution policy |
+
+This contract does not implement services, database schemas, migrations,
+buckets, topics, storage adapters, retention jobs, export handlers, deployment
+infrastructure, public API routes, Sentry wire compatibility, role matrices,
+credential lifecycle, PII scrubbing policy, signal-specific semantics, query
+languages, job retry policy, customer-managed keys, cross-region replication,
+external historical imports, raw customer downloads, or numeric
+platform-wide targets.
+
+## Contract Acceptance Scenarios
+
+The owning implementation contracts must make these scenarios testable:
+
+1. Store equivalent external event, trace, or span identifiers for two tenants
+   without Watchtower ID collision or cross-tenant disclosure.
+2. Fail S3, PostgreSQL, ClickHouse, and MSK operations before and after local
+   commits; verify no false successful acceptance and idempotent recovery.
+3. Verify raw-object immutability, SHA-256 and size reconciliation, and the
+   required MSK durability and seven-day retention settings.
+4. Rebuild an eligible Query projection through authorized Processor
+   republishing without direct Processor storage access.
+5. Shorten retention and delete a project; verify immediate inaccessibility,
+   active purge within 14 days, backup purge within 90 days, export
+   cancellation, cache invalidation, and minimal anonymous evidence.
+6. Export permitted signals and verify Parquet output, manifest checksums,
+   authorization recheck, one-hour URLs, rate limits, and oversized-request
+   `resource_exhausted` behavior.
+7. Reprocess a successful and a partially failed range; verify provenance,
+   full-range promotion, and preservation of the prior default result.
+8. Attempt cross-tenant access through PostgreSQL, ClickHouse, S3, MSK,
+   projections, exports, and break-glass workflows; verify denial and required
+   audit evidence.
+9. Verify that production and non-production accounts, stores, keys,
+   credentials, and data paths remain separate.
+10. Trigger accepted-data-loss, unrecoverable-handoff, tenant-isolation,
+    deletion-deadline, and reconciliation failures; verify the required page,
+    alert, and escalation behavior.

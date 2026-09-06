@@ -45,7 +45,7 @@ the component contract without updating it.
 
 | Decision area | Owning downstream contract |
 | --- | --- |
-| Canonical telemetry, authoritative data classes, and storage model | #14, `canonical telemetry and storage model` |
+| Canonical telemetry, authoritative data classes, and storage model | #14, [`canonical telemetry and storage model`](servers-watchtower-canonical-telemetry-storage-contract.md) |
 | Control plane, roles, authorization, WorkOS behavior, and credential lifecycle | #15, `control plane and authorization` |
 | Sentry routes, DTOs, request semantics, and compatibility matrix | #16, `Sentry compatibility contract` |
 | Ingestion admission and durable raw-to-processing handoff | #17, `ingestion admission and durable handoff` |
