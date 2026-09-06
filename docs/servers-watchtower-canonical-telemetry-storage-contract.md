@@ -200,6 +200,11 @@ MSK handoff and canonical-change topics retain data for seven days and use:
 
 Processor owns encrypted, project-scoped canonical replay batches in S3 for 90
 days and derived replay batches for their authoritative aggregate lifecycle.
+When committing each normalized or enriched processing-input replay batch,
+Processor records the immutable object's SHA-256 digest and byte size in its
+separate class metadata, and verifies both before any replay or reprocessing
+use. A verification failure makes the batch unusable and cannot create,
+publish, or promote a canonical result.
 Each immutable replay batch is retention-homogeneous: every represented item
 has the same effective lifecycle expiry, and Processor does not place items
 with different expiry deadlines in one object.
@@ -239,13 +244,15 @@ contributions, and Query denies excess reads, exports, and rebuilds. Processor
 returns a durable terminal policy-fenced disposition for each rejected raw
 handoff; Ingest records that disposition as completed, retires its outbox entry,
 and purges the corresponding raw object and acceptance metadata under the new
-policy. After installing its fence, each owner submits a durable active-store
-purge request to Jobs. Jobs owns scheduling and retrying that request and
-dispatches the purge command; the data owner performs the idempotent purge within
-14 days. Before a restored API database accepts traffic, API loads the current
-retention registry and republishes each policy; every restored owner reapplies
-its effective cutoff, fences excess data, and submits its durable purge request
-to Jobs before readiness. There is no cold archive.
+policy. After installing its fence, each owner submits a durable recurring
+active-store purge schedule to Jobs for as long as the shortened policy remains
+active. Jobs owns scheduling and retrying each purge dispatch; on every run, the
+data owner applies the current-time effective cutoff and idempotently purges all
+newly expired data within 14 days. Before a restored API database accepts
+traffic, API loads the current retention registry and republishes each policy;
+every restored owner reapplies its effective cutoff, fences excess data, and
+submits its durable recurring active-store purge schedule to Jobs before
+readiness. There is no cold archive.
 
 Project deletion is project-wide. API creates a versioned deletion generation
 and keyed project tombstone in its append-only restore-independent registry,
@@ -464,7 +471,8 @@ The owning implementation contracts must make these scenarios testable:
    leased, and in-flight work; rejection of late execution outcomes; terminal
    disposition and retirement of policy-fenced raw handoffs;
    derived-aggregate recomputation without expired contributions; current-time
-   duration enforcement; Jobs-scheduled, owner-run active purge within 14 days;
+   duration enforcement; recurring Jobs-scheduled, owner-run active purges of
+   data that expires after policy installation within 14 days;
    purge or irreversible anonymization of Jobs project-scoped operational state;
    backup purge within 90 days; removal of every project retention-policy registry
    record; restore-independent retention and tombstone-registry recovery before
@@ -482,7 +490,9 @@ The owning implementation contracts must make these scenarios testable:
    prior default result, selection-state recovery and republishing after a
    Processor rebuild, generation-aware cross-stage reconciliation, derived
    aggregates exclude candidate generations, and consistent derived-aggregate
-   lifecycle anchors after later contributions.
+   lifecycle anchors after later contributions; reject a corrupted or truncated
+   normalized or enriched processing-input replay batch before reprocessing or
+   canonical publication.
 8. Attempt cross-tenant access through PostgreSQL, ClickHouse, S3, MSK,
    projections, exports, and break-glass workflows; verify denial and required
    audit evidence.
