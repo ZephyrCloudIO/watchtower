@@ -87,9 +87,10 @@ limited to mTLS certificates, CA bundles, and broker, storage, or service
 credentials. An invalid reload retains the last-known-good value and emits an
 operational alert; all other configuration changes require deployment.
 
-Detailed roles, WorkOS behavior, credential lifecycle, PII handling, retention,
-deletion, abuse controls, and compliance gates remain owned by issues #15 and
-#18.
+Detailed roles, WorkOS behavior, credential lifecycle, PII handling, abuse
+controls, and compliance gates remain owned by issues #15 and #18. Canonical
+storage lifecycle, retention, deletion, restoration, and replay mechanics
+remain owned by #14.
 
 ## Health, Readiness, and Shutdown
 

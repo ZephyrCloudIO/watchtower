@@ -96,8 +96,10 @@ canonical telemetry.
 | Compatibility-only representations | The sole owning adapter for each protocol interface; authoritative only for that boundary | Request-scoped memory or an adapter-owned boundary defined by #16 or its signal contract | No canonical retention; never a shared persistence model |
 | Query projections | Query; authoritative only for read projection state | Query-owned ClickHouse databases or schemas | Rebuildable canonical-signal projections are retained for 90 days; derived-aggregate projections use their authoritative aggregate's lifecycle and retention window; all are purged with the project |
 | Query cache | Query; never authoritative | Encrypted Query-owned cache | At most 15 minutes; immediately invalidated for retention, deletion, or authorization changes |
+| Export objects | Query; non-authoritative customer-download artifacts | Encrypted Query-owned project-scoped S3 export prefix | Seven days; canceled, expired, retention-fenced, and deleted-project exports are removed or made inaccessible |
 | Audit events | API for contract-level lifecycle and access audit authority | API-owned append-only PostgreSQL audit boundary | Detailed history follows #15; deleted projects retain only minimal anonymous evidence |
-| Deletion tombstone registry | API; authoritative for deletion fencing and restore cleanup | API-owned append-only restore-independent registry | Non-customer-readable keyed tombstones retained for 13 months; never restored from API PostgreSQL backups |
+| Retention policy registry | API; authoritative for shortened-retention cutoffs and restore cleanup | API-owned encrypted immutable S3 control-registry prefix, independent of API PostgreSQL backups | Versioned policy records and current cutoffs retained for 13 months; loaded before restored owners accept traffic |
+| Deletion tombstone registry | API; authoritative for deletion fencing and restore cleanup | API-owned encrypted immutable S3 control-registry prefix, independent of API PostgreSQL backups | Non-customer-readable keyed tombstones retained for 13 months; loaded before restored owners accept traffic |
 | Processing and operational state | The component performing the operation | Its own PostgreSQL database or explicitly owned state boundary | Owned and retained by that component; no cross-component writer |
 
 Jobs owns scheduling, leases, execution history, and other job operational
@@ -136,8 +138,8 @@ access to another component's storage are prohibited.
 | --- | --- |
 | Ingest | Encrypted immutable raw S3 objects, PostgreSQL acceptance metadata, and the transactional processing outbox. |
 | Processor | The four immutable canonical ClickHouse histories, encrypted project-scoped non-authoritative replay batches, PostgreSQL processing state, and mutable derived aggregates. |
-| Query | Independently owned ClickHouse read projections and the encrypted non-authoritative cache. |
-| API | Authoritative control-plane and audit state in its own PostgreSQL boundary, plus the append-only restore-independent deletion tombstone registry. |
+| Query | Independently owned ClickHouse read projections, encrypted non-authoritative cache, and encrypted project-scoped S3 export prefix. |
+| API | Authoritative control-plane and audit state in its own PostgreSQL boundary, plus encrypted immutable S3 control-registry prefixes for restore-independent retention policies and deletion tombstones. |
 | Jobs | Scheduling, leases, retries, dead-letter state, execution history, and orchestration state in its own PostgreSQL boundary. |
 | Web | No server-authoritative storage. |
 
@@ -217,17 +219,21 @@ Retention is calculated from `accepted_at`, except that a derived aggregate and
 its replay batches and Query projections use the retention-windowed lifecycle
 defined above. Authorized project administrators may shorten a project retention
 policy but may not extend it through this contract. API records each versioned
-shortened policy in an append-only restore-independent retention registry and
-reports success only after Ingest, Processor, and Query acknowledge it. Until
-acknowledgement, the mutation fails closed. Before its acknowledgement, Processor
-durably fences and rejects queued, pending-handoff, and replayed work whose
-`accepted_at` falls outside the new limit, prevents canonical or derived
-publication, and recomputes or removes derived results with expired
-contributions. Once acknowledged, Ingest, Processor, and Query apply the local
-policy projection to deny access to excess data while active-store purge is
-scheduled within 14 days. Before a restored API database accepts traffic, API
-loads the current retention registry and republishes each cutoff; every restored
-owner reapplies its cutoff, fences excess data, and schedules its purge before
+shortened policy and current cutoff in its restore-independent retention policy
+registry, then reports success only after Ingest, Processor, and Query each
+durably install and enforce that cutoff. Until acknowledgement, the mutation
+fails closed. Before its acknowledgement, Ingest stops admitting excess records
+and serving excess raw data, Processor durably fences queued, pending-handoff,
+and replayed work whose `accepted_at` falls outside the new limit, prevents
+canonical or derived publication, and recomputes or removes derived results with
+expired contributions, and Query denies excess reads, exports, and rebuilds.
+Processor returns a durable terminal policy-fenced disposition for each rejected
+raw handoff; Ingest records that disposition as completed, retires its outbox
+entry, and purges the corresponding raw object and acceptance metadata under the
+new policy. Each owner schedules active-store purge within 14 days only after
+installing its fence. Before a restored API database accepts traffic, API loads
+the current retention registry and republishes each cutoff; every restored owner
+reapplies its cutoff, fences excess data, and schedules its purge before
 readiness. There is no cold archive.
 
 Project deletion is project-wide. API creates a versioned deletion generation
@@ -265,25 +271,28 @@ historical imports are not supported.
 
 API owns export authorization and customer-visible status. Jobs schedules the
 work. Query produces selected-signal canonical and derived snapshots from its
-own projections into a Query-owned encrypted S3 prefix. At export creation,
-Processor supplies the requested range's canonical change watermark; Query may
-mark the export complete only after its projection reaches that watermark. The
-manifest records the watermark and Query snapshot generation. Exports never
-include raw data, caches, or audit records.
+own projections into its encrypted project-scoped S3 export prefix. At export
+creation, Processor supplies the requested range's canonical change watermark
+and, when derived results are selected, the authoritative derived-state revision
+watermark. Query may mark the export complete only after its applicable
+projections reach those watermarks. The manifest records the watermarks and
+Query snapshot generation. Exports never include raw data, caches, or audit
+records.
 
 An export contains Parquet data and a JSON manifest with the schema version,
 authorized scope, selected signals, `accepted_at` range, object sizes, and
 SHA-256 checksums. For every Parquet object, the manifest also records a row
 count and deterministic reconciliation summaries: ordered Watchtower-ID,
 processing-generation, and correlation-ID digests where those fields are
-represented, or ordered derived aggregate-key digests for derived rows. For
-canonical rows, the manifest additionally records the deterministic digest of
-the authoritative default-generation selection at the snapshot watermark; every
-exported canonical row must match that selection. These summaries are the export
-reconciliation source. A project may have one active export and at most three
-export requests per UTC day. Each signal range is limited to 31 days and 100
-GiB uncompressed. A larger request fails safely with `resource_exhausted` and a
-correlation ID.
+represented. For derived rows, it records an ordered digest of aggregate keys,
+authoritative derived revisions, and selected aggregate state at the derived
+watermark. For canonical rows, the manifest additionally records the
+deterministic digest of the authoritative default-generation selection at the
+snapshot watermark; every exported canonical row must match that selection.
+These summaries are the export reconciliation source. A project may have one
+active export and at most three export requests per UTC day. Each signal range
+is limited to 31 days and 100 GiB uncompressed. A larger request fails safely
+with `resource_exhausted` and a correlation ID.
 
 Export lifecycle states are `queued`, `running`, `completed`, `failed`,
 `canceled`, and `expired`. Export objects are retained for seven days. API
@@ -333,10 +342,12 @@ like-for-like dimensions: raw acceptance and handoff compare logical
 `watchtower_id` counts and ordered ID digests; canonical histories and replay
 compare physical `(watchtower_id, processing_generation)` counts and ordered
 pair digests; and Query projections and canonical exports compare the
-authoritative default-generation selection at a common watermark. Correlation-ID
-digests are compared only for represented records in the same dimension.
-Derived results use their aggregate keys and retention-windowed source set. A
-mismatch is not silently repaired or treated as successful completion.
+authoritative default-generation selection at a common watermark. Derived
+projections and exports compare the selected aggregate state, aggregate
+revisions, and retention-windowed source set at a common derived-state revision
+watermark. Correlation-ID digests are compared only for represented records in
+the same dimension. A mismatch is not silently repaired or treated as successful
+completion.
 
 Immutable audit events are required for break-glass access, exports, deletion,
 restoration attempts, reprocessing, retention changes, and key, replication,
@@ -396,18 +407,19 @@ The owning implementation contracts must make these scenarios testable:
    canonical replay copies remain non-authoritative and reconcile to their
    represented canonical versions.
 5. Shorten retention and delete a project; verify Ingest, Processor, and Query
-   policy acknowledgement; fencing of pending, handoff, or replayed excess work;
-   derived-aggregate recomputation without expired contributions; immediate
-   access denial; active purge within 14 days; backup purge within 90 days;
-   restore-independent retention and tombstone-registry cleanup before restored
-   owners accept traffic; export cancellation; cache invalidation; and minimal
-   anonymous evidence.
+   install and enforce each policy fence before acknowledgement; fencing of
+   pending, handoff, or replayed excess work; terminal disposition and retirement
+   of policy-fenced raw handoffs; derived-aggregate recomputation without expired
+   contributions; immediate access denial; active purge within 14 days; backup
+   purge within 90 days; restore-independent retention and tombstone-registry
+   recovery before restored owners accept traffic; export cancellation; cache
+   invalidation; and minimal anonymous evidence.
 6. Export permitted signals and verify Parquet output, manifest checksums, row
-   counts, generation-aware deterministic reconciliation summaries and
-   default-generation selection, Processor-to-Query watermark completion,
-   Query-issued URLs no longer than their remaining object lifetime,
-   authorization recheck, rate limits, and
-   oversized-request `resource_exhausted` behavior.
+   counts, generation-aware canonical and revision-aware derived reconciliation
+   summaries, default-generation selection, Processor-to-Query watermark
+   completion, Query-issued URLs no longer than their remaining object lifetime,
+   authorization recheck, rate limits, and oversized-request
+   `resource_exhausted` behavior.
 7. Reprocess a successful and a partially failed range; verify provenance,
    distinct processing generations, full-range promotion, preservation of the
    prior default result, generation-aware cross-stage reconciliation, and
