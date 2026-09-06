@@ -99,7 +99,7 @@ canonical telemetry.
 | Query cache | Query; never authoritative | Encrypted Query-owned cache | At most 15 minutes; immediately invalidated for retention, deletion, or authorization changes |
 | Export objects | Query; non-authoritative customer-download artifacts | Encrypted Query-owned project-scoped S3 export prefix | Seven days; canceled, expired, retention-fenced, and deleted-project exports are removed or made inaccessible |
 | Audit events | API for contract-level lifecycle and access audit authority | API-owned append-only PostgreSQL audit boundary | Detailed history follows #15; deleted projects retain only minimal anonymous evidence |
-| Retention policy registry | API; authoritative for shortened-retention cutoffs and restore cleanup | API-owned encrypted immutable S3 control-registry prefix, independent of API PostgreSQL backups | The active policy and current cutoff persist until superseded; superseded versioned policy records are retained for 13 months and the active cutoff is loaded before restored owners accept traffic |
+| Retention policy registry | API; authoritative for shortened-retention duration policies, their current-time effective cutoffs, and restore cleanup | API-owned encrypted immutable S3 control-registry prefix, independent of API PostgreSQL backups | The active policy persists until superseded and its effective cutoff is computed from that duration at enforcement time; superseded versioned policy records are retained for 13 months and the active policy is loaded before restored owners accept traffic |
 | Deletion tombstone registry | API; authoritative for deletion fencing and restore cleanup | API-owned encrypted immutable S3 control-registry prefix, independent of API PostgreSQL backups | Non-customer-readable keyed tombstones retained for 13 months; loaded before restored owners accept traffic |
 | Processing and operational state | The component performing the operation | Its own PostgreSQL database or explicitly owned state boundary | Owned and retained by that component; no cross-component writer |
 
@@ -223,22 +223,26 @@ Retention is calculated from `accepted_at`, except that a derived aggregate and
 its replay batches and Query projections use the retention-windowed lifecycle
 defined above. Authorized project administrators may shorten a project retention
 policy but may not extend it through this contract. API records each versioned
-shortened policy and current cutoff in its restore-independent retention policy
-registry, then reports success only after Ingest, Processor, and Query each
-durably install and enforce that cutoff. Until acknowledgement, the mutation
-fails closed. Before its acknowledgement, Ingest stops admitting excess records
-and serving excess raw data, Processor durably fences queued, pending-handoff,
-and replayed work whose `accepted_at` falls outside the new limit, prevents
-canonical or derived publication, and recomputes or removes derived results with
-expired contributions, and Query denies excess reads, exports, and rebuilds.
-Processor returns a durable terminal policy-fenced disposition for each rejected
-raw handoff; Ingest records that disposition as completed, retires its outbox
-entry, and purges the corresponding raw object and acceptance metadata under the
-new policy. Each owner schedules active-store purge within 14 days only after
-installing its fence. Before a restored API database accepts traffic, API loads
-the current retention registry and republishes each cutoff; every restored owner
-reapplies its cutoff, fences excess data, and schedules its purge before
-readiness. There is no cold archive.
+shortened duration policy in its restore-independent retention policy registry.
+Ingest, Processor, and Query each compute its effective cutoff from that duration
+and current time whenever enforcing admission, read, processing, replay, export,
+or rebuild behavior. API reports success only after each owner durably installs
+and enforces the policy. Until acknowledgement, the mutation fails closed. Before
+its acknowledgement, Ingest stops admitting excess records and serving excess raw
+data, Processor durably fences queued, pending-handoff, and replayed work whose
+`accepted_at` falls outside the new limit, prevents canonical or derived
+publication, and recomputes or removes derived results with expired
+contributions, and Query denies excess reads, exports, and rebuilds. Processor
+returns a durable terminal policy-fenced disposition for each rejected raw
+handoff; Ingest records that disposition as completed, retires its outbox entry,
+and purges the corresponding raw object and acceptance metadata under the new
+policy. After installing its fence, each owner submits a durable active-store
+purge request to Jobs. Jobs owns scheduling and retrying that request and
+dispatches the purge command; the data owner performs the idempotent purge within
+14 days. Before a restored API database accepts traffic, API loads the current
+retention registry and republishes each policy; every restored owner reapplies
+its effective cutoff, fences excess data, and submits its durable purge request
+to Jobs before readiness. There is no cold archive.
 
 Project deletion is project-wide. API creates a versioned deletion generation
 and keyed project tombstone in its append-only restore-independent registry,
@@ -252,11 +256,12 @@ stores, including raw, canonical, derived, projections, replay batches, and
 export objects, are purged within 14 days. Backups are purged within 90 days,
 and deleted project data is not restored from a backup. Before a restored API
 database accepts traffic, API loads the current registry and reapplies every
-current tombstone to identify, fence, and purge deleted-project rows. API retains
-the non-customer-readable registry tombstone for 13 months. Only irreversible
-minimal evidence remains after project deletion: deletion timestamp, result,
-correlation ID, and the keyed tombstone, without tenant-identifying or
-customer-payload content.
+current tombstone to identify, fence, and purge deleted-project rows. Before
+accepting deletion, API irreversibly removes every retention-policy registry
+version for the project. API retains the non-customer-readable registry tombstone
+for 13 months. Only irreversible minimal evidence remains after project deletion:
+deletion timestamp, result, correlation ID, and the keyed tombstone, without
+tenant-identifying or customer-payload content.
 
 Reprocessing is bounded by project and `accepted_at` range. Each attempt records
 source data class, source and target schema or normalization versions,
@@ -269,12 +274,14 @@ A new result uses a new `processing_generation` and is a candidate until the
 complete requested range passes integrity validation. Processor records the
 authoritative default-generation mapping for each `watchtower_id`; promotion
 updates that mapping only after full-range success. A partial or failed range
-never becomes the default and the prior default result remains active. Processor
-persists the mapping in its selection state and emits versioned selection changes
-with canonical replay metadata. After recovery or rebuild, it replays retained
-selection changes, validates the resulting mapping against canonical history,
-and only then republishes the selection to Query. External historical imports
-are not supported.
+never becomes the default and the prior default result remains active. Derived
+aggregate computation and publication use only rows selected by the authoritative
+default-generation mapping; candidate generations are excluded until promotion.
+Processor persists the mapping in its selection state and emits versioned
+selection changes with canonical replay metadata. After recovery or rebuild, it
+replays retained selection changes, validates the resulting mapping against
+canonical history, and only then republishes the selection to Query. External
+historical imports are not supported.
 
 ## Export Contract
 
@@ -436,10 +443,11 @@ The owning implementation contracts must make these scenarios testable:
    install and enforce each policy fence before acknowledgement; fencing of
    pending, handoff, or replayed excess work; terminal disposition and retirement
    of policy-fenced raw handoffs; derived-aggregate recomputation without expired
-   contributions; immediate access denial; active purge within 14 days; backup
-   purge within 90 days; restore-independent retention and tombstone-registry
-   recovery before restored owners accept traffic; export cancellation; cache
-   invalidation; and minimal anonymous evidence.
+   contributions; current-time duration enforcement; Jobs-scheduled, owner-run
+   active purge within 14 days; backup purge within 90 days; removal of every
+   project retention-policy registry record; restore-independent retention and
+   tombstone-registry recovery before restored owners accept traffic; export
+   cancellation; cache invalidation; and minimal anonymous evidence.
 6. Export permitted signals and verify Parquet output, manifest checksums, row
    counts, independently recomputable canonical digest tuples, generation-aware
    canonical and revision-aware derived reconciliation summaries,
@@ -450,8 +458,9 @@ The owning implementation contracts must make these scenarios testable:
 7. Reprocess a successful and a partially failed range; verify provenance,
    distinct processing generations, full-range promotion, preservation of the
    prior default result, selection-state recovery and republishing after a
-   Processor rebuild, generation-aware cross-stage reconciliation, and
-   consistent derived-aggregate lifecycle anchors after later contributions.
+   Processor rebuild, generation-aware cross-stage reconciliation, derived
+   aggregates exclude candidate generations, and consistent derived-aggregate
+   lifecycle anchors after later contributions.
 8. Attempt cross-tenant access through PostgreSQL, ClickHouse, S3, MSK,
    projections, exports, and break-glass workflows; verify denial and required
    audit evidence.
