@@ -227,9 +227,10 @@ Live reload is limited to mTLS certificates, CA bundles, and broker, storage,
 or service credentials. Invalid reloads retain the last-known-good value and
 emit an operational alert. All other configuration changes require deployment.
 
-Detailed roles, WorkOS behavior, credential lifecycle, PII handling, retention,
-deletion, abuse controls, and compliance gates remain owned by issues #15 and
-#18.
+Detailed roles, WorkOS behavior, credential lifecycle, PII handling, abuse
+controls, and compliance gates remain owned by issues #15 and #18. Canonical
+storage lifecycle, retention, deletion, restoration, and replay mechanics
+remain owned by #14.
 
 ## Deployment and Operations
 

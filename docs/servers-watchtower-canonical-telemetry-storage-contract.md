@@ -92,9 +92,9 @@ canonical telemetry.
 | Enriched records | Processor; authoritative only as processing input | Processor-owned encrypted S3 replay-batch prefix, with separate class metadata | Retained only as needed for replay, no longer than 90 days |
 | Canonical telemetry | Processor; authoritative for the four signal histories | Four independent ClickHouse canonical table families | Immutable history for 90 days from `accepted_at` |
 | Canonical replay representations | Processor; non-authoritative, immutable replay copies of canonical changes | Processor-owned encrypted project-scoped S3 replay-batch prefix with separate class metadata | 90 days from each represented record's `accepted_at`; purged with its project |
-| Derived aggregates | Processor; authoritative for mutable derived results | Processor-owned PostgreSQL schemas and encrypted project-scoped derived replay batches | Thirteen months from the greatest `accepted_at` of their currently represented source records, unless a downstream contract selects a shorter policy |
+| Derived aggregates | Processor; authoritative for mutable derived results | Processor-owned PostgreSQL schemas and encrypted project-scoped derived replay batches | Thirteen months from the greatest `accepted_at` of their currently represented source records; a shortened project policy requires retention-windowed recomputation that removes expired contributions |
 | Compatibility-only representations | The sole owning adapter for each protocol interface; authoritative only for that boundary | Request-scoped memory or an adapter-owned boundary defined by #16 or its signal contract | No canonical retention; never a shared persistence model |
-| Query projections | Query; authoritative only for read projection state | Query-owned ClickHouse databases or schemas | Rebuildable canonical-signal projections are retained for 90 days; derived-aggregate projections use their authoritative aggregate's lifecycle anchor; all are purged with the project |
+| Query projections | Query; authoritative only for read projection state | Query-owned ClickHouse databases or schemas | Rebuildable canonical-signal projections are retained for 90 days; derived-aggregate projections use their authoritative aggregate's lifecycle and retention window; all are purged with the project |
 | Query cache | Query; never authoritative | Encrypted Query-owned cache | At most 15 minutes; immediately invalidated for retention, deletion, or authorization changes |
 | Audit events | API for contract-level lifecycle and access audit authority | API-owned append-only PostgreSQL audit boundary | Detailed history follows #15; deleted projects retain only minimal anonymous evidence |
 | Deletion tombstone registry | API; authoritative for deletion fencing and restore cleanup | API-owned append-only restore-independent registry | Non-customer-readable keyed tombstones retained for 13 months; never restored from API PostgreSQL backups |
@@ -164,12 +164,12 @@ ordered by:
 tenant_id, project_id, observed_at, watchtower_id, processing_generation
 ```
 
-Every PostgreSQL multi-tenant table enables row-level security and requires
-authorized tenant and project predicates. Application queries must also apply
-explicit authorized tenant/project filters; RLS is defense in depth, not a
-replacement for authorization. Equivalent tenant and project isolation is
-required in ClickHouse policies, S3 prefixes and KMS permissions, MSK ACLs,
-exports, and break-glass workflows.
+Every PostgreSQL multi-tenant table enables row-level security. Tenant-scoped
+rows and queries require an authorized tenant predicate; project-scoped rows
+and queries require authorized tenant and project predicates. RLS is defense in
+depth, not a replacement for authorization. Equivalent tenant and, where
+applicable, project isolation is required in ClickHouse policies, S3 prefixes
+and KMS permissions, MSK ACLs, exports, and break-glass workflows.
 
 ## Consistency, Messages, and Replay
 
@@ -201,27 +201,34 @@ Canonical replay batches are non-authoritative immutable copies, not a second
 canonical store; their separate metadata identifies the represented canonical
 versions for reconciliation and deletion. A derived aggregate's lifecycle anchor
 is the greatest `accepted_at` of its currently represented source records; each
-newer contribution advances that anchor, and Processor replay batches and Query
-projections use the same anchor. Query projection rebuilds submit an authorized
-request for Processor to republish the eligible versioned canonical or derived
-changes. Query never reads Processor S3, Processor PostgreSQL, or Processor
-ClickHouse directly. Rebuilds are idempotent and cannot republish a deleted
-project. Consumers must understand every message schema version retained in the
-applicable replay horizon.
+newer contribution advances that anchor. A shortened project policy instead
+requires a retention-windowed aggregate: Processor removes expired contributions
+by recomputing or deleting the aggregate before acknowledging the policy, and
+its replay batches and Query projections contain only that recomputed result.
+Query projection rebuilds submit an authorized request for Processor to
+republish the eligible versioned canonical or derived changes. Query never reads
+Processor S3, Processor PostgreSQL, or Processor ClickHouse directly. Rebuilds
+are idempotent and cannot republish a deleted project. Consumers must understand
+every message schema version retained in the applicable replay horizon.
 
 ## Retention, Deletion, and Reprocessing
 
 Retention is calculated from `accepted_at`, except that a derived aggregate and
-its replay batches and Query projections use the aggregate lifecycle anchor
+its replay batches and Query projections use the retention-windowed lifecycle
 defined above. Authorized project administrators may shorten a project retention
-policy but may not extend it through this contract. API records a versioned
-shortened policy and reports success only after Ingest, Processor, and Query
-acknowledge it. Until acknowledgement, the mutation fails closed. Before its
-acknowledgement, Processor durably fences and rejects queued, pending-handoff,
-and replayed work whose `accepted_at` falls outside the new limit, preventing
-canonical or derived publication. Once acknowledged, Ingest, Processor, and
-Query apply the local policy projection to deny access to excess data while
-active-store purge is scheduled within 14 days. There is no cold archive.
+policy but may not extend it through this contract. API records each versioned
+shortened policy in an append-only restore-independent retention registry and
+reports success only after Ingest, Processor, and Query acknowledge it. Until
+acknowledgement, the mutation fails closed. Before its acknowledgement, Processor
+durably fences and rejects queued, pending-handoff, and replayed work whose
+`accepted_at` falls outside the new limit, prevents canonical or derived
+publication, and recomputes or removes derived results with expired
+contributions. Once acknowledged, Ingest, Processor, and Query apply the local
+policy projection to deny access to excess data while active-store purge is
+scheduled within 14 days. Before a restored API database accepts traffic, API
+loads the current retention registry and republishes each cutoff; every restored
+owner reapplies its cutoff, fences excess data, and schedules its purge before
+readiness. There is no cold archive.
 
 Project deletion is project-wide. API creates a versioned deletion generation
 and keyed project tombstone in its append-only restore-independent registry,
@@ -280,13 +287,14 @@ correlation ID.
 
 Export lifecycle states are `queued`, `running`, `completed`, `failed`,
 `canceled`, and `expired`. Export objects are retained for seven days. API
-rechecks authorization immediately before issuing a one-hour download URL;
-it then calls Query's authenticated internal signing interface with the
-authorized actor, action, project, and export context. Query independently
+rechecks authorization immediately before requesting a download URL of up to
+one hour, capped at the export object's remaining retention lifetime; it then
+calls Query's authenticated internal signing interface with the authorized
+actor, action, project, export context, and capped lifetime. Query independently
 validates the caller, current authorization projection, export ownership, and
-lifecycle state before issuing the one-hour URL; API never accesses Query
-object storage or signing credentials. The URL is never issued for a deleted,
-unauthorized, or revoked project.
+lifecycle state before issuing the URL; the URL expiry never exceeds object
+expiry. API never accesses Query object storage or signing credentials. The URL
+is never issued for a deleted, unauthorized, revoked, or expired export.
 Deletion cancels active exports and revokes issued download access. Cancellation
 prevents publication of incomplete results and removes or invalidates the
 associated objects according to the seven-day export lifecycle.
@@ -320,10 +328,15 @@ immediately. Lifecycle failures, deletion-deadline risk, backup-purge failure,
 and unreconciled integrity differences alert and escalate through the owning
 operational boundary.
 
-Raw and export objects are checksum-validated. Reconciliation compares counts,
-Watchtower UUIDs, and correlation IDs across raw acceptance, handoff,
-canonical histories, projections, replay, and export manifests. A mismatch is
-not silently repaired or treated as successful completion.
+Raw and export objects are checksum-validated. Reconciliation compares
+like-for-like dimensions: raw acceptance and handoff compare logical
+`watchtower_id` counts and ordered ID digests; canonical histories and replay
+compare physical `(watchtower_id, processing_generation)` counts and ordered
+pair digests; and Query projections and canonical exports compare the
+authoritative default-generation selection at a common watermark. Correlation-ID
+digests are compared only for represented records in the same dimension.
+Derived results use their aggregate keys and retention-windowed source set. A
+mismatch is not silently repaired or treated as successful completion.
 
 Immutable audit events are required for break-glass access, exports, deletion,
 restoration attempts, reprocessing, retention changes, and key, replication,
@@ -384,18 +397,21 @@ The owning implementation contracts must make these scenarios testable:
    represented canonical versions.
 5. Shorten retention and delete a project; verify Ingest, Processor, and Query
    policy acknowledgement; fencing of pending, handoff, or replayed excess work;
-   immediate access denial; active purge within 14 days; backup purge within 90
-   days; restore-independent tombstone-registry cleanup; export cancellation;
-   cache invalidation; and minimal anonymous evidence.
+   derived-aggregate recomputation without expired contributions; immediate
+   access denial; active purge within 14 days; backup purge within 90 days;
+   restore-independent retention and tombstone-registry cleanup before restored
+   owners accept traffic; export cancellation; cache invalidation; and minimal
+   anonymous evidence.
 6. Export permitted signals and verify Parquet output, manifest checksums, row
    counts, generation-aware deterministic reconciliation summaries and
    default-generation selection, Processor-to-Query watermark completion,
-   Query-issued one-hour URLs, authorization recheck, rate limits, and
+   Query-issued URLs no longer than their remaining object lifetime,
+   authorization recheck, rate limits, and
    oversized-request `resource_exhausted` behavior.
 7. Reprocess a successful and a partially failed range; verify provenance,
    distinct processing generations, full-range promotion, preservation of the
-   prior default result, and consistent derived-aggregate lifecycle anchors
-   after later contributions.
+   prior default result, generation-aware cross-stage reconciliation, and
+   consistent derived-aggregate lifecycle anchors after later contributions.
 8. Attempt cross-tenant access through PostgreSQL, ClickHouse, S3, MSK,
    projections, exports, and break-glass workflows; verify denial and required
    audit evidence.
