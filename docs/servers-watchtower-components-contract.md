@@ -179,9 +179,11 @@ code, safe message, retryability, and correlation identifier. Original causes
 remain in structured logs.
 
 The export-time watermark handoff is a versioned unary Protobuf-over-HTTP call
-under `/internal/v1` from API to Processor. API sends the export identity and
-revision, authorized tenant and project scope, `accepted_at` range, selected
-signals, derived-selection flag, correlation identifier, and idempotency key.
+under `/internal/v1` from API to Processor. API sends the canonical lowercase
+UUID v7 `export_id` (stored as PostgreSQL `uuid` in API state) and
+`export_revision`, authorized tenant and project scope, `accepted_at` range,
+selected signals, derived-selection flag, correlation identifier, and idempotency
+key.
 Processor returns a correlated versioned response containing the canonical
 change watermark for that scope and, when applicable, the authoritative
 derived-state revision watermark. API persists the response and includes the

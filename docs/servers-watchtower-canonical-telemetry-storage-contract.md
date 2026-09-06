@@ -97,7 +97,7 @@ canonical telemetry.
 | Compatibility-only representations | The sole owning adapter for each protocol interface; authoritative only for that boundary | Request-scoped memory or an adapter-owned boundary defined by #16 or its signal contract | No canonical retention; never a shared persistence model |
 | Query projections | Query; authoritative only for read projection state | Query-owned ClickHouse databases or schemas | Rebuildable canonical-signal projections are retained for 90 days; derived-aggregate projections use their authoritative aggregate's lifecycle and retention window; all are purged with the project |
 | Query cache | Query; never authoritative | Encrypted Query-owned cache | At most 15 minutes; immediately invalidated for retention, deletion, or authorization changes |
-| Export objects | Query; non-authoritative customer-download artifacts | Encrypted Query-owned project-scoped S3 export prefix | Seven days; canceled, expired, retention-fenced, and deleted-project exports are removed or made inaccessible |
+| Export objects | Query; non-authoritative customer-download artifacts | Encrypted Query-owned project-scoped S3 export prefix | Seven days from API `completed_at`; canceled, expired, retention-fenced, and deleted-project exports are removed or made inaccessible |
 | Audit events | API for contract-level lifecycle and access audit authority | API-owned append-only PostgreSQL audit boundary | Detailed history follows #15; deleted projects retain only minimal anonymous evidence |
 | Retention policy registry | API; authoritative for shortened-retention duration policies, their current-time effective cutoffs, and restore cleanup | API-owned encrypted immutable S3 control-registry prefix, independent of API PostgreSQL backups | The active policy persists until superseded and its effective cutoff is computed from that duration at enforcement time; superseded versioned policy records are retained for 13 months and the active policy is loaded before restored owners accept traffic |
 | Deletion tombstone registry | API; authoritative for deletion fencing and restore cleanup | API-owned encrypted immutable S3 control-registry prefix, independent of API PostgreSQL backups | Non-customer-readable keyed tombstones retained for 13 months; loaded before restored owners accept traffic |
@@ -214,7 +214,13 @@ versions for reconciliation and deletion. Derived aggregates are
 retention-windowed: Processor removes expired contributions by recomputing or
 deleting each aggregate before they can outlive the applicable thirteen-month
 default or shortened project policy. Their replay batches and Query projections
-contain only that recomputed result.
+contain only that recomputed result. Processor assigns each derived aggregate
+change a strictly monotonic per-project, per-aggregate `authoritative_revision`,
+persists it with the aggregate state and selected source set, and emits it with
+derived change and replay metadata. Query and every recovery or rebuild consumer
+retain the highest applied revision for each aggregate, ignore lower revisions,
+and apply an equal revision only when the aggregate state and selected source
+set match; a conflicting equal revision is rejected as an integrity conflict.
 Query projection rebuilds submit an authorized request for Processor to
 republish the eligible versioned canonical or derived changes. Query never reads
 Processor S3, Processor PostgreSQL, or Processor ClickHouse directly. Rebuilds
@@ -223,11 +229,12 @@ every message schema version retained in the applicable replay horizon.
 
 ## Retention, Deletion, and Reprocessing
 
-Retention is calculated from `accepted_at`, except that a derived aggregate and
-its replay batches and Query projections use the retention-windowed lifecycle
-defined above. Authorized project administrators may shorten a project retention
-policy but may not extend it through this contract. API assigns every project
-policy a strictly monotonic generation and records each versioned shortened
+Retention is calculated from `accepted_at`, except that derived aggregates and
+their replay batches and Query projections use the retention-windowed lifecycle
+defined above, and export objects use the `completed_at` lifecycle anchor defined
+in the Export Contract. Authorized project administrators may shorten a project
+retention policy but may not extend it through this contract. API assigns every
+project policy a strictly monotonic generation and records each versioned shortened
 duration policy in its restore-independent retention policy registry. Ingest,
 Processor, and Query each durably retain the highest installed generation, ignore
 lower-generation deliveries, and acknowledge installation only for the matching
@@ -306,18 +313,21 @@ republishes the selection to Query. External historical imports are not supporte
 ## Export Contract
 
 API owns export authorization and customer-visible status. Jobs schedules the
-work. Query produces selected-signal canonical and derived snapshots from its
-own projections into its encrypted project-scoped S3 export prefix. At export
-creation, API sends Processor an authenticated, versioned export-watermark
-request containing the export identity and revision, authorized tenant and
-project scope, `accepted_at` range, selected signals, and whether derived
-results are selected. Processor returns a correlated, versioned response with
+work. API assigns each export a canonical lowercase UUID v7 `export_id`, stores
+it as PostgreSQL `uuid` in API state, and uses that canonical lowercase UUID v7
+representation at every external boundary. Query produces selected-signal
+canonical and derived snapshots from its own projections into its encrypted
+project-scoped S3 export prefix. At export creation, API sends Processor an
+authenticated, versioned export-watermark request containing `export_id` and
+`export_revision`, authorized tenant and project scope, `accepted_at` range,
+selected signals, and whether derived results are selected. Processor returns a
+correlated, versioned response with
 the canonical change watermark for that scope and, when applicable, the
 authoritative derived-state revision watermark. API persists those watermarks
 and carries them in the versioned work dispatched to Jobs and Query; Query does
 not infer them from its local projection. After its applicable projections
-reach those watermarks, Query emits a versioned export outcome containing the
-export identity, revision, outcome, manifest, watermarks, and snapshot
+reach those watermarks, Query emits a versioned export outcome containing
+`export_id`, `export_revision`, outcome, manifest, watermarks, and snapshot
 generation; API alone records the resulting lifecycle transition. The manifest
 records the watermarks and Query snapshot generation. Exports never include raw
 data, caches, or audit records.
@@ -342,16 +352,18 @@ with `resource_exhausted` and a correlation ID.
 Export lifecycle states are `queued`, `running`, `completed`, `failed`,
 `canceled`, and `expired`. Every export attempt has a strictly monotonic
 `export_revision` persisted by API. Jobs commands and Query outcomes carry the
-export identity and revision. API accepts an outcome only when its revision
+`export_id` and `export_revision`. API accepts an outcome only when its revision
 matches the current non-terminal export state; it ignores lower, mismatched,
 or otherwise stale outcomes and every outcome received after a terminal state
 has been recorded. Cancellation advances the revision and fences in-flight
 work, so a late completion cannot restore a canceled export and a late failure
 cannot overwrite a successful one. Query stops or invalidates the associated
-artifact when cancellation is fenced. Export objects are retained for seven days. API
-rechecks authorization immediately before requesting a Query-owned authorized
-download-gateway URL of up to one hour, capped at the export object's remaining
-retention lifetime; it then calls Query's authenticated internal issuance
+artifact when cancellation is fenced. API records `completed_at` as the UTC time
+it persists a successful `completed` transition, and export objects are retained
+for seven days from that timestamp, independent of the records' `accepted_at`
+values. API rechecks authorization immediately before requesting a Query-owned
+authorized download-gateway URL of up to one hour, capped at the export object's
+remaining retention lifetime; it then calls Query's authenticated internal issuance
 interface with the authorized actor, action, project, export context, and capped
 lifetime. Query independently validates the caller, current authorization
 projection, export ownership, and lifecycle state before issuing the opaque
@@ -362,7 +374,8 @@ storage or signing credentials, and gateway URLs never grant direct object-store
 access. The URL is never issued for a deleted, unauthorized, revoked, or expired
 export. Deletion cancels active exports and revokes issued download access.
 Cancellation prevents publication of incomplete results and removes or
-invalidates the associated objects according to the seven-day export lifecycle.
+invalidates the associated objects according to the seven-day export lifecycle
+anchored at `completed_at`.
 
 Safe status and error responses expose no raw payload, secret, or unauthorized
 tenant/project information. The export-specific active-export and daily-request
@@ -518,7 +531,8 @@ The owning implementation contracts must make these scenarios testable:
    request/response, Processor-to-Query watermark completion, Query-to-API
    versioned completion outcomes and API-only lifecycle persistence, rejection
    of stale outcomes after cancellation or another terminal transition,
-   Query-issued URLs no longer than their remaining object lifetime,
+   Query-issued URLs no longer than their remaining object lifetime and
+   seven-day object expiry anchored at `completed_at`,
    authorization recheck, rate limits, and oversized-request `resource_exhausted`
    behavior.
 7. Reprocess a successful and a partially failed range; verify provenance,
@@ -526,8 +540,9 @@ The owning implementation contracts must make these scenarios testable:
    prior default result, ordered per-record selection revisions with stale
    delivery rejection, selection-state recovery and republishing after a
    Processor rebuild, generation-aware cross-stage reconciliation, derived
-   aggregates exclude candidate generations, and consistent derived-aggregate
-   lifecycle anchors after later contributions; reject a corrupted or truncated
+   aggregates exclude candidate generations, consistent derived-aggregate
+   lifecycle anchors after later contributions, and rejection of lower or
+   conflicting equal derived-aggregate revisions; reject a corrupted or truncated
    normalized or enriched processing-input replay batch before reprocessing or
    canonical publication.
 8. Attempt cross-tenant access through PostgreSQL, ClickHouse, S3, MSK,
