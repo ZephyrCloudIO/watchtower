@@ -98,7 +98,7 @@ canonical telemetry.
 | Query cache | Query; never authoritative | Encrypted Query-owned cache | At most 15 minutes; immediately invalidated for retention, deletion, or authorization changes |
 | Export objects | Query; non-authoritative customer-download artifacts | Encrypted Query-owned project-scoped S3 export prefix | Seven days; canceled, expired, retention-fenced, and deleted-project exports are removed or made inaccessible |
 | Audit events | API for contract-level lifecycle and access audit authority | API-owned append-only PostgreSQL audit boundary | Detailed history follows #15; deleted projects retain only minimal anonymous evidence |
-| Retention policy registry | API; authoritative for shortened-retention cutoffs and restore cleanup | API-owned encrypted immutable S3 control-registry prefix, independent of API PostgreSQL backups | Versioned policy records and current cutoffs retained for 13 months; loaded before restored owners accept traffic |
+| Retention policy registry | API; authoritative for shortened-retention cutoffs and restore cleanup | API-owned encrypted immutable S3 control-registry prefix, independent of API PostgreSQL backups | The active policy and current cutoff persist until superseded; superseded versioned policy records are retained for 13 months and the active cutoff is loaded before restored owners accept traffic |
 | Deletion tombstone registry | API; authoritative for deletion fencing and restore cleanup | API-owned encrypted immutable S3 control-registry prefix, independent of API PostgreSQL backups | Non-customer-readable keyed tombstones retained for 13 months; loaded before restored owners accept traffic |
 | Processing and operational state | The component performing the operation | Its own PostgreSQL database or explicitly owned state boundary | Owned and retained by that component; no cross-component writer |
 
@@ -296,17 +296,20 @@ with `resource_exhausted` and a correlation ID.
 
 Export lifecycle states are `queued`, `running`, `completed`, `failed`,
 `canceled`, and `expired`. Export objects are retained for seven days. API
-rechecks authorization immediately before requesting a download URL of up to
-one hour, capped at the export object's remaining retention lifetime; it then
-calls Query's authenticated internal signing interface with the authorized
-actor, action, project, export context, and capped lifetime. Query independently
-validates the caller, current authorization projection, export ownership, and
-lifecycle state before issuing the URL; the URL expiry never exceeds object
-expiry. API never accesses Query object storage or signing credentials. The URL
-is never issued for a deleted, unauthorized, revoked, or expired export.
-Deletion cancels active exports and revokes issued download access. Cancellation
-prevents publication of incomplete results and removes or invalidates the
-associated objects according to the seven-day export lifecycle.
+rechecks authorization immediately before requesting a Query-owned authorized
+download-gateway URL of up to one hour, capped at the export object's remaining
+retention lifetime; it then calls Query's authenticated internal issuance
+interface with the authorized actor, action, project, export context, and capped
+lifetime. Query independently validates the caller, current authorization
+projection, export ownership, and lifecycle state before issuing the opaque
+gateway URL and again for every download request; the URL expiry never exceeds
+object expiry. Authorization changes invalidate outstanding gateway URLs, and
+Query denies subsequent download requests. API never accesses Query object
+storage or signing credentials, and gateway URLs never grant direct object-store
+access. The URL is never issued for a deleted, unauthorized, revoked, or expired
+export. Deletion cancels active exports and revokes issued download access.
+Cancellation prevents publication of incomplete results and removes or
+invalidates the associated objects according to the seven-day export lifecycle.
 
 Safe status and error responses expose no raw payload, secret, or unauthorized
 tenant/project information. The export-specific active-export and daily-request
