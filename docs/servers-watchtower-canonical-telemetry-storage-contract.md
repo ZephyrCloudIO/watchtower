@@ -460,8 +460,9 @@ The owning implementation contracts must make these scenarios testable:
    expiry, and reconcile to their represented canonical versions.
 5. Shorten retention and delete a project; verify Ingest, Processor, Query, and
    Jobs install and enforce each deletion fence before acknowledgement; fencing
-   of pending, handoff, replayed, queued, retry, dead-letter, and dispatchable
-   work; terminal disposition and retirement of policy-fenced raw handoffs;
+   of pending, handoff, replayed, queued, retry, dead-letter, dispatchable,
+   leased, and in-flight work; rejection of late execution outcomes; terminal
+   disposition and retirement of policy-fenced raw handoffs;
    derived-aggregate recomputation without expired contributions; current-time
    duration enforcement; Jobs-scheduled, owner-run active purge within 14 days;
    purge or irreversible anonymization of Jobs project-scoped operational state;
