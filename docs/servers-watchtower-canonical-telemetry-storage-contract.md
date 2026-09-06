@@ -87,11 +87,12 @@ canonical telemetry.
 
 | Data class | Writer and authority | Storage boundary | Lifecycle |
 | --- | --- | --- | --- |
-| Raw accepted records and attachments | Ingest; authoritative for raw acceptance | Encrypted immutable S3 objects plus Ingest PostgreSQL acceptance metadata and outbox state | At least seven days from `accepted_at`, and longer until Processor durably confirms handoff completion; never customer-downloadable |
+| Raw accepted records and attachments | Ingest; authoritative for raw acceptance | Encrypted immutable S3 objects plus Ingest PostgreSQL acceptance metadata and outbox state | Seven days from `accepted_at` by default, subject to a successfully installed shortened project policy, and longer until Processor durably confirms handoff completion when still permitted by that policy; never customer-downloadable |
 | Normalized records | Processor; authoritative only as processing input | Processor-owned encrypted S3 replay-batch prefix, with separate class metadata | Retained only as needed for replay, no longer than 90 days |
 | Enriched records | Processor; authoritative only as processing input | Processor-owned encrypted S3 replay-batch prefix, with separate class metadata | Retained only as needed for replay, no longer than 90 days |
 | Canonical telemetry | Processor; authoritative for the four signal histories | Four independent ClickHouse canonical table families | Immutable history for 90 days from `accepted_at` |
 | Canonical replay representations | Processor; non-authoritative, immutable replay copies of canonical changes | Processor-owned encrypted project-scoped S3 replay-batch prefix with separate class metadata | 90 days from each represented record's `accepted_at`; purged with its project |
+| Default-generation selections | Processor; authoritative mapping of each `watchtower_id` to its promoted `processing_generation` | Processor-owned PostgreSQL selection state and versioned selection changes in Processor canonical replay batches | Retained while its canonical record is eligible; rebuilt from retained selection changes and validated against canonical history before Processor republishes it to Query after recovery |
 | Derived aggregates | Processor; authoritative for mutable derived results | Processor-owned PostgreSQL schemas and encrypted project-scoped derived replay batches | Thirteen months from the greatest `accepted_at` of their currently represented source records; a shortened project policy requires retention-windowed recomputation that removes expired contributions |
 | Compatibility-only representations | The sole owning adapter for each protocol interface; authoritative only for that boundary | Request-scoped memory or an adapter-owned boundary defined by #16 or its signal contract | No canonical retention; never a shared persistence model |
 | Query projections | Query; authoritative only for read projection state | Query-owned ClickHouse databases or schemas | Rebuildable canonical-signal projections are retained for 90 days; derived-aggregate projections use their authoritative aggregate's lifecycle and retention window; all are purged with the project |
@@ -199,6 +200,9 @@ MSK handoff and canonical-change topics retain data for seven days and use:
 
 Processor owns encrypted, project-scoped canonical replay batches in S3 for 90
 days and derived replay batches for their authoritative aggregate lifecycle.
+Each immutable replay batch is retention-homogeneous: every represented item
+has the same effective lifecycle expiry, and Processor does not place items
+with different expiry deadlines in one object.
 Canonical replay batches are non-authoritative immutable copies, not a second
 canonical store; their separate metadata identifies the represented canonical
 versions for reconciliation and deletion. A derived aggregate's lifecycle anchor
@@ -257,15 +261,20 @@ customer-payload content.
 Reprocessing is bounded by project and `accepted_at` range. Each attempt records
 source data class, source and target schema or normalization versions,
 processor release, request or job identity, correlation ID, checksums, counts,
-and outcome. Raw data is the source for ranges within its seven-day retention;
-after that, an eligible retained safe normalized replay batch is the source.
+and outcome. Raw data is the source for ranges within the project's applicable
+raw-retention window, which is seven days by default; after that, an eligible
+retained safe normalized replay batch is the source.
 
 A new result uses a new `processing_generation` and is a candidate until the
 complete requested range passes integrity validation. Processor records the
 authoritative default-generation mapping for each `watchtower_id`; promotion
 updates that mapping only after full-range success. A partial or failed range
-never becomes the default and the prior default result remains active. External
-historical imports are not supported.
+never becomes the default and the prior default result remains active. Processor
+persists the mapping in its selection state and emits versioned selection changes
+with canonical replay metadata. After recovery or rebuild, it replays retained
+selection changes, validates the resulting mapping against canonical history,
+and only then republishes the selection to Query. External historical imports
+are not supported.
 
 ## Export Contract
 
@@ -315,6 +324,20 @@ Safe status and error responses expose no raw payload, secret, or unauthorized
 tenant/project information. The export-specific active-export and daily-request
 limits above are authoritative here; detailed authorization, roles,
 non-export quotas, and credential behavior remain owned by #15.
+
+### Reconciliation digest encoding
+
+Every reconciliation digest is lowercase hexadecimal SHA-256 over one UTF-8
+byte stream. The stream contains one RFC 8785 canonical-JSON tuple per line,
+sorted by the bytewise UTF-8 value of that canonical tuple and terminated by a
+single line-feed. Missing values use JSON `null`; each represented row emits
+one tuple, so repeated correlation values are preserved rather than deduplicated.
+The required tuples are `{"watchtower_id": ...}` for raw acceptance and
+handoff; `{"watchtower_id": ..., "processing_generation": ...}` for canonical
+history, replay, and default-generation selection; that identity tuple plus
+`"correlation_id"` for correlation summaries; and
+`{"aggregate_key": ..., "authoritative_revision": ..., "selected_state": ...}`
+for derived summaries. `selected_state` is itself RFC 8785 canonical JSON.
 
 ## Integrity, Observability, Audit, and Security
 
@@ -403,12 +426,12 @@ The owning implementation contracts must make these scenarios testable:
 2. Fail S3, PostgreSQL, ClickHouse, and MSK operations before and after local
    commits; verify no false successful acceptance and idempotent recovery.
 3. Verify raw-object immutability, SHA-256 and size reconciliation, required
-   MSK durability and seven-day retention settings, and redelivery of
-   unprocessed work after the MSK window expires.
+   MSK durability and seven-day default retention settings, shortened-policy
+   enforcement, and redelivery of unprocessed work after the MSK window expires.
 4. Rebuild eligible canonical and derived Query projections through authorized
    Processor republishing without direct Processor storage access; verify that
-   canonical replay copies remain non-authoritative and reconcile to their
-   represented canonical versions.
+   canonical replay copies remain non-authoritative, have retention-homogeneous
+   expiry, and reconcile to their represented canonical versions.
 5. Shorten retention and delete a project; verify Ingest, Processor, and Query
    install and enforce each policy fence before acknowledgement; fencing of
    pending, handoff, or replayed excess work; terminal disposition and retirement
@@ -418,14 +441,16 @@ The owning implementation contracts must make these scenarios testable:
    recovery before restored owners accept traffic; export cancellation; cache
    invalidation; and minimal anonymous evidence.
 6. Export permitted signals and verify Parquet output, manifest checksums, row
-   counts, generation-aware canonical and revision-aware derived reconciliation
-   summaries, default-generation selection, Processor-to-Query watermark
+   counts, independently recomputable canonical digest tuples, generation-aware
+   canonical and revision-aware derived reconciliation summaries,
+   default-generation selection, Processor-to-Query watermark
    completion, Query-issued URLs no longer than their remaining object lifetime,
    authorization recheck, rate limits, and oversized-request
    `resource_exhausted` behavior.
 7. Reprocess a successful and a partially failed range; verify provenance,
    distinct processing generations, full-range promotion, preservation of the
-   prior default result, generation-aware cross-stage reconciliation, and
+   prior default result, selection-state recovery and republishing after a
+   Processor rebuild, generation-aware cross-stage reconciliation, and
    consistent derived-aggregate lifecycle anchors after later contributions.
 8. Attempt cross-tenant access through PostgreSQL, ClickHouse, S3, MSK,
    projections, exports, and break-glass workflows; verify denial and required
