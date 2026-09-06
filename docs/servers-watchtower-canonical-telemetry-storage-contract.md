@@ -221,12 +221,16 @@ every message schema version retained in the applicable replay horizon.
 Retention is calculated from `accepted_at`, except that a derived aggregate and
 its replay batches and Query projections use the retention-windowed lifecycle
 defined above. Authorized project administrators may shorten a project retention
-policy but may not extend it through this contract. API records each versioned
-shortened duration policy in its restore-independent retention policy registry.
-Ingest, Processor, and Query each compute its effective cutoff from that duration
-and current time whenever enforcing admission, read, processing, replay, export,
-or rebuild behavior. API reports success only after each owner durably installs
-and enforces the policy. Until acknowledgement, the mutation fails closed. Before
+policy but may not extend it through this contract. API assigns every project
+policy a strictly monotonic generation and records each versioned shortened
+duration policy in its restore-independent retention policy registry. Ingest,
+Processor, and Query each durably retain the highest installed generation, ignore
+lower-generation deliveries, and acknowledge installation only for the matching
+or an idempotent equal generation. Each owner computes its effective cutoff from
+that duration and current time whenever enforcing admission, read, processing,
+replay, export, or rebuild behavior. API reports success only after each owner
+durably installs and enforces the policy. Until acknowledgement, the mutation
+fails closed. Before
 its acknowledgement, Ingest stops admitting excess records and serving excess raw
 data, Processor durably fences queued, pending-handoff, and replayed work whose
 `accepted_at` falls outside the new limit, prevents canonical or derived
@@ -251,8 +255,11 @@ fences the project for that generation before acknowledgement: Ingest rejects
 collection and pending raw handoffs, Processor rejects pending or replayed work
 and canonical or derived republishing, Query rejects reads, restoration, exports,
 and new projection rebuilds, and Jobs cancels and fences queued, retry,
-dead-letter, and dispatchable project work. Query invalidates cache entries
-immediately. Active stores, including raw, canonical, derived, projections,
+dead-letter, dispatchable, leased, and in-flight project work. Before Jobs
+acknowledges, it prevents further dispatch for that generation and rejects late
+execution outcomes so they cannot recreate project-scoped execution state. Query
+invalidates cache entries immediately. Active stores, including raw, canonical,
+derived, projections,
 replay batches, export objects, and Jobs project-scoped operational state, are
 purged or irreversibly anonymized within 14 days. Backups are purged within 90
 days, and deleted project data is not restored from a backup. Before a restored API
@@ -302,8 +309,9 @@ SHA-256 checksums. For every Parquet object, the manifest also records a row
 count and deterministic reconciliation summaries: ordered Watchtower-ID,
 processing-generation, and correlation-ID digests where those fields are
 represented. For derived rows, it records an ordered digest of aggregate keys,
-authoritative derived revisions, and selected aggregate state at the derived
-watermark. For canonical rows, the manifest additionally records the
+authoritative derived revisions, selected aggregate state, and deterministic
+selected-canonical-source-set digests at the derived watermark. For canonical
+rows, the manifest additionally records the
 deterministic digest of the authoritative default-generation selection at the
 snapshot watermark; every exported canonical row must match that selection.
 These summaries are the export reconciliation source. A project may have one
@@ -344,8 +352,13 @@ The required tuples are `{"watchtower_id": ...}` for raw acceptance and
 handoff; `{"watchtower_id": ..., "processing_generation": ...}` for canonical
 history, replay, and default-generation selection; that identity tuple plus
 `"correlation_id"` for correlation summaries; and
-`{"aggregate_key": ..., "authoritative_revision": ..., "selected_state": ...}`
-for derived summaries. `selected_state` is itself RFC 8785 canonical JSON.
+`{"aggregate_key": ..., "authoritative_revision": ..., "selected_state": ...,
+"source_set_digest": ...}` for derived summaries. `selected_state` is itself
+RFC 8785 canonical JSON. Each `source_set_digest` is SHA-256 over the same
+line-delimited canonical-JSON encoding of the aggregate's selected canonical
+source `{"watchtower_id": ..., "processing_generation": ...}` tuples. It
+commits to every represented source membership, including multiple sources with
+the same aggregate value.
 
 ## Integrity, Observability, Audit, and Security
 
