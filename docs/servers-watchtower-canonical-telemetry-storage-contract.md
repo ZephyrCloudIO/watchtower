@@ -56,11 +56,14 @@ Every canonical record contains the following typed fields:
 | `source_timezone` | Optional compatibility metadata only. It never changes UTC interpretation or ordering. |
 | `external_keys` | Scoped compatibility or correlation keys, each bound to a protocol and scope. They are never Watchtower primary keys. |
 
-Canonical and message timestamps use UTC RFC 3339 with nanosecond precision.
-Storage must preserve nanosecond precision even where the physical type is not
-the wire representation. Watchtower IDs are globally non-reused across tenants
-and the four signal families. External keys are scoped by tenant, project,
-protocol, and source namespace, so equal external values in different scopes
+Canonical and message timestamps use exactly
+`YYYY-MM-DDTHH:mm:ss.sssssssssZ`: UTC, nine fractional-second digits, and a
+trailing `Z`, with no numeric offset or omitted fraction. Producers normalize
+equivalent instants to this representation before RFC 8785 canonicalization and
+digesting. Storage must preserve nanosecond precision even where the physical
+type is not the wire representation. Watchtower IDs are globally non-reused
+across tenants and the four signal families. External keys are scoped by tenant,
+project, protocol, and source namespace, so equal external values in different scopes
 remain distinct. W3C trace context and external protocol identifiers remain
 correlation or compatibility material; a Sentry event ID, OpenTelemetry trace
 or span ID, or any other external ID cannot be used interchangeably with
@@ -91,7 +94,7 @@ canonical telemetry.
 
 | Data class | Writer and authority | Storage boundary | Lifecycle |
 | --- | --- | --- | --- |
-| Raw accepted records and attachments | Ingest; authoritative for raw acceptance | Encrypted immutable S3 objects plus Ingest PostgreSQL acceptance metadata and outbox state | Seven days from `accepted_at` by default; a project policy may shorten this cutoff but never extend it, and raw state may remain only until Processor durably confirms handoff completion within that cutoff; never customer-downloadable |
+| Raw accepted records and attachments | Ingest; authoritative for raw acceptance | Encrypted immutable S3 objects plus Ingest PostgreSQL acceptance metadata and outbox state | Seven days from `accepted_at` by default; a project policy may shorten this cutoff but never extend it, and raw state may remain only until Processor durably confirms handoff completion or Ingest durably records class-default expiry within that cutoff; never customer-downloadable |
 | Normalized records | Processor; authoritative only as processing input | Processor-owned encrypted S3 replay-batch prefix, with separate class metadata | Retained as needed for replay; a verified normalized representation is retained at least through the applicable raw-retention cutoff whenever raw may retire after successful handoff, and never longer than 90 days |
 | Enriched records | Processor; authoritative only as processing input | Processor-owned encrypted S3 replay-batch prefix, with separate class metadata | Retained only as needed for replay, no longer than 90 days |
 | Canonical telemetry | Processor; authoritative for the four signal histories | Four independent ClickHouse canonical table families | Immutable history for 90 days from `accepted_at` |
@@ -162,8 +165,9 @@ its digest and size have been verified, and the acceptance metadata and
 transactional outbox commit. Orphaned or incomplete attempts are reconciled
 without being reported as successful acceptance. The raw object, acceptance
 metadata, and recoverable handoff remain until Processor durably confirms
-completion through the versioned `RawHandoffDispositionV1` message. For a
-`completed` disposition, Processor commits the verified normalized replay
+completion through the versioned `RawHandoffDispositionV1` message or Ingest
+durably records a class-default expiry fence through `RawRetentionExpiryV1`.
+For a `completed` disposition, Processor commits the verified normalized replay
 representation before sending the disposition, so Ingest may retire raw state
 immediately without losing the reprocessing source. Ingest redelivers and
 reconciles pending handoffs if the seven-day MSK window expires.
@@ -267,23 +271,26 @@ non-destructive pending fences. A pending fence may reject new admission, read,
 processing, export, or rebuild work that would violate the proposed cutoff or
 deletion scope, but it must not purge, anonymize, retire raw state, or destroy
 aggregate contributions. Each owner sends the versioned
-`LifecyclePurgeRegistrationV1` handoff to Jobs with its owner, mutation kind,
-authorized scope, generation, affected data classes, correlation identifier,
-and idempotency key. Jobs durably returns the matching
-`purge_registration_id` in `paused` state, and the owner persists that
-registration reference with its pending fence before returning a matching
-`LifecycleMutationAcknowledgementV1` with `phase=prepared`. Jobs handles its
-own local registration in the same durable operation. Every durable purge
-registration has a `purge_registration_id` that is a canonical lowercase UUID
-v7 at component boundaries and a PostgreSQL `uuid` in Jobs state; activation
-and cleanup use the same generation-matched registration ID.
+`LifecyclePurgeRegistrationV1` handoff to Jobs with
+`registration_phase=prepare`, its owner, mutation kind, authorized scope,
+generation, affected data classes, correlation identifier, and idempotency key.
+Jobs durably returns the matching `purge_registration_id` in `paused` state,
+and the owner persists that registration reference with its pending fence before
+returning a matching `LifecycleMutationAcknowledgementV1` with
+`phase=prepared`. Jobs handles its own local registration in the same durable
+operation. Every durable purge registration has a `purge_registration_id` that
+is a canonical lowercase UUID v7 at component boundaries and a PostgreSQL
+`uuid` in Jobs state.
 
 After every required prepared acknowledgement arrives, API atomically commits
 the matching active policy or tombstone generation and sends the activate phase.
-Only after that commit may Jobs enable the recurring purge schedule and may
-owners perform irreversible retention or deletion work. Owners return a
-generation-matched acknowledgement with `phase=active` after enabling the
-active fence and schedule. API reports successful mutation only after every
+Each owner then resends `LifecyclePurgeRegistrationV1` with
+`registration_phase=activate` and the generation-matched
+`purge_registration_id`. Jobs transitions that paused registration to
+`active`, enables the schedule, and returns the matching active state; Jobs
+performs the same transition for its local registration. Only after that
+acknowledgement may an owner report `phase=active` or perform irreversible
+retention or deletion work. API reports successful mutation only after every
 required active acknowledgement confirms the matching generation, installed
 fence, and enabled purge registration. If preparation or activation is
 incomplete, the durable mutation remains `accepted_pending` and is retried;
@@ -303,13 +310,21 @@ message with a terminal
 `policy_rejected` disposition for each handoff rejected by the shortened policy;
 for an unprocessed handoff that crosses the seven-day class default without a
 shortened policy, it returns `default_expired` with
-`expiry_basis=class_default` and no retention-policy generation. Ingest records
-either disposition as terminal, retires its outbox entry, and purges the
-corresponding raw object and acceptance metadata. Jobs owns a durable recurring
+`expiry_basis=class_default` and no retention-policy generation. If that cutoff
+arrives while Processor is unavailable, Jobs sends the versioned
+`RawRetentionExpiryV1` command to Ingest. Ingest verifies the current cutoff,
+durably records the same `default_expired` fence, retires the matching outbox
+entry, and purges the raw object and acceptance metadata without waiting for
+Processor. `RawPayloadFetchV1` and late Processor dispositions reject a handoff
+already fenced by Ingest expiry. Jobs owns a durable recurring
 baseline lifecycle-purge registration for every applicable project and data
-class, even when the project keeps the default policy. A shortened policy or
-project deletion adds a generation-scoped registration; its schedule is paused
-during prepare and enabled only after activation. Jobs owns scheduling and
+class, even when the project keeps the default policy. Project creation causes
+each applicable data owner to submit an idempotent baseline
+`LifecyclePurgeRegistrationV1` with the active default-policy generation; Jobs
+returns and persists an active registration before acknowledging that owner. A
+shortened policy or project deletion adds a generation-scoped registration; its
+schedule is paused during prepare and enabled only after the activation
+handshake. Jobs owns scheduling and
 retrying each purge dispatch; on every run, the data owner applies the
 current-time effective cutoff and idempotently purges all newly expired data
 within 14 days. For derived aggregates, the baseline schedule recomputes or
@@ -346,8 +361,11 @@ purged or irreversibly anonymized within 14 days. Backups are purged within 90
 days of deletion, and deleted project data is not restored from a backup. Before
 a restored API database accepts traffic, API loads the current registry and
 reapplies every current tombstone to identify, fence, and purge deleted-project
-rows. Before accepting deletion, API irreversibly removes every retention-policy
-registry version for the project. API retains the non-customer-readable registry tombstone
+rows. While deletion is pending, API retains every active and effective
+retention-policy registry version for the project so restored owners can enforce
+the shortened cutoff. Only after the tombstone is active and the required purge
+activation acknowledgements are complete may API irreversibly remove those
+project policy versions. API retains the non-customer-readable registry tombstone
 for 13 months. Audit rows remain append-only and are never updated or deleted:
 their actor or workload identity, tenant/project context, action, and target
 resource are encrypted under an erasable project-scoped context key, and
@@ -356,7 +374,12 @@ remains available after project deletion: deletion timestamp, result,
 correlation ID, and the keyed tombstone, without tenant-identifying or
 customer-payload content.
 
-Reprocessing is bounded by project and `accepted_at` range. Each attempt records
+Every `accepted_at` range is half-open, `[start, end)`: `start` is inclusive and
+`end` is exclusive. This convention applies to reprocessing, retention
+enforcement, export holds and execution, projection rebuilds, manifests, and
+every related message or query. A record whose `accepted_at` equals `end` is
+outside the range, and adjacent ranges do not overlap. Reprocessing is bounded
+by project and `accepted_at` range. Each attempt records
 source data class, source and target schema or normalization versions,
 processor release, request or job identity, correlation ID, checksums, counts,
 and outcome. Raw data is the preferred source for ranges within the project's
@@ -416,18 +439,23 @@ Before Query may materialize an export, Processor's
 requested inputs and exact watermark vectors. Each hold is keyed by `export_id`
 and `export_revision`, covers every selected canonical partition or derived
 aggregate and the Query projection, and remains until the export reaches a
-terminal state. Query records an immutable snapshot generation only after every
+terminal state. Query records an immutable `snapshot_generation` only after every
 canonical vector sequence and derived aggregate revision is materialized at the
-requested target. If a hold cannot be installed or any vector member can no
+requested target. `snapshot_generation` is a Query-created canonical lowercase
+UUID v7 at external and component boundaries and is stored as PostgreSQL `uuid`
+in Query export metadata. If a hold cannot be installed or any vector member can no
 longer be materialized, Query emits a terminal `failed` outcome and no partial
 artifact; it never silently omits records present at request creation. After
 all requested vectors are complete, Query emits a versioned export outcome
 containing `export_id`, `export_revision`, outcome, manifest, vectors, and
-snapshot generation; API alone records the resulting lifecycle transition and
+`snapshot_generation`; API alone records the resulting lifecycle transition and
 publishes the terminal `ExportSnapshotHoldReleaseV1` command to Processor and
-Query. The release is idempotent and revision-fenced, and remains durably
-retryable until both owners confirm it. The manifest records the complete
-vectors and Query snapshot generation. Exports never include raw data, caches,
+Query. The release contains both the `held_export_revision` used to key the
+installed hold and the current terminal `export_revision`, so cancellation can
+advance the API revision without losing the old hold key. The release is
+idempotent and revision-fenced, and remains durably retryable until both owners
+confirm it. The manifest records the complete
+vectors and Query `snapshot_generation`. Exports never include raw data, caches,
 or audit records.
 
 An export contains Parquet data and a JSON manifest with the schema version,
@@ -457,13 +485,16 @@ or otherwise stale outcomes and every outcome received after a terminal state
 has been recorded. Cancellation advances the revision and fences in-flight
 work, so a late completion cannot restore a canceled export and a late failure
 cannot overwrite a successful one. Query stops or invalidates the associated
-artifact when cancellation is fenced. Jobs schedules an idempotent
-`ExportExpiryV1` handoff for `completed_at + 7 days`. API authoritatively
+artifact when cancellation is fenced. When API persists a successful
+`completed` transition, it sends Jobs an idempotent `ExportExpiryScheduleV1`
+request containing the export ID, current export revision, and authoritative
+`completed_at`. Jobs persists that timestamp and schedules the idempotent
+`ExportExpiryV1` handoff for exactly `completed_at + 7 days`. API authoritatively
 transitions a still-completed export to `expired`, advances its revision, and
 publishes the invalidation to Query even if the artifact has already become
 inaccessible. Query invalidates the artifact and rejects every expired download.
-API records `completed_at` as the UTC time
-it persists a successful `completed` transition, and export objects are retained
+API records `completed_at` as the canonical UTC timestamp at which it persists a
+successful `completed` transition, and export objects are retained
 for seven days from that timestamp, independent of the records' `accepted_at`
 values. API rechecks authorization immediately before requesting a Query-owned
 authorized download-gateway URL of up to one hour, capped at the export object's
@@ -499,6 +530,8 @@ byte stream. The stream contains one RFC 8785 canonical-JSON tuple per line,
 sorted by the bytewise UTF-8 value of that canonical tuple and terminated by a
 single line-feed. Missing values use JSON `null`; each represented row emits
 one tuple, so repeated correlation values are preserved rather than deduplicated.
+Before any digest is computed, every timestamp value is normalized to the exact
+UTC nine-fractional-digit `...Z` representation defined in the canonical model.
 For every canonical row, `canonical_content_digest` is lowercase hexadecimal
 SHA-256 over the RFC 8785 canonical-JSON encoding of the complete typed
 canonical record, including common fields, signal-specific fields, and
@@ -624,7 +657,8 @@ The owning implementation contracts must make these scenarios testable:
    reject out-of-range extension integers and non-finite extension floats before
    canonicalization; verify tagged integer and finite-float values produce
    different canonical-content digests even when their numeric values compare
-   equal.
+   equal; normalize equivalent timestamp spellings to the exact nine-digit UTC
+   `Z` representation before digesting.
 2. Fail S3, PostgreSQL, ClickHouse, and MSK operations before and after local
    commits; verify no false successful acceptance and idempotent recovery.
 3. Verify raw-object immutability, SHA-256 and size reconciliation, required
@@ -632,7 +666,9 @@ The owning implementation contracts must make these scenarios testable:
    enforcement without allowing a project duration to extend a shorter class
    default, redelivery of unprocessed work after the MSK window expires, the
    `default_expired` disposition for an unprocessed handoff beyond the class
-   default, and generation-aware reconciliation of each completed handoff to a
+   default, the Jobs-to-Ingest `RawRetentionExpiryV1` path during Processor
+   outage, rejection of late fetches or dispositions after the Ingest expiry
+   fence, and generation-aware reconciliation of each completed handoff to a
    promoted canonical default or durable terminal disposition before raw
    retirement.
 4. Rebuild eligible canonical and derived Query projections through an
@@ -646,10 +682,12 @@ The owning implementation contracts must make these scenarios testable:
 5. Shorten retention and delete a project; verify each owner uses the
    versioned `LifecyclePurgeRegistrationV1` handoff and cannot return a prepare
    acknowledgement until its matching paused Jobs registration is durable,
-   install only non-destructive pending fences, activation commits the barrier
-   before any purge or anonymization, and an unavailable owner leaves the
-   mutation durably `accepted_pending` rather than failing after destructive
-   work starts; verify canonical lowercase UUID v7 `purge_registration_id`
+   require each owner to activate that registration with Jobs before returning
+   `phase=active`, install only non-destructive pending fences, activation
+   commits the barrier before any purge or anonymization, and an unavailable
+   owner leaves the mutation durably `accepted_pending` rather than failing
+   after destructive work starts; verify canonical lowercase UUID v7
+   `purge_registration_id`
    values and PostgreSQL `uuid` Jobs state; fencing of
    pending, handoff, replayed, queued, retry, dead-letter, dispatchable, leased,
    and in-flight work; rejection of late execution outcomes; terminal disposition
@@ -660,8 +698,8 @@ The owning implementation contracts must make these scenarios testable:
    installation within 14 days;
    purge or irreversible anonymization of Jobs project-scoped operational state;
    backup purge or irreversible inaccessibility within 90 days of each applicable
-   expiry, including deleted-project data; removal of every project
-   retention-policy registry record; restore-independent retention and
+   expiry, including deleted-project data; retention of the active project policy
+   until tombstone activation and only then its removal; restore-independent retention and
    tombstone-registry recovery before any restored or rebuilt owner accepts
    traffic; export cancellation; cache invalidation; generation-matched
    `LifecycleMutationAcknowledgementV1` outcomes; durable audit intent before a
@@ -679,14 +717,18 @@ The owning implementation contracts must make these scenarios testable:
    be materialized, `ExportSnapshotHoldReleaseV1` delivery after completion,
    failure, and cancellation, Query-to-API versioned completion outcomes and
    API-only lifecycle persistence, rejection of stale outcomes after
-   cancellation or another terminal transition, Jobs-scheduled
+   cancellation or another terminal transition, release of the originally held
+   revision when cancellation advances the export revision, the API-to-Jobs
+   `ExportExpiryScheduleV1` handoff carrying authoritative `completed_at`, Jobs-scheduled
    `completed_at + 7 days` expiry and the authoritative API `expired` transition,
    Query-issued URLs no longer than their remaining object lifetime and
    seven-day object expiry anchored at `completed_at`, immediate cleanup of
    failed or canceled partial objects, revision-fenced authorization revocation,
    authorization recheck, rate limits, and oversized-request
    `resource_exhausted` behavior.
-7. Reprocess a successful and a partially failed range; verify provenance,
+7. Reprocess a successful and a partially failed `[start, end)` range; verify
+   that records exactly at `end` are excluded and adjacent ranges do not
+   overlap; verify provenance,
    distinct processing generations, full-range promotion, preservation of the
    prior default result, ordered per-record selection revisions with stale
    delivery rejection, selection-state recovery and republishing after a
