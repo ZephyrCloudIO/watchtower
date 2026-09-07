@@ -73,7 +73,9 @@ or span ID, or any other external ID cannot be used interchangeably with
 
 Extension attributes are a flat, typed, namespaced collection. A value is only
 one of `null`, boolean, string, integer, finite float, or a homogeneous array of
-one primitive kind. Arrays cannot contain nested arrays or objects. Attribute
+one primitive kind. Finite float values equal to zero are normalized to `+0.0`
+before canonical storage, replay, export, or digesting, so signed zero is not a
+distinct canonical value. Arrays cannot contain nested arrays or objects. Attribute
 names must include an owning namespace, and the namespace does not permit an
 unbounded raw structure. Integer values are restricted to the exact IEEE-754
 safe-integer range `[-(2^53 - 1), 2^53 - 1]`; larger integers are rejected
@@ -341,8 +343,10 @@ During prepare, Ingest, Processor, Query, and Jobs durably retain the highest
 prepared generation, ignore lower-generation deliveries, and install only
 non-destructive pending fences. A pending fence may reject new admission, read,
 processing, export, or rebuild work that would violate the proposed cutoff or
-deletion scope, but it must not purge, anonymize, retire raw state, or destroy
-aggregate contributions. Each owner sends the versioned
+deletion scope, but it must not execute the pending mutation's purge,
+anonymization, raw retirement, or aggregate-contribution destruction. Previously
+active baseline and retention-policy schedules continue to enforce their own
+effective cutoffs during a stalled prepare. Each owner sends the versioned
 `LifecyclePurgeRegistrationV1` handoff to Jobs with
 `registration_phase=prepare`, its owner, mutation kind, authorized scope,
 generation, affected data classes, correlation identifier, and idempotency key.
@@ -434,7 +438,12 @@ and deletion-tombstone registry snapshots from API through the versioned
 them before readiness, and enforces them. Each data owner reapplies its effective
 cutoff and fences excess data; Jobs restores the associated baseline, policy,
 and deletion scheduling and fences.
-There is no cold archive.
+Before a restored or rebuilt Jobs owner becomes ready, it reconciles its local
+baseline registrations against the active-project inventory returned by
+`ControlRegistrySnapshotV1`, recreating missing registrations idempotently for
+every applicable project and data class, including projects with the default
+policy. It then restores the associated policy and deletion scheduling and
+fences. There is no cold archive.
 
 Project deletion is project-wide and uses the same prepare/activate barrier. API
 records a versioned deletion generation and keyed project tombstone in a pending
@@ -442,8 +451,10 @@ state in its append-only restore-independent registry. Each owner installs a
 pending project fence before returning `phase=prepared`: Ingest rejects new
 collection and pending raw handoffs, Processor rejects new pending or replayed
 work and republishing, Query rejects new reads, restoration, exports, and
-projection rebuilds, and Jobs fences new non-purge work. No project data is
-purged or anonymized during prepare. After API commits the active tombstone,
+projection rebuilds, and Jobs fences new non-purge work. A pending deletion
+registration does not dispatch deletion-specific purge or anonymization during
+prepare; previously active baseline and retention-policy schedules continue to
+enforce their own effective cutoffs. After API commits the active tombstone,
 Jobs enables the versioned project-purge schedule and dispatches it; Ingest,
 Processor, Query, and Jobs return `phase=active` acknowledgements after the
 active fence and purge registration are installed. API fails closed until the
@@ -528,18 +539,22 @@ authenticated, versioned `ExportSnapshotHoldInstallV1` request containing
 Processor atomically installs the export-scoped hold and returns a correlated,
 versioned response with complete watermark vectors. The canonical vector is
 keyed by every requested Processor change partition and contains that
-partition's monotonic sequence. The derived vector is keyed by every requested
-fully qualified aggregate key and contains that aggregate's
-`authoritative_revision`; an aggregate with no eligible state has an explicit
-empty revision entry. Entries from different partitions or aggregates are never
-compared as one global order, and a response missing any requested entry is
-invalid. API persists the exact vectors and sends them only in the durable
-scheduling request to Jobs. Jobs durably owns the export schedule, lease, retry,
-and cancellation state, then dispatches a revision-fenced `ExportExecutionV1`
-command to Query carrying the API-persisted vectors, authorized scope, range,
-selected signals, and `export_revision`. Query does not execute an export from
-a direct API dispatch or infer an authoritative watermark from its local
-projection.
+partition's monotonic sequence. The selection vector is keyed by every
+requested canonical `(partition, watchtower_id)` record and contains its
+monotonic `selection_revision` and selected `processing_generation`. Processor
+holds promotions affecting those records until the export hold is released, so
+the selected generation cannot change after the vector is captured. The derived
+vector is keyed by every requested fully qualified aggregate key and contains
+that aggregate's `authoritative_revision`; an aggregate with no eligible state
+has an explicit empty revision entry. Entries from different partitions,
+records, or aggregates are never compared as one global order, and a response
+missing any requested entry is invalid. API persists the exact vectors and sends
+them only in the durable scheduling request to Jobs. Jobs durably owns the
+export schedule, lease, retry, and cancellation state, then dispatches a
+revision-fenced `ExportExecutionV1` command to Query carrying the
+API-persisted vectors, authorized scope, range, selected signals, and
+`export_revision`. Query does not execute an export from a direct API dispatch
+or infer an authoritative watermark from its local projection.
 
 When API records cancellation, including cancellation caused by an activated
 shortened retention policy, it sends the revision-fenced
@@ -551,18 +566,29 @@ acknowledging it and rejects stale or post-terminal `ExportExecutionV1`
 commands. API does not release the held revision until Jobs and Query confirm
 the cancellation fence.
 
+When Query emits a terminal `failed` outcome, API appends a failure intent to the
+restore-independent hold registry and sends a revision-fenced `ExportFailureV1`
+command to Jobs containing the held and terminal export revisions, failure
+reason, authorized scope, correlation identifier, and idempotency key. Jobs
+durably fences queued, leased, retry, and in-flight execution state and
+acknowledges the terminal failure before API releases the held revision. Query's
+failed terminal fence continues to reject stale or post-terminal
+`ExportExecutionV1` commands.
+
 Before Query may materialize an export, Processor's
 `ExportSnapshotHoldInstallV1` response and the Jobs-to-Query
 `ExportExecutionV1` command durably establish export-scoped holds for the
 requested inputs and exact watermark vectors. Each hold is keyed by `export_id`
-and `export_revision`, covers every selected canonical partition or derived
-aggregate and the Query projection, and remains until the export reaches a
-terminal state. Processor and Query report their held `(export_id,
+and `export_revision`, covers every selected canonical partition, selection
+vector entry, or derived aggregate and the Query projection, and remains until
+the export reaches a terminal state. Processor and Query report their held
+`(export_id,
 export_revision)` inventory through the authenticated versioned
 `ExportHoldInventoryV1` reconciliation interface. Query records
 an immutable `snapshot_generation` only after every
-canonical vector sequence and derived aggregate revision is materialized at the
-requested target. `snapshot_generation` is a Query-created canonical lowercase
+canonical vector sequence, selection revision and generation, and derived
+aggregate revision is materialized at the requested target.
+`snapshot_generation` is a Query-created canonical lowercase
 UUID v7 at external and component boundaries and is stored as PostgreSQL `uuid`
 in Query's owned PostgreSQL export-metadata boundary. If a hold cannot be
 installed or any vector member can no
@@ -579,7 +605,7 @@ idempotent and revision-fenced, and remains durably retryable until both owners
 confirm it. Before API persists a terminal lifecycle transition or dispatches
 its corresponding cleanup command, it appends an immutable terminal intent to
 the restore-independent hold registry. A cancellation intent precedes
-`ExportCancellationV1`; a release intent precedes
+`ExportCancellationV1`; a failure intent precedes `ExportFailureV1`; a release intent precedes
 `ExportSnapshotHoldReleaseV1`. Before API commits a successful `completed`
 transition, it appends a completion/expiry intent containing the authoritative
 `completed_at`, export revision, effective export-object expiry deadline, and
@@ -609,8 +635,8 @@ authoritative derived revisions, selected aggregate state, and deterministic
 selected-canonical-source-set digests at the corresponding derived watermark
 vector entries. For canonical rows, the manifest additionally records the
 deterministic digest of the authoritative default-generation selection at the
-corresponding canonical vector entries; every exported canonical row must match
-that selection.
+corresponding canonical and selection vector entries; every exported canonical
+row must match that selection and its captured `selection_revision`.
 These summaries are the export reconciliation source. A project may have one
 active export and at most three export requests per UTC day. Each signal range
 is limited to 31 days and 100 GiB uncompressed. A larger request fails safely
@@ -677,7 +703,8 @@ sorted by the bytewise UTF-8 value of that canonical tuple and terminated by a
 single line-feed. Missing values use JSON `null`; each represented row emits
 one tuple, so repeated correlation values are preserved rather than deduplicated.
 Before any digest is computed, every timestamp value is normalized to the exact
-UTC nine-fractional-digit `...Z` representation defined in the canonical model.
+UTC nine-fractional-digit `...Z` representation defined in the canonical model,
+and every finite float equal to zero is normalized to `+0.0`.
 For every canonical row, `canonical_content_digest` is lowercase hexadecimal
 SHA-256 over the RFC 8785 canonical-JSON encoding of the complete typed
 canonical record, including common fields, signal-specific fields, and
@@ -695,8 +722,9 @@ encoded with RFC 8785 canonical JSON. This tagged representation is identical
 across authoritative storage, replay, Query projections, and exports.
 The required tuples are `{"watchtower_id": ...}` for raw acceptance and
 handoff; `{"watchtower_id": ..., "processing_generation": ..., "canonical_content_digest": ...}`
-for canonical history, replay, Query projections, default-generation selection,
-and canonical exports; that identity tuple plus `"correlation_id"` for
+for canonical history, replay, Query projections, and default-generation
+selection; canonical export tuples additionally include `"selection_revision"`.
+That identity tuple plus `"correlation_id"` is used for
 correlation summaries; and
 `{"aggregate_key": ..., "authoritative_revision": ..., "selected_state": ...,
 "source_set_digest": ...}` for derived summaries. `selected_state` is itself
@@ -809,8 +837,8 @@ The owning implementation contracts must make these scenarios testable:
    reject out-of-range extension integers and non-finite extension floats before
    canonicalization; verify tagged integer and finite-float values produce
    different canonical-content digests even when their numeric values compare
-   equal; normalize equivalent timestamp spellings to the exact nine-digit UTC
-   `Z` representation before digesting.
+   equal; normalize signed zero to `+0.0`; normalize equivalent timestamp
+   spellings to the exact nine-digit UTC `Z` representation before digesting.
 2. Fail S3, PostgreSQL, ClickHouse, and MSK operations before and after local
    commits; verify no false successful acceptance and idempotent recovery.
 3. Verify raw-object immutability, SHA-256 and size reconciliation, required
@@ -850,7 +878,10 @@ The owning implementation contracts must make these scenarios testable:
    `phase=active`, install only non-destructive pending fences, activation
    commits the barrier before any purge or anonymization, and an unavailable
    owner leaves the mutation durably `accepted_pending` rather than failing
-   after destructive work starts; verify canonical lowercase UUID v7
+   after destructive work starts; while deletion remains `accepted_pending`,
+   verify previously active baseline and retention-policy schedules continue
+   enforcing their effective cutoffs while deletion-specific purge remains
+   paused; verify canonical lowercase UUID v7
    `purge_registration_id`
    values and PostgreSQL `uuid` Jobs state; fencing of
    pending, handoff, replayed, queued, retry, dead-letter, dispatchable, leased,
@@ -870,7 +901,9 @@ The owning implementation contracts must make these scenarios testable:
    until tombstone activation and only then its removal; restore-independent
    retention, tombstone, API audit-intent, API audit-journal, and export-hold/
    expiry-intent
-   registry recovery before any restored or rebuilt owner accepts traffic;
+   registry recovery before any restored or rebuilt owner accepts traffic,
+   including Jobs rebuilding a missing default-policy baseline registration from
+   the active-project inventory;
    shortened-retention activation must expire and revoke every still-downloadable
    completed export whose selected source or export-object cutoff crosses the new
    cutoff before the policy becomes active, and must reschedule artifacts whose
@@ -886,7 +919,8 @@ The owning implementation contracts must make these scenarios testable:
    canonical-content and per-aggregate revision-aware derived reconciliation
    summaries, default-generation selection, API-to-Processor correlated
    `ExportSnapshotHoldInstallV1` request/response with complete canonical
-   partition-sequence and derived watermark vectors, API-to-Jobs scheduling,
+   partition-sequence, per-record selection-revision, and derived watermark
+   vectors, promotion fencing for held selections, API-to-Jobs scheduling,
    Jobs-to-Query
    revision-fenced execution with the returned vectors, export snapshot holds
    through terminal completion, safe failure when any held vector member cannot
@@ -895,7 +929,8 @@ The owning implementation contracts must make these scenarios testable:
    API-only lifecycle persistence, rejection of stale outcomes after
    cancellation or another terminal transition, release of the originally held
    revision when cancellation advances the export revision, the API-to-Jobs
-   `ExportCancellationV1` and `ExportExecutionCancellationV1` terminal fences,
+   `ExportCancellationV1`, `ExportFailureV1`, and
+   `ExportExecutionCancellationV1` terminal fences,
    `ExportExpiryScheduleV1` handoff carrying authoritative `completed_at`, the
    restore-independent completion/expiry intent, Jobs-scheduled expiry at the
    earlier of `completed_at + 7 days` and the export-object policy cutoff, and

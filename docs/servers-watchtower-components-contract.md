@@ -402,13 +402,15 @@ integrity failure that cannot retire raw state.
 
 The registry-snapshot handoff is a versioned unary Protobuf-over-HTTP call under
 `/internal/v1` from each of Ingest, Processor, Query, and Jobs to API. Each owner
-requests the current retention-policy and deletion-tombstone snapshots with its
-authenticated owner identity, correlation, and idempotency context. API returns
-the versioned snapshots and their highest generations; the requesting owner
-persists them before readiness and fails closed if the snapshot cannot be
-installed. Subsequent policy and deletion mutations use the same
-generation-aware durable handoffs, while this request repairs state after
-restoration or rebuild.
+requests the current retention-policy and deletion-tombstone snapshots plus the
+active-project baseline lifecycle-registration inventory with its authenticated
+owner identity, correlation, and idempotency context. The inventory covers every
+active project and applicable data class, including default-policy projects that
+have no shortened-retention policy row. API returns the versioned snapshots,
+inventory, and their highest generations; the requesting owner persists them
+before readiness and fails closed if the snapshot cannot be installed.
+Subsequent policy and deletion mutations use the same generation-aware durable
+handoffs, while this request repairs state after restoration or rebuild.
 
 Retention-policy and project-deletion barriers use a versioned unary
 `LifecycleMutationV1` Protobuf-over-HTTP request from API to each of Ingest,
@@ -448,8 +450,10 @@ acknowledgements match; only then may the activation handshake enable purge,
 anonymization, raw retirement, or other irreversible work. API returns
 `accepted_pending` while either phase is incomplete and reports success only
 after all required active acknowledgements match. Stale, conflicting, or
-incomplete acknowledgements fail closed, and no destructive work may run from a
-pending registration.
+incomplete acknowledgements fail closed, and no purge or anonymization caused
+by the pending mutation may run from a pending registration. Previously active
+baseline and retention-policy schedules continue to enforce their own effective
+cutoffs during a stalled prepare.
 
 The authorization-revocation fence is a versioned unary Protobuf-over-HTTP call
 under `/internal/v1` from API to Query. API sends the affected actor, project or
@@ -638,8 +642,9 @@ become runtime acceptance criteria for the owning implementation issues:
    before acknowledging active. Activation commits the barrier before purge or
    anonymization, and an unavailable owner leaves a durable `accepted_pending`
    mutation; verify canonical lowercase UUID v7 purge-registration IDs and
-   baseline default-lifecycle schedules, while the data owner performs one
-   idempotent effect without Jobs writing its store.
+   baseline default-lifecycle schedules, while previously active baseline and
+   retention-policy schedules continue during a stalled deletion prepare and
+   the data owner performs one idempotent effect without Jobs writing its store.
    When Query is unavailable, the barriered API mutation fails closed while
    unrelated API-owned mutations retain normal failure isolation.
 7. Reject forged tenant context, invalid workload identity, unauthorized
@@ -700,8 +705,11 @@ become runtime acceptance criteria for the owning implementation issues:
     stale asynchronous projection state; when Query is unavailable, API fails
     closed rather than acknowledging the revocation.
 17. Restore Ingest, Processor, Query, and Jobs independently and verify each
-    obtains and persists current retention-policy and deletion-tombstone
-    snapshots before readiness; when replacing a component store, verify the
+    obtains and persists current retention-policy, deletion-tombstone, and
+    active-project baseline-registration snapshots before readiness; when Jobs'
+    backup predates an ordinary default-policy project creation, verify it
+    recreates the missing baseline registration idempotently from the inventory
+    before enabling schedules. When replacing a component store, verify the
     applicable audit intent survives a backup that predates the replaced store,
     including the API audit-intent prefix for an API PostgreSQL restore.
 
