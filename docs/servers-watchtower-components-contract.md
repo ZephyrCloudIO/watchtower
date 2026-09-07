@@ -127,11 +127,13 @@ The allowed protocol and data-flow direction is:
    earliest held-source
    expiry for API's versioned
    `ExportSnapshotHoldInstallV1` request, accepts Query's authorized
-   `ProjectionRebuildV1` requests, emits a matching per-partition
-   `ProjectionRebuildBaselineV1` marker before the first retained sequence, or
-   at the current partition high-water sequence for an empty rebuild, and emits
-   contiguous change or authenticated skip coverage for every subsequent
-   sequence in that stream. A retention-expired
+   `ProjectionRebuildV1` requests, captures a fixed available,
+   published-contiguous target watermark for each requested partition, emits a
+   matching `ProjectionRebuildBaselineV1` marker before the first retained
+   sequence or at that watermark for an empty rebuild, and emits contiguous
+   change or authenticated skip coverage through each fixed target. Query marks
+   the rebuild complete at those targets; sequences published afterward remain
+   on the normal live-change path. A retention-expired
    staged live write uses an idempotent no-row `CanonicalChangeSkipV1` marker
    for its reserved sequence only when no authoritative ClickHouse row exists;
    if the row was committed before publication failed, Processor reconciles and
@@ -197,21 +199,34 @@ The allowed protocol and data-flow direction is:
    owners resend the matching registration with `registration_phase=enable`,
    and Jobs verifies the committed generation before enabling dispatch. Each of
    Ingest, Processor, Query, and Jobs obtains the current retention-policy,
-   deletion-tombstone, and applicable resolved authorization-revocation
-   snapshots through an authenticated
-   `ControlRegistrySnapshotV1` request to API before readiness or after
-   restoration. Processor and Query also obtain their owner-scoped export-hold,
-   terminal-fence, and completed-materialization recovery snapshot through that
-   request, while Jobs obtains its owner-scoped export-schedule, non-terminal
-   execution, and terminal-fence recovery snapshot. Each owner persists the snapshot before
-   readiness, performs the idempotent side effect, and publishes the outcome.
-   Processor and Query remain unready until their local hold/fence inventory
-   matches the API registry generation and digest; Jobs remains unready until
-   its schedule, non-terminal execution, and fence inventory matches as well.
-   API and Query apply resolved authorization-revocation tombstones before
-   readiness. Query installs a terminal execution fence before releasing a
-   projection hold, and Jobs installs every restored terminal fence before
-   re-enabling export dispatch or scheduling.
+   deletion-tombstone, and applicable authorization-revocation snapshots through
+   an authenticated `ControlRegistrySnapshotV1` request to API before readiness
+   or after restoration. The response is an immutable owner-scoped snapshot
+   descriptor containing the snapshot identity, registry generation and digest,
+   bounded page parameters, entry/page counts, and final digest; it does not
+   inline the deployment-wide entries. Each owner retrieves bounded ordered
+   authenticated versioned `ControlRegistrySnapshotPageV1` pages using the
+   descriptor and validates the
+   owner scope, cursor order, page digests, counts, and final digest before
+   persisting the complete snapshot. A new registry generation creates a new
+   immutable descriptor; it cannot mutate pages already being restored.
+   Processor and Query also obtain their owner-scoped export-hold,
+   terminal-fence, and completed-materialization recovery pages through that
+   interface, while Jobs obtains its owner-scoped export-schedule, non-terminal
+   execution, and terminal-fence pages. Query's pages include every unresolved
+   desired authorization-revocation fence as well as resolved tombstones.
+   After reconciliation, each owner sends a final
+   `ControlRegistryReadinessCommitV1` acknowledgement with the descriptor
+   generation and digest. API atomically compares that pair with the current
+   registry and records the owner-ready cutover: a concurrent mutation either
+   waits behind that cutover or causes the acknowledgement to fail and the owner
+   to remain unready until it installs a fresh descriptor. Owners become ready
+   only after this acknowledgement. API and Query apply resolved
+   authorization-revocation tombstones before readiness, and Query installs all
+   unresolved revocation fences before readiness and enforces them on affected
+   paths. Query installs a terminal execution fence before releasing a projection
+   hold, and Jobs installs every restored terminal fence before re-enabling export
+   dispatch or scheduling.
 7. Before Ingest, Processor, Query, or Jobs begins a break-glass, restoration,
    key, replication, backup, restore, or other audited side effect, it sends a
    versioned `AuditIntentV1` to API and waits for a durable acknowledgement.
@@ -436,13 +451,15 @@ status regression or redispatch at a lower revision.
 When Processor or Query restores its own store, it instead receives the
 owner-scoped desired holds, every terminal fence that can coexist with a
 restorable backup, and completed-export materialization recovery metadata in
-`ControlRegistrySnapshotV1`. When Jobs restores its own store, it receives the
-owner-scoped export-expiry schedules and every terminal execution fence that
-can coexist with a restorable backup. Each owner persists that snapshot before
-readiness and reconciles missing or stale local state against it; Jobs
-reinstalls missing schedules idempotently and installs terminal fences before
-re-enabling dispatch. This owner-store recovery does not depend on an API
-database restore.
+the immutable, paginated `ControlRegistrySnapshotV1` descriptor and pages.
+When Jobs restores its own store, it receives the owner-scoped export-expiry
+schedules and every terminal execution fence that can coexist with a restorable
+backup through the same descriptor and pages. Each owner persists the complete
+snapshot before readiness and reconciles missing or stale local state against
+it; Jobs reinstalls missing schedules idempotently and installs terminal fences
+before re-enabling dispatch. The owner then completes the atomic
+`ControlRegistryReadinessCommitV1` generation check before readiness. This
+owner-store recovery does not depend on an API database restore.
 
 After the completion intent is durable, API sends Jobs an idempotent versioned
 `ExportCompletionV1` request containing `export_id`, the held and terminal
@@ -493,13 +510,16 @@ UUID v7 `rebuild_id`, authorized tenant and project scope, `accepted_at` range,
 selected signals, derived-selection flag, correlation identifier, and
 idempotency key. Processor validates the authorization, retention, and deletion
 fences, durably records the request and its idempotency state with `rebuild_id`
-stored as PostgreSQL `uuid` before acknowledging it. Before republishing
-eligible versioned canonical or derived changes through its normal change path,
-Processor emits a matching `ProjectionRebuildBaselineV1` marker for each
-requested canonical partition. The marker establishes the first retained
-sequence (or an explicit empty partition) and is accepted only for its matching
-rebuild and active fences. For every sequence after the baseline through the
-requested rebuild target, Processor emits either the canonical change or a
+stored as PostgreSQL `uuid` before acknowledging it. At durable request
+acceptance, Processor captures the current available, published-contiguous
+watermark as an immutable `target_sequence` for every requested canonical
+partition. Before republishing eligible versioned canonical or derived changes
+through its normal change path, Processor emits a matching
+`ProjectionRebuildBaselineV1` marker for each requested canonical partition.
+The marker establishes the first retained sequence (or an explicit empty
+partition), carries the fixed target sequence, and is accepted only for its
+matching rebuild and active fences. For every sequence after the baseline
+through that fixed target, Processor emits either the canonical change or a
 versioned authenticated `ProjectionRebuildSkipV1` record covering a contiguous
 range excluded by the requested range or retention state. Each skip record is
 bound to the rebuild, partition, active fences, exclusion basis, and integrity
@@ -510,7 +530,9 @@ unchanged. An unexpired row omitted by a narrower request is not a valid skip.
 Query verifies complete contiguous coverage, advances its checkpoint over
 changes and retention-excluded skip ranges, and writes every eligible row in
 the covered window; missing, stale, conflicting, or unauthorized coverage
-fails the rebuild safely.
+fails the rebuild safely. Query marks the rebuild complete only after coverage
+reaches the authenticated target sequence for every requested partition;
+sequences published after those targets remain on the normal live-change path.
 The correlated response reports durable acceptance or a terminal safe error;
 Query never accesses Processor persistence directly.
 
@@ -567,42 +589,60 @@ integrity failure that cannot retire raw state.
 
 The registry-snapshot handoff is a versioned unary Protobuf-over-HTTP call under
 `/internal/v1` from each of Ingest, Processor, Query, and Jobs to API. Each owner
-requests the current retention-policy and deletion-tombstone snapshots,
-applicable resolved authorization-revocation tombstones, plus the
-active-project baseline lifecycle-registration inventory with its authenticated
-owner identity, correlation, and idempotency context. The inventory covers every
-active project and applicable data class, including default-policy projects that
-have no shortened-retention policy row. API returns the versioned snapshots,
-inventory, and their highest generations; the requesting owner persists them
-before readiness and fails closed if the snapshot cannot be installed. The
-owner-scoped Processor and Query snapshots include desired export holds and
-every terminal execution fence from the restore-independent completion intent.
-The owner-scoped Jobs snapshot includes each desired `ExportExpiryScheduleV1`
-with its export revision, authoritative `completed_at`, expiry basis, and
-effective deadline, each desired non-terminal `ExportExecutionV1` request with
-its held revision, canonical partition-sequence vector, derived revision
-snapshot descriptor, selection-snapshot descriptor, and execution state, plus
-every terminal execution fence and its terminal revision. These entries include
-acknowledged terminal tombstones retained until no restorable API, Processor,
-Query, or Jobs backup can predate the corresponding terminal transition,
-resolved authorization-revocation tombstones through their applicable owner
-horizon, and non-terminal execution requests, not only unresolved intents. The
-Query snapshot
-also includes completed-export materialization recovery metadata: manifest
-content and digest, artifact object references and digests, canonical
-partition-sequence vectors, derived revision snapshot descriptors and digests,
-selection-snapshot descriptors and digests, export and terminal revisions, and
-Query's `snapshot_generation`.
-Query rebuilds or verifies its local export metadata from that copy before
-readiness. If the artifact or metadata is missing or conflicting, Query sends
-the authenticated `ExportRecoveryInvalidationV1` handoff to API before remaining
-unready for that completed export. API validates the matching completed
-revision, advances it through the existing revision-fenced terminal `expired`
-invalidation and hold-release path, and Query does not serve the artifact while
-the handoff is pending. Jobs reconciles its schedules, non-terminal execution
-requests, and fences before re-enabling dispatch.
-Subsequent policy and deletion mutations use the same generation-aware durable
-handoffs, while this request repairs state after restoration or rebuild.
+requests the current retention-policy, deletion-tombstone, and applicable
+authorization-revocation snapshots, plus the active-project baseline
+lifecycle-registration inventory with its authenticated owner identity,
+correlation, and idempotency context. The inventory covers every active project
+and applicable data class, including default-policy projects that have no
+shortened-retention policy row. API materializes one immutable owner-scoped
+snapshot and returns a descriptor containing its snapshot identity, registry
+generation and digest, bounded page parameters, entry/page counts, and final
+digest. The descriptor has no unbounded page-digest list and the unary response
+contains no deployment-wide entries. The owner retrieves the snapshot through
+bounded, ordered `ControlRegistrySnapshotPageV1` responses. Each page carries a
+bounded set of entries, its page digest, cursor/next cursor, and terminal final
+digest; the owner rejects missing, repeated, reordered, out-of-scope,
+conflicting, or digest-invalid pages and persists the complete snapshot before
+readiness. Large completed-export manifests are represented by bounded ordered
+recovery entries or chunks covered by the same descriptor digest.
+
+The owner-scoped Processor and Query snapshot pages include desired export holds
+and every terminal execution fence from the restore-independent completion
+intent. The owner-scoped Jobs pages include each desired
+`ExportExpiryScheduleV1` with its export revision, authoritative `completed_at`,
+expiry basis, and effective deadline, each desired non-terminal
+`ExportExecutionV1` request with its held revision, canonical partition-sequence
+vector, derived revision snapshot descriptor, selection-snapshot descriptor,
+and execution state, plus every terminal execution fence and its terminal
+revision. These entries include acknowledged terminal tombstones retained until
+no restorable API, Processor, Query, or Jobs backup can predate the
+corresponding terminal transition, resolved authorization-revocation tombstones
+through their applicable owner horizon, every unresolved desired Query
+revocation fence, and non-terminal execution requests, not only unresolved
+intents. Query's pages also include completed-export materialization recovery
+metadata: manifest content or bounded manifest chunks and digest, artifact object
+references and digests, canonical partition-sequence vectors, derived revision
+snapshot descriptors and digests, selection-snapshot descriptors and digests,
+export and terminal revisions, and Query's `snapshot_generation`.
+
+After the owner rebuilds or verifies its local metadata and reconciles the
+complete snapshot, it sends an authenticated `ControlRegistryReadinessCommitV1`
+acknowledgement containing the descriptor generation and digest. API atomically
+compares those values with the current registry before recording the owner-ready
+cutover. A mutation that wins that serialization makes the acknowledgement fail
+and the owner remains unready until it installs a fresh descriptor; a mutation
+after a successful cutover is delivered through the normal generation-aware
+handoff to the now-ready owner. Query persists and enforces unresolved revocation
+fences before this acknowledgement. If a completed artifact or its metadata is
+missing or conflicting, Query sends the authenticated
+`ExportRecoveryInvalidationV1` handoff to API before remaining unready for that
+completed export. API validates the matching completed revision, advances it
+through the existing revision-fenced terminal `expired` invalidation and hold-
+release path, and Query does not serve the artifact while the handoff is
+pending. Jobs reconciles its schedules, non-terminal execution requests, and
+fences before re-enabling dispatch. Subsequent policy and deletion mutations use
+the same generation-aware durable handoffs, while this request repairs state
+after restoration or rebuild.
 
 Retention-policy and project-deletion barriers use a versioned unary
 `LifecycleMutationV1` Protobuf-over-HTTP request from API to each of Ingest,
@@ -886,7 +926,9 @@ become runtime acceptance criteria for the owning implementation issues:
     fences before cancellation releases the originally held revision after API
     advances the terminal revision; verify that a rebuild whose first retained
     canonical sequence is greater than one installs the matching
-    `ProjectionRebuildBaselineV1` marker before applying changes, emits
+    `ProjectionRebuildBaselineV1` marker before applying changes, captures and
+    authenticates a fixed available target watermark for each partition, emits
+    coverage through each target before declaring completion, and emits
     contiguous `ProjectionRebuildSkipV1` coverage only for retention-excluded
     sequences, writes every eligible row before advancing the global checkpoint,
     leaves that checkpoint unchanged for an incomplete subrange request, and
@@ -947,12 +989,16 @@ become runtime acceptance criteria for the owning implementation issues:
     asynchronous projection state; recover after each boundary and verify an
     unresolved intent retries the fence and commit, a resolved minimal tombstone
     remains through the applicable restorable-backup horizon and is reapplied before API or
-    Query readiness, while Query unavailability leaves API durably fail-closed
+    Query readiness, and a restored Query receives and enforces every unresolved
+    desired revocation fence before its readiness cutover; Query unavailability leaves API durably fail-closed
     rather than acknowledging the revocation.
 17. Restore Ingest, Processor, Query, and Jobs independently and verify each
-    obtains and persists current retention-policy, deletion-tombstone, resolved
-    authorization-revocation, and active-project baseline-registration snapshots
-    before readiness; restore
+    obtains and persists immutable, paginated current retention-policy,
+    deletion-tombstone, resolved and unresolved authorization-revocation, and
+    active-project baseline-registration snapshots before readiness; validate
+    bounded page ordering, per-page digests, counts, and the final digest, then
+    require the atomic `ControlRegistryReadinessCommitV1` generation check;
+    restore
     Processor and Query from backups predating an active export hold or
     completed, failed, canceled, or expired terminal execution fence and verify
     their owner-scoped hold/fence and completed-materialization snapshot
@@ -961,7 +1007,9 @@ become runtime acceptance criteria for the owning implementation issues:
     Query, and Jobs, with Query rebuilding or verifying manifests, artifact
     references, the canonical vector, derived revision descriptor,
     selection-snapshot pages, and their digests, and
-    `snapshot_generation` before serving a completed export; restore Jobs from
+    `snapshot_generation` before serving a completed export; a concurrent
+    registry mutation must either be serialized after the readiness cutover or
+    reject the stale acknowledgement and require a fresh descriptor; restore Jobs from
     a backup predating an acknowledged export schedule, non-terminal execution
     request, or terminal fence and verify its owner-scoped schedule, execution,
     and fence snapshot recreates missing schedules and exact revision-fenced

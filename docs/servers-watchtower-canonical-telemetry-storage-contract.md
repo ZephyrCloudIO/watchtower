@@ -223,11 +223,14 @@ uses the authenticated `ProjectionRebuildV1` gap-repair mode defined below
 before applying those successors. A retry reuses the same partition and sequence
 rather than allocating another one. Recovery reconciles staged,
 ClickHouse-committed, skipped, and published states, including a ClickHouse
-row that exists before its PostgreSQL status is recorded. A sequence has no
-available watermark until its authoritative row or skip marker and publication
-are both durably confirmed. A conflicting payload, marker, or digest for an
-existing `(partition, sequence)` is an integrity failure; there is no
-distributed transaction or best-effort publication.
+row that exists before its PostgreSQL status is recorded. Processor exposes an
+available, published-contiguous watermark `N`: the greatest sequence for which
+every sequence through `N` has an authoritative row or no-row skip marker and
+durable publication confirmed. Reservation, staging, a ClickHouse commit
+without publication, and out-of-order publication do not advance `N`. A
+conflicting payload, marker, or digest for an existing `(partition, sequence)`
+is an integrity failure; there is no distributed transaction or best-effort
+publication.
 
 Query stores the highest contiguous applied sequence and its digest for each
 logical partition. It rejects a gap or a conflicting equal sequence and
@@ -245,18 +248,21 @@ through the normal authenticated rebuild path. The marker carries the
 `rebuild_id`, partition identity, active retention cutoff, the authorized
 rebuild scope, `baseline_sequence` equal to the sequence immediately before
 the first retained change for a non-empty retained window, or equal to the
-partition's current authoritative high-water sequence for an explicit empty
-partition. It also carries the first retained sequence for a non-empty window
-or an explicit empty-partition value, and an integrity digest over those
-values. The empty-partition value is used
-when all changes through high-water sequence `N` have expired, so the marker
-carries `baseline_sequence = N` rather than an unavailable predecessor.
+the published-contiguous watermark `N` for an explicit empty partition. It
+also carries the first retained sequence for a non-empty window or an
+explicit empty-partition value, a fixed per-partition `target_sequence` equal
+to the available watermark captured when Processor durably accepts the rebuild
+request, and an integrity digest over those values. The empty-partition value
+is used when all changes through `N` have expired, so the marker carries
+`baseline_sequence = N` rather than an unavailable predecessor. Reserved,
+staged, or otherwise unpublished sequences are excluded from both `N` and the
+fixed target.
 Query verifies that the
 marker matches the rebuild request and current fences, stages the requested
 partition from that baseline, and atomically records the baseline as its
 highest contiguous applied sequence and marker digest before accepting
 `baseline_sequence + 1`. For every sequence after the baseline through the
-requested rebuild target, Processor emits either the canonical change or a
+fixed `target_sequence`, Processor emits either the canonical change or a
 versioned authenticated `ProjectionRebuildSkipV1` record covering a contiguous
 range excluded by the requested range or retention state. Each skip record is
 bound to the rebuild, partition, active fences, exclusion basis, and integrity
@@ -267,10 +273,12 @@ unchanged. An unexpired row omitted by a narrower request is not a valid skip.
 Query verifies complete contiguous coverage, advances its checkpoint over
 changes and retention-excluded skip ranges, and writes every eligible row in
 the covered window; missing, stale, conflicting, or unauthorized coverage
-fails the rebuild safely.
-An empty retained window records its current high-water sequence as its
-baseline, allowing Query to accept the next live sequence without resetting
-the partition. A missing, conflicting,
+fails the rebuild safely. Query marks the rebuild complete only after it has
+verified contiguous coverage through the authenticated `target_sequence` for
+every requested partition; sequences published after that fixed target remain
+on the normal live-change path. An empty retained window records the
+published-contiguous watermark `N` as its baseline, allowing Query to accept
+the next live sequence without resetting the partition. A missing, conflicting,
 or stale marker fails the rebuild safely; it cannot reset a live partition or
 be used outside its matching rebuild. Normal live changes continue to reject
 gaps.
@@ -516,11 +524,13 @@ recomputes or removes expired contributions and publishes the resulting
 revisioned state so Query projections cannot retain dormant expired data. Before any restored or
 rebuilt Ingest,
 Processor, Query, or Jobs owner becomes ready, it obtains current
-retention-policy, deletion-tombstone, and applicable resolved authorization-
-revocation registry snapshots from API through the versioned
+retention-policy, deletion-tombstone, and applicable authorization-revocation
+registry snapshots from API through the versioned
 `ControlRegistrySnapshotV1` handoff defined in the component contract, persists
-them before readiness, and enforces them. Each data owner reapplies its effective
-cutoff and fences excess data; Jobs restores the associated baseline, policy,
+the complete paginated snapshot before readiness, completes the final generation
+cutover check defined in the component contract, and enforces them. Each data
+owner reapplies its effective cutoff and fences excess data; Jobs restores the
+associated baseline, policy,
 and deletion scheduling and fences. Before a restored or rebuilt Processor,
 Query, or Jobs owner becomes ready, it also obtains its owner-scoped export
 recovery snapshot from the same handoff. For Processor and Query, the snapshot
@@ -535,20 +545,23 @@ terminal execution fence and its terminal revision. These entries include
 acknowledged terminal tombstones retained until no restorable API, Processor,
 Query, or Jobs backup can predate the corresponding terminal transition,
 resolved authorization-revocation tombstones through their applicable owner
-horizon, and non-terminal execution requests, not only unresolved intents. All
-entries
+horizon, every unresolved desired Query revocation fence, and non-terminal
+execution requests, not only unresolved intents. All entries
 include their registry generation and integrity digest. For completed exports it
 also contains the
 restore-independent recovery copy of Query's materialization metadata:
 manifest content and digest, artifact object references and digests, complete
 canonical partition-sequence vectors, derived revision snapshot descriptors and
 digests, selection-snapshot descriptors and digests, and `snapshot_generation`.
-This copy is recovery evidence, not a second Query authority.
-The owner persists the snapshot, reconciles its local inventory, installs every
-missing desired hold, schedule, non-terminal execution request, or terminal
-fence, and removes or releases only state authorized by the current snapshot.
-API and Query apply resolved authorization-revocation tombstones before
-readiness. Query durably installs a terminal
+This copy is recovery evidence, not a second Query authority. The owner
+persists the complete paginated snapshot, reconciles its local inventory,
+installs every missing desired hold, schedule, non-terminal execution request,
+terminal fence, or unresolved revocation fence, and removes or releases only
+state authorized by the current snapshot. API and Query apply resolved
+authorization-revocation tombstones before readiness. Query also enforces every
+unresolved desired revocation fence before readiness and on all affected
+admission, read, provider/index, cache, gateway, and download paths. Query
+durably installs a terminal
 execution fence before releasing its projection hold. If a completed artifact
 or its metadata is missing or conflicting, Query sends the authenticated
 `ExportRecoveryInvalidationV1` handoff defined in the component contract before
@@ -1091,13 +1104,19 @@ The owning implementation contracts must make these scenarios testable:
    changed non-key canonical field when its identity pair is unchanged; verify
    that each requested canonical partition receives a matching
    `ProjectionRebuildBaselineV1` marker before its first retained sequence,
-   accepts a first sequence greater than one without a false gap, emits
+   captures an authenticated fixed available `target_sequence` for every
+   requested partition, and accepts a first sequence greater than one without
+   a false gap; emits and validates
    contiguous authenticated `ProjectionRebuildSkipV1` coverage only for
    retention-excluded interleaved sequences, live `CanonicalChangeSkipV1`
    coverage for an expired staged sequence, writes every eligible row before
-   advancing the global checkpoint, leaves that checkpoint unchanged for an
-   incomplete subrange request, and fails safely when coverage is missing,
-   stale, or mismatched.
+   advancing the global checkpoint, declares completion only through each fixed
+   target, leaves that checkpoint unchanged for an incomplete subrange request,
+   and fails safely when coverage is missing, stale, or mismatched. When all
+   retained rows have expired while a later sequence is reserved but not yet
+   published, verify the empty baseline uses the highest published-contiguous
+   watermark rather than the reserved sequence and accepts that later
+   publication without a conflicting equal-sequence rejection.
 5. Create a project through the generation-matched `project_create`
    `LifecycleMutationV1` barrier and verify it remains unavailable until every
    applicable owner has an active baseline Jobs registration and matching
@@ -1137,7 +1156,10 @@ The owning implementation contracts must make these scenarios testable:
    registry recovery before any restored or rebuilt owner accepts
    traffic; verify restored Processor and Query owners also reconcile their
    owner-scoped export holds and every completed, failed, canceled, and expired
-   terminal execution fence from the API registry snapshot before readiness,
+   terminal execution fence from the immutable paginated API registry snapshot
+   before readiness, including page and final digest validation and the atomic
+   final generation check; a concurrent mutation must reject a stale readiness
+   acknowledgement and require a fresh snapshot,
    while restored Jobs reconciles every owner-scoped export schedule and
    terminal fence before readiness and prevents late execution redispatch,
    including Jobs rebuilding a missing default-policy baseline registration
