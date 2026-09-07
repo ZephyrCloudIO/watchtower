@@ -72,7 +72,9 @@ Extension attributes are a flat, typed, namespaced collection. A value is only
 one of `null`, boolean, string, integer, finite float, or a homogeneous array of
 one primitive kind. Arrays cannot contain nested arrays or objects. Attribute
 names must include an owning namespace, and the namespace does not permit an
-unbounded raw structure. `NaN`, positive infinity, and negative infinity are
+unbounded raw structure. Integer values are restricted to the exact IEEE-754
+safe-integer range `[-(2^53 - 1), 2^53 - 1]`; larger integers are rejected
+during normalization. `NaN`, positive infinity, and negative infinity are
 rejected during normalization and never enter canonical storage, replay,
 reconciliation digests, or exports.
 
@@ -89,7 +91,7 @@ canonical telemetry.
 
 | Data class | Writer and authority | Storage boundary | Lifecycle |
 | --- | --- | --- | --- |
-| Raw accepted records and attachments | Ingest; authoritative for raw acceptance | Encrypted immutable S3 objects plus Ingest PostgreSQL acceptance metadata and outbox state | Seven days from `accepted_at` by default, subject to a successfully installed shortened project policy, and longer until Processor durably confirms handoff completion when still permitted by that policy; never customer-downloadable |
+| Raw accepted records and attachments | Ingest; authoritative for raw acceptance | Encrypted immutable S3 objects plus Ingest PostgreSQL acceptance metadata and outbox state | Seven days from `accepted_at` by default; a project policy may shorten this cutoff but never extend it, and raw state may remain only until Processor durably confirms handoff completion within that cutoff; never customer-downloadable |
 | Normalized records | Processor; authoritative only as processing input | Processor-owned encrypted S3 replay-batch prefix, with separate class metadata | Retained only as needed for replay, no longer than 90 days |
 | Enriched records | Processor; authoritative only as processing input | Processor-owned encrypted S3 replay-batch prefix, with separate class metadata | Retained only as needed for replay, no longer than 90 days |
 | Canonical telemetry | Processor; authoritative for the four signal histories | Four independent ClickHouse canonical table families | Immutable history for 90 days from `accepted_at` |
@@ -160,8 +162,8 @@ its digest and size have been verified, and the acceptance metadata and
 transactional outbox commit. Orphaned or incomplete attempts are reconciled
 without being reported as successful acceptance. The raw object, acceptance
 metadata, and recoverable handoff remain until Processor durably confirms
-completion; Ingest redelivers and reconciles pending handoffs if the seven-day
-MSK window expires.
+completion through the versioned `RawHandoffDispositionV1` message; Ingest
+redelivers and reconciles pending handoffs if the seven-day MSK window expires.
 
 Canonical ClickHouse tables are partitioned monthly by `accepted_at` and
 ordered by:
@@ -238,7 +240,11 @@ applicable replay horizon.
 Retention is calculated from `accepted_at`, except that derived aggregates and
 their replay batches and Query projections use the retention-windowed lifecycle
 defined above, and export objects use the `completed_at` lifecycle anchor defined
-in the Export Contract. Backup copies of project data may outlive active-store
+in the Export Contract. For each data class, the effective cutoff is the earlier
+of that class's default lifecycle cutoff and the cutoff computed from the active
+project policy using the class's lifecycle anchor. A project policy can only
+shorten a class's default lifetime and never extend it. Backup copies of project
+data may outlive active-store
 expiry only as a bounded recovery exception: each expired record or state item
 must be purged from backups or made irreversibly inaccessible within 90 days of
 its effective expiry. This deadline covers raw, replay, canonical, derived,
@@ -251,9 +257,10 @@ project policy a strictly monotonic generation and records each versioned shorte
 duration policy in its restore-independent retention policy registry. Ingest,
 Processor, and Query each durably retain the highest installed generation, ignore
 lower-generation deliveries, and acknowledge installation only for the matching
-or an idempotent equal generation. Each owner computes its effective cutoff from
-that duration and current time whenever enforcing admission, read, processing,
-replay, export, or rebuild behavior. API reports success only after each owner
+or an idempotent equal generation. Each owner computes the earlier of its
+class-default cutoff and project-policy cutoff from current time whenever
+enforcing admission, read, processing, replay, export, or rebuild behavior. API
+reports success only after each owner
 durably installs and enforces the policy. Until acknowledgement, the mutation
 fails closed. Before
 its acknowledgement, Ingest stops admitting excess records and serving excess raw
@@ -261,10 +268,11 @@ data, Processor durably fences queued, pending-handoff, and replayed work whose
 `accepted_at` falls outside the new limit, prevents canonical or derived
 publication, and recomputes or removes derived results with expired
 contributions, and Query denies excess reads, exports, and rebuilds. Processor
-returns a durable terminal policy-fenced disposition for each rejected raw
-handoff; Ingest records that disposition as completed, retires its outbox entry,
-and purges the corresponding raw object and acceptance metadata under the new
-policy. After installing its fence, each owner submits a durable recurring
+returns a durable `RawHandoffDispositionV1` message with a terminal
+`policy_rejected` disposition for each rejected raw handoff; Ingest records that
+disposition as terminal, retires its outbox entry, and purges the corresponding
+raw object and acceptance metadata under the new policy. After installing its
+fence, each owner submits a durable recurring
 active-store purge schedule to Jobs for as long as the shortened policy remains
 active. Jobs must durably persist that schedule before the owner acknowledges the
 policy. Jobs owns scheduling and retrying each purge dispatch; on every run, the
@@ -521,13 +529,15 @@ The owning implementation contracts must make these scenarios testable:
 1. Store equivalent external event, trace, or span identifiers for two tenants
    without Watchtower ID collision or cross-tenant disclosure; verify project and
    Watchtower IDs use the canonical UUID v7/PostgreSQL `uuid` representation and
-   reject non-finite extension floats before canonicalization.
+   reject out-of-range extension integers and non-finite extension floats before
+   canonicalization.
 2. Fail S3, PostgreSQL, ClickHouse, and MSK operations before and after local
    commits; verify no false successful acceptance and idempotent recovery.
 3. Verify raw-object immutability, SHA-256 and size reconciliation, required
    MSK durability and seven-day default retention settings, shortened-policy
-   enforcement, redelivery of unprocessed work after the MSK window expires,
-   and generation-aware reconciliation of each completed handoff to a promoted
+   enforcement without allowing a project duration to extend a shorter class
+   default, redelivery of unprocessed work after the MSK window expires, and
+   generation-aware reconciliation of each completed handoff to a promoted
    canonical default or durable terminal disposition before raw retirement.
 4. Rebuild eligible canonical and derived Query projections through an
    authorized, durably acknowledged Query-to-Processor `ProjectionRebuildV1`

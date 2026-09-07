@@ -91,7 +91,8 @@ The allowed protocol and data-flow direction is:
    routing layer. They cannot reach internal messages or RPCs.
 2. Ingest accepts telemetry and consumes API-published changes for local
    authorization-related projections. It publishes recoverable processing
-   handoff work.
+   handoff work and consumes Processor's terminal `RawHandoffDispositionV1`
+   messages before retiring the corresponding raw state.
 3. API accepts control-plane, release, artifact, and Sentry management
    commands. It publishes versioned change events. API may call Query's
    authenticated internal interfaces for Sentry management reads and authorized
@@ -101,8 +102,9 @@ The allowed protocol and data-flow direction is:
    component's persistence directly.
 4. Processor consumes Ingest handoff work and relevant API changes. It
    publishes canonical and derived changes, answers API's versioned
-   export-watermark requests, and accepts Query's authorized
-   `ProjectionRebuildV1` requests.
+   export-watermark requests, accepts Query's authorized `ProjectionRebuildV1`
+   requests, and publishes a terminal `RawHandoffDispositionV1` to Ingest for
+   every completed or policy-rejected raw handoff.
 5. Query consumes API changes and Processor changes into its own projections,
    indexes, and caches. It consumes API-authorized export work carrying
    Processor's watermark, publishes versioned export outcomes for API to record
@@ -140,7 +142,9 @@ Ingest may acknowledge a successful telemetry write only after both the raw
 accepted record and a recoverable processing handoff/outbox are durably
 established. Processor or broker outages may accumulate bounded backlog. When
 safe capacity is exhausted, Ingest must stop returning successful admissions
-until capacity is recovered.
+until capacity is recovered. Ingest does not retire the raw object, acceptance
+metadata, or handoff outbox until it durably records the matching terminal
+Processor disposition.
 
 Processor owns asynchronous normalization, privacy processing, enrichment,
 symbolication execution, canonical telemetry, processing state, and derived
@@ -212,6 +216,20 @@ stored as PostgreSQL `uuid` before acknowledging it, and republishes eligible
 versioned canonical or derived changes through its normal change path. The
 correlated response reports durable acceptance or a terminal safe error; Query
 never accesses Processor persistence directly.
+
+The raw-handoff completion path is a versioned durable `RawHandoffDispositionV1`
+message from Processor to Ingest using the common asynchronous envelope. Its
+bounded payload contains the canonical lowercase UUID v7 `watchtower_id`, a
+terminal `disposition` of `completed` or `policy_rejected`, and the generation
+context for the result: canonical lowercase UUID v7 `processing_generation` is
+required for `completed`, while `policy_rejected` includes the
+`retention_policy_generation` and a bounded rejection reason. The Processor
+publishes the message through its durable outbox after recording the terminal
+result; transient processing failures publish no terminal disposition. Ingest
+transactionally persists the disposition and idempotency state before retiring
+the matching outbox entry and raw acceptance data. Redelivery of the same
+message is idempotent, and a conflicting disposition or generation is an
+integrity failure that cannot retire raw state.
 
 The registry-snapshot handoff is a versioned unary Protobuf-over-HTTP call under
 `/internal/v1` from each of Ingest, Processor, Query, and Jobs to API. Each owner
@@ -356,10 +374,11 @@ The following walkthroughs are required review cases for this contract and
 become runtime acceptance criteria for the owning implementation issues:
 
 1. Follow a Sentry SDK request through routing, Ingest, durable raw and
-   handoff records, Processor, Query projection, and visible query results.
+   handoff records, Processor, its `RawHandoffDispositionV1` completion path
+   back to Ingest, Query projection, and visible query results.
 2. Stop Processor delivery before and after Ingest acknowledgement; accepted
-   data remains recoverable, and admission stops at the documented capacity
-   boundary.
+   data remains recoverable until a matching terminal disposition is durably
+   recorded, and admission stops at the documented capacity boundary.
 3. Follow a native control command from Web to API through defense-in-depth
    authorization, authoritative persistence, and change publication.
 4. Follow a Sentry management read through API compatibility translation and
