@@ -244,8 +244,14 @@ Processor emits a versioned `ProjectionRebuildBaselineV1` marker
 through the normal authenticated rebuild path. The marker carries the
 `rebuild_id`, partition identity, active retention cutoff, the authorized
 rebuild scope, `baseline_sequence` equal to the sequence immediately before
-the first retained change, the first retained sequence or an explicit empty
-partition, and an integrity digest over those values. Query verifies that the
+the first retained change for a non-empty retained window, or equal to the
+partition's current authoritative high-water sequence for an explicit empty
+partition. It also carries the first retained sequence for a non-empty window
+or an explicit empty-partition value, and an integrity digest over those
+values. The empty-partition value is used
+when all changes through high-water sequence `N` have expired, so the marker
+carries `baseline_sequence = N` rather than an unavailable predecessor.
+Query verifies that the
 marker matches the rebuild request and current fences, stages the requested
 partition from that baseline, and atomically records the baseline as its
 highest contiguous applied sequence and marker digest before accepting
@@ -262,7 +268,9 @@ Query verifies complete contiguous coverage, advances its checkpoint over
 changes and retention-excluded skip ranges, and writes every eligible row in
 the covered window; missing, stale, conflicting, or unauthorized coverage
 fails the rebuild safely.
-An empty retained window still records its baseline. A missing, conflicting,
+An empty retained window records its current high-water sequence as its
+baseline, allowing Query to accept the next live sequence without resetting
+the partition. A missing, conflicting,
 or stale marker fails the rebuild safely; it cannot reset a live partition or
 be used outside its matching rebuild. Normal live changes continue to reject
 gaps.
@@ -668,9 +676,15 @@ parameters, entry count, page count, and final digest; it never inlines one
 entry or an unbounded page-digest list for every aggregate. Its pages contain
 the requested fully qualified aggregate keys and their `authoritative_revision`
 values, including explicit empty revision entries, in a deterministic order.
-Entries from different partitions, records, or aggregates are never compared as
-one global order, and missing or conflicting descriptor or page coverage is
-invalid. API persists the canonical partition-sequence vector, the selection
+During the export hold, Processor freezes each captured derived aggregate's
+state, selected source set, and `authoritative_revision`, including explicit
+empty revision entries, until the matching hold release. Contributions or
+retention recomputations for those aggregates are queued and cannot publish a
+higher revision during the hold, so every descriptor page remains materializable
+at its captured revision. Entries from different partitions, records, or
+aggregates are never compared as one global order, and missing or conflicting
+descriptor or page coverage is invalid. API persists the canonical
+partition-sequence vector, the selection
 descriptor and digest, and, when present, the derived revision descriptor and
 digest, plus the earliest effective expiry among all held
 canonical rows, selection entries, and derived contributions, and sends that

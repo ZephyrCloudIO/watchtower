@@ -128,9 +128,10 @@ The allowed protocol and data-flow direction is:
    expiry for API's versioned
    `ExportSnapshotHoldInstallV1` request, accepts Query's authorized
    `ProjectionRebuildV1` requests, emits a matching per-partition
-   `ProjectionRebuildBaselineV1` marker before the first retained sequence of
-   each rebuild stream, and emits contiguous change or authenticated skip
-   coverage for every subsequent sequence in that stream. A retention-expired
+   `ProjectionRebuildBaselineV1` marker before the first retained sequence, or
+   at the current partition high-water sequence for an empty rebuild, and emits
+   contiguous change or authenticated skip coverage for every subsequent
+   sequence in that stream. A retention-expired
    staged live write uses an idempotent no-row `CanonicalChangeSkipV1` marker
    for its reserved sequence only when no authoritative ClickHouse row exists;
    if the row was committed before publication failed, Processor reconciles and
@@ -316,7 +317,11 @@ identity, request scope, fixed-size page parameters, entry count, page count,
 and final selection digest; it never inlines one entry or an unbounded
 page-digest list for every record. The derived revision descriptor uses the
 same bounded metadata shape and never inlines aggregate entries or an
-unbounded page-digest list. The source-expiry value is absent
+unbounded page-digest list. Processor freezes each captured derived aggregate's
+state, selected source set, and `authoritative_revision`, including explicit
+empty revision entries, until the matching export hold is released; updates for
+those aggregates are queued and cannot publish a higher revision during the
+hold. The source-expiry value is absent
 when the requested snapshot has no eligible canonical rows, selection entries,
 or derived contributions. API persists the canonical partition-sequence
 vector, the selection descriptor and digest, and, when present, the derived
@@ -843,9 +848,11 @@ become runtime acceptance criteria for the owning implementation issues:
    request and verify each data owner uses `LifecyclePurgeRegistrationV1` to
    obtain a durable paused Jobs registration before acknowledging prepare, keeps
    the generation non-active while sending the matching registration ID for
-   activation, and receives the enabled state before acknowledging active. API
-   commits the active barrier only after every activation acknowledgement, and
-   purge or anonymization cannot run before that commit; an unavailable owner
+   activation, and receives the armed, non-dispatchable state before
+   acknowledging active. API commits the active barrier only after every owner
+   has acknowledged that armed state. Post-commit enablement then transitions
+   the matching registration to enabled before purge or anonymization may run;
+   an unavailable owner
    leaves a durable `accepted_pending`
    mutation; verify canonical lowercase UUID v7 purge-registration IDs and
    baseline default-lifecycle schedules, while previously active baseline and
