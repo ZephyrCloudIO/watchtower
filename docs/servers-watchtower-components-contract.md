@@ -102,26 +102,34 @@ The allowed protocol and data-flow direction is:
    authenticated internal interfaces for Sentry management reads and authorized
    export download-gateway issuance and `AuthorizationRevocationFenceV1` for
    immediate export-download revocation, and Processor's authenticated
-   `ExportWatermarkV1` interface at export creation, but never reads another
-   component's persistence directly.
+   `ExportSnapshotHoldInstallV1` interface at export creation, but never reads
+   another component's persistence directly.
 4. Processor consumes Ingest handoff work and relevant API changes. It
-   publishes canonical and derived changes, answers API's versioned
-   export-watermark requests, accepts Query's authorized `ProjectionRebuildV1`
-   requests, and publishes a terminal `RawHandoffDispositionV1` to Ingest for
-   every completed, shortened-policy-rejected, or default-expired raw handoff.
+   publishes canonical and derived changes, installs the export-scoped hold and
+   returns the authoritative export watermark vector for API's versioned
+   `ExportSnapshotHoldInstallV1` request, accepts Query's authorized
+   `ProjectionRebuildV1` requests, and publishes a terminal
+   `RawHandoffDispositionV1` to Ingest for every completed,
+   shortened-policy-rejected, or default-expired raw handoff.
 5. Query consumes API changes and Processor changes into its own projections,
    indexes, and caches. It consumes Jobs-dispatched revision-fenced
-   `ExportExecutionV1` commands carrying API-persisted Processor watermarks,
+   `ExportExecutionV1` commands carrying API-persisted Processor watermark
+   vectors,
    publishes versioned export outcomes for API to record customer-visible
    lifecycle transitions, submits authorized `ProjectionRebuildV1` requests to
    Processor, and does not call another component for persistence fallback.
 6. Jobs receives durable requests, owns scheduling and retry state, and
    dispatches versioned commands to the component owning the affected data.
    Jobs owns baseline lifecycle-purge schedules even when no shortened policy is
-   active. During a lifecycle prepare phase, data owners durably register paused
-   policy or project-deletion purge work with Jobs before returning a matching
-   `phase=prepared` `LifecycleMutationAcknowledgementV1`; Jobs enables the
-   schedule only after API commits activation. Each of Ingest, Processor, Query,
+   active. During a lifecycle prepare phase, Ingest, Processor, and Query send a
+   versioned `LifecyclePurgeRegistrationV1` request to Jobs for the affected
+   policy or project-deletion purge work. Jobs durably creates the paused
+   registration and returns its `purge_registration_id` and paused state; the
+   owner persists that result with its pending fence before returning a matching
+   `phase=prepared` `LifecycleMutationAcknowledgementV1`. Jobs records its own
+   scheduling registration in the same transaction. Jobs enables the schedule
+   only after API commits activation, and owners use the matching registration
+   ID for activation or idempotent cleanup. Each of Ingest, Processor, Query,
    and Jobs obtains the current
    retention-policy and deletion-tombstone snapshots through an authenticated
    `ControlRegistrySnapshotV1` request to API before readiness or after
@@ -201,24 +209,33 @@ consumers. Internal errors use a safe Protobuf envelope containing a canonical
 code, safe message, retryability, and correlation identifier. Original causes
 remain in structured logs.
 
-The export-time watermark handoff is a versioned unary Protobuf-over-HTTP call
-under `/internal/v1` from API to Processor. API sends the canonical lowercase
-UUID v7 `export_id` (stored as PostgreSQL `uuid` in API state) and
-`export_revision`, authorized tenant and project scope, `accepted_at` range,
-selected signals, derived-selection flag, correlation identifier, and idempotency
-key.
-Processor returns a correlated versioned response containing the canonical
-change watermark for that scope and, when applicable, the authoritative
-derived-state revision watermark. API persists the response and includes the
-watermarks only in the durable scheduling request sent to Jobs; Jobs owns the
-lease, retry, and cancellation state and dispatches a revision-fenced
-`ExportExecutionV1` command to Query carrying those watermarks, the authorized
-scope, range, selected signals, and `export_revision`. Query never receives a
-direct API execution dispatch or infers an authoritative watermark from its
-local projection. Before execution, Processor and Query install an
-export-scoped snapshot hold keyed by `export_id` and `export_revision`; Query
-fails the export without an artifact if the hold or any requested watermark
-cannot be materialized.
+The export snapshot-hold installation is a versioned unary
+`ExportSnapshotHoldInstallV1` Protobuf-over-HTTP call under `/internal/v1` from
+API to Processor. API sends the canonical lowercase UUID v7 `export_id` (stored
+as PostgreSQL `uuid` in API state) and `export_revision`, authorized tenant and
+project scope, `accepted_at` range, selected signals, derived-selection flag,
+correlation identifier, and idempotency key. Processor atomically captures the
+complete authoritative watermark vector and installs the export-scoped hold
+before returning a correlated versioned response. API persists the response and
+includes the exact vectors only in the durable scheduling request sent to Jobs;
+Jobs owns the lease, retry, and cancellation state and dispatches a
+revision-fenced `ExportExecutionV1` command to Query carrying those vectors, the
+authorized scope, range, selected signals, and `export_revision`. Query treats
+that command as its explicit hold-install handoff, durably installing the
+matching projection hold before reading or writing an artifact. Query never
+receives a direct API execution dispatch or infers an authoritative watermark
+from its local projection. Query fails the export without an artifact if its
+hold or any requested vector member cannot be materialized.
+
+After API records any terminal `completed`, `failed`, or `canceled` export
+transition, it publishes an idempotent versioned
+`ExportSnapshotHoldReleaseV1` command to Processor and Query. The command
+contains `export_id`, `export_revision`, terminal outcome, correlation, and
+idempotency context. Each owner durably releases the matching hold before
+acknowledging the command; retries are safe, and a stale release cannot remove a
+hold for a newer revision. API retains and retries undelivered release commands
+until both owners confirm them, so cancellation or owner failure cannot strand
+an inferred hold indefinitely.
 
 Jobs schedules an idempotent versioned `ExportExpiryV1` handoff for
 `completed_at + 7 days` and sends it to API. API alone advances a still-
@@ -280,8 +297,14 @@ Retention-policy and project-deletion barriers use a versioned unary
 Processor, Query, and Jobs under `/internal/v1`. The request carries the
 mutation kind, `phase` (`prepare` or `activate`), authorized scope, monotonic
 mutation generation, correlation identifier, and idempotency key. During
-`prepare`, each owner durably installs a non-destructive pending fence and Jobs
-creates a paused purge registration. The correlated
+`prepare`, each data owner durably installs a non-destructive pending fence and
+sends Jobs a versioned unary `LifecyclePurgeRegistrationV1` request under
+`/internal/v1` containing the owner, mutation kind, authorized scope,
+generation, affected data classes, correlation identifier, and idempotency key.
+Jobs durably persists the registration in `paused` state and returns its
+`purge_registration_id`; the owner persists that ID and the paused confirmation
+before acknowledging the lifecycle prepare. Jobs handles its own local
+registration in the same durable operation. The correlated
 `LifecycleMutationAcknowledgementV1` carries the owner, mutation kind,
 generation, phase, `fence_installed`, `purge_registration_id`, and registration
 state. `purge_registration_id` is a canonical lowercase UUID v7 at this
@@ -348,13 +371,15 @@ partition.
 
 Before a component begins a break-glass, restoration, or other required audited
 side effect, it durably commits an `AuditIntentV1` record in its own transactional
-outbox. The intent has a canonical lowercase UUID v7 `audit_intent_id`, producer,
-action, target resource, actor or workload identity, tenant and project context
-when applicable, correlation identifier, and idempotency key. The side effect
-cannot begin until that intent is durable. The component then publishes
-at-least-once `AuditEvidenceV1` that references the intent and records the
-eventual outcome; crash recovery must retry the evidence or record an explicit
-unknown outcome from the durable intent before considering the action complete.
+outbox. The intent has a canonical lowercase UUID v7 `audit_intent_id`, stored
+as PostgreSQL `uuid` wherever it is held in repository-owned relational outbox
+or state, plus producer, action, target resource, actor or workload identity,
+tenant and project context when applicable, correlation identifier, and
+idempotency key. The side effect cannot begin until that intent is durable. The
+component then publishes at-least-once `AuditEvidenceV1` that references the
+intent and records the eventual outcome; crash recovery must retry the evidence
+or record an explicit unknown outcome from the durable intent before considering
+the action complete.
 Neither intent nor evidence contains raw payloads or secrets. A component may
 retain and retry its local outbox while API is unavailable; API remains the sole
 audit writer and correlates the intent with its immutable audit event. Component
@@ -450,15 +475,15 @@ become runtime acceptance criteria for the owning implementation issues:
    unary Protobuf HTTP to Query without direct Query persistence access.
 5. Perform a native or compatible query during API outage with a valid
    security projection, then cross its freshness boundary and fail closed.
-6. Redeliver a retention or deletion request and verify prepare acknowledgements
-   install only non-destructive pending fences and paused Jobs registrations,
-   activation commits the barrier before purge or anonymization, and an
-   unavailable owner leaves a durable `accepted_pending` mutation; verify
-   canonical lowercase UUID v7 purge-registration IDs and baseline default-
-   lifecycle schedules, while the data owner performs one idempotent effect
-   without Jobs writing its store. When Query is unavailable, the barriered API
-   mutation fails closed while unrelated API-owned mutations retain normal
-   failure isolation.
+6. Redeliver a retention or deletion request and verify each data owner uses
+   `LifecyclePurgeRegistrationV1` to obtain a durable paused Jobs registration
+   before acknowledging prepare, activation commits the barrier before purge or
+   anonymization, and an unavailable owner leaves a durable
+   `accepted_pending` mutation; verify canonical lowercase UUID v7
+   purge-registration IDs and baseline default-lifecycle schedules, while the
+   data owner performs one idempotent effect without Jobs writing its store.
+   When Query is unavailable, the barriered API mutation fails closed while
+   unrelated API-owned mutations retain normal failure isolation.
 7. Reject forged tenant context, invalid workload identity, unauthorized
    broker access, and cross-tenant projection data.
 8. Exercise every canonical error mapping, deadline, cancellation, retryable
@@ -472,10 +497,13 @@ become runtime acceptance criteria for the owning implementation issues:
 12. Review every ownership and failure entry for an unowned path, shared
     writer, circular dependency, or undocumented fallback.
 13. Create an export while Processor is publishing, verify the correlated
-    API-to-Processor watermark request/response, API-to-Jobs scheduling,
-    Jobs-to-Query `ExportExecutionV1` dispatch, and an export snapshot hold that
-    preserves inputs through completion or fails without an artifact when a
-    watermark cannot be materialized.
+    API-to-Processor `ExportSnapshotHoldInstallV1` request/response, complete
+    watermark vectors, API-to-Jobs scheduling, Jobs-to-Query
+    `ExportExecutionV1` hold installation, and an export snapshot hold that
+    preserves inputs through completion or fails without an artifact when any
+    vector member cannot be materialized; verify terminal
+    `ExportSnapshotHoldReleaseV1` delivery for completion, failure, and
+    cancellation.
 14. Race export cancellation and terminal completion or failure, then verify
     revision fencing prevents a stale outcome from changing API state or
     making an invalid artifact issuable, partial failed or canceled objects are
@@ -483,9 +511,9 @@ become runtime acceptance criteria for the owning implementation issues:
     `expired` through the authoritative API handoff at `completed_at + 7 days`.
 15. Perform a required component break-glass or backup action while API is
     unavailable, verify the durable audit intent was committed before the
-    action, retry its correlated versioned audit evidence after a crash, and
-    verify API alone appends the resulting audit event without direct storage
-    writes.
+    action with its relational `uuid` type, retry its correlated versioned audit
+    evidence after a crash, and verify API alone appends the resulting audit
+    event without direct storage writes.
 16. Revoke export authorization after URL issuance and verify the synchronous
     revision fence blocks the next issuance and download despite stale
     asynchronous projection state; when Query is unavailable, API fails closed

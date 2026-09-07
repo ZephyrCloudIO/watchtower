@@ -266,12 +266,17 @@ prepared generation, ignore lower-generation deliveries, and install only
 non-destructive pending fences. A pending fence may reject new admission, read,
 processing, export, or rebuild work that would violate the proposed cutoff or
 deletion scope, but it must not purge, anonymize, retire raw state, or destroy
-aggregate contributions. Each owner returns a matching
-`LifecycleMutationAcknowledgementV1` with `phase=prepared` only after its
-pending fence is durable and the required Jobs registration is durable but
-paused. Every durable purge registration has a `purge_registration_id` that is
-a canonical lowercase UUID v7 at component boundaries and a PostgreSQL `uuid`
-in Jobs state.
+aggregate contributions. Each owner sends the versioned
+`LifecyclePurgeRegistrationV1` handoff to Jobs with its owner, mutation kind,
+authorized scope, generation, affected data classes, correlation identifier,
+and idempotency key. Jobs durably returns the matching
+`purge_registration_id` in `paused` state, and the owner persists that
+registration reference with its pending fence before returning a matching
+`LifecycleMutationAcknowledgementV1` with `phase=prepared`. Jobs handles its
+own local registration in the same durable operation. Every durable purge
+registration has a `purge_registration_id` that is a canonical lowercase UUID
+v7 at component boundaries and a PostgreSQL `uuid` in Jobs state; activation
+and cleanup use the same generation-matched registration ID.
 
 After every required prepared acknowledgement arrives, API atomically commits
 the matching active policy or tombstone generation and sends the activate phase.
@@ -386,34 +391,44 @@ it as PostgreSQL `uuid` in API state, and uses that canonical lowercase UUID v7
 representation at every external boundary. Query produces selected-signal
 canonical and derived snapshots from its own projections into its encrypted
 project-scoped S3 export prefix. At export creation, API sends Processor an
-authenticated, versioned export-watermark request containing `export_id` and
-`export_revision`, authorized tenant and project scope, `accepted_at` range,
-selected signals, and whether derived results are selected. Processor returns a
-correlated, versioned response with
-the canonical change watermark for that scope and, when applicable, the
-authoritative derived-state revision watermark. API persists those watermarks
-and sends a scheduling request containing them only to Jobs. Jobs durably owns
-the export schedule, lease, retry, and cancellation state, then dispatches a
-revision-fenced `ExportExecutionV1` command to Query carrying the API-persisted
-watermarks, authorized scope, range, selected signals, and `export_revision`.
-Query does not execute an export from a direct API dispatch or infer an
-authoritative watermark from its local projection.
+authenticated, versioned `ExportSnapshotHoldInstallV1` request containing
+`export_id` and `export_revision`, authorized tenant and project scope,
+`accepted_at` range, selected signals, and whether derived results are selected.
+Processor atomically installs the export-scoped hold and returns a correlated,
+versioned response with complete watermark vectors. The canonical vector is
+keyed by every requested Processor change partition and contains that
+partition's monotonic sequence. The derived vector is keyed by every requested
+fully qualified aggregate key and contains that aggregate's
+`authoritative_revision`; an aggregate with no eligible state has an explicit
+empty revision entry. Entries from different partitions or aggregates are never
+compared as one global order, and a response missing any requested entry is
+invalid. API persists the exact vectors and sends them only in the durable
+scheduling request to Jobs. Jobs durably owns the export schedule, lease, retry,
+and cancellation state, then dispatches a revision-fenced `ExportExecutionV1`
+command to Query carrying the API-persisted vectors, authorized scope, range,
+selected signals, and `export_revision`. Query does not execute an export from
+a direct API dispatch or infer an authoritative watermark from its local
+projection.
 
-Before Query may materialize an export, Processor and Query durably install an
-export-scoped snapshot hold for the requested inputs and watermarks. The hold
-is keyed by `export_id` and `export_revision`, covers the selected canonical or
-derived source and Query projection, and remains until the export reaches a
-terminal state. Query records an immutable snapshot generation only after all
-required inputs are materialized at the returned watermarks. If a hold cannot
-be installed or a watermark can no longer be materialized, Query emits a
-terminal `failed` outcome and no partial artifact; it never silently omits
-records present at request creation. After its applicable projections reach the
-watermarks, Query emits a versioned export outcome containing `export_id`,
-`export_revision`, outcome, manifest, watermarks, and snapshot generation; API
-alone records the resulting lifecycle transition and publishes the terminal
-hold-release command to the owning stores. The manifest records the watermarks
-and Query snapshot generation. Exports never include raw data, caches, or audit
-records.
+Before Query may materialize an export, Processor's
+`ExportSnapshotHoldInstallV1` response and the Jobs-to-Query
+`ExportExecutionV1` command durably establish export-scoped holds for the
+requested inputs and exact watermark vectors. Each hold is keyed by `export_id`
+and `export_revision`, covers every selected canonical partition or derived
+aggregate and the Query projection, and remains until the export reaches a
+terminal state. Query records an immutable snapshot generation only after every
+canonical vector sequence and derived aggregate revision is materialized at the
+requested target. If a hold cannot be installed or any vector member can no
+longer be materialized, Query emits a terminal `failed` outcome and no partial
+artifact; it never silently omits records present at request creation. After
+all requested vectors are complete, Query emits a versioned export outcome
+containing `export_id`, `export_revision`, outcome, manifest, vectors, and
+snapshot generation; API alone records the resulting lifecycle transition and
+publishes the terminal `ExportSnapshotHoldReleaseV1` command to Processor and
+Query. The release is idempotent and revision-fenced, and remains durably
+retryable until both owners confirm it. The manifest records the complete
+vectors and Query snapshot generation. Exports never include raw data, caches,
+or audit records.
 
 An export contains Parquet data and a JSON manifest with the schema version,
 authorized scope, selected signals, `accepted_at` range, object sizes, and
@@ -423,10 +438,11 @@ processing-generation, canonical-content-digest, and correlation-ID digests
 where those fields are represented. For derived rows, it records an ordered
 digest of aggregate keys,
 authoritative derived revisions, selected aggregate state, and deterministic
-selected-canonical-source-set digests at the derived watermark. For canonical
-rows, the manifest additionally records the
+selected-canonical-source-set digests at the corresponding derived watermark
+vector entries. For canonical rows, the manifest additionally records the
 deterministic digest of the authoritative default-generation selection at the
-snapshot watermark; every exported canonical row must match that selection.
+corresponding canonical vector entries; every exported canonical row must match
+that selection.
 These summaries are the export reconciliation source. A project may have one
 active export and at most three export requests per UTC day. Each signal range
 is limited to 31 days and 100 GiB uncompressed. A larger request fails safely
@@ -545,9 +561,10 @@ terminal disposition; canonical histories and replay compare physical
 `(watchtower_id, processing_generation, canonical_content_digest)` counts and
 ordered content-aware digests; and Query projections and canonical exports
 compare the authoritative default-generation selection and canonical content
-digests at a common watermark. Derived projections and exports compare the
-selected aggregate state, aggregate revisions, and retention-windowed source
-set at a common derived-state revision watermark.
+digests at matching canonical vector entries. Derived projections and exports
+compare the selected aggregate state, aggregate revisions, and retention-windowed
+source set at matching per-aggregate derived vector entries; no scalar revision
+is used to claim cross-aggregate completion.
 Correlation-ID digests are compared only for represented records in the same
 dimension. A mismatch is not silently repaired or treated as successful
 completion.
@@ -626,12 +643,14 @@ The owning implementation contracts must make these scenarios testable:
    canonical replay copies remain non-authoritative, have retention-homogeneous
    expiry, reconcile to their represented canonical versions, and reject a
    changed non-key canonical field when its identity pair is unchanged.
-5. Shorten retention and delete a project; verify prepare acknowledgements
-   install only non-destructive pending fences and paused Jobs registrations,
-   activation commits the barrier before any purge or anonymization, and an
-   unavailable owner leaves the mutation durably `accepted_pending` rather than
-   failing after destructive work starts; verify canonical lowercase UUID v7
-   `purge_registration_id` values and PostgreSQL `uuid` Jobs state; fencing of
+5. Shorten retention and delete a project; verify each owner uses the
+   versioned `LifecyclePurgeRegistrationV1` handoff and cannot return a prepare
+   acknowledgement until its matching paused Jobs registration is durable,
+   install only non-destructive pending fences, activation commits the barrier
+   before any purge or anonymization, and an unavailable owner leaves the
+   mutation durably `accepted_pending` rather than failing after destructive
+   work starts; verify canonical lowercase UUID v7 `purge_registration_id`
+   values and PostgreSQL `uuid` Jobs state; fencing of
    pending, handoff, replayed, queued, retry, dead-letter, dispatchable, leased,
    and in-flight work; rejection of late execution outcomes; terminal disposition
    and retirement of policy-fenced raw handoffs; derived-aggregate recomputation
@@ -651,13 +670,15 @@ The owning implementation contracts must make these scenarios testable:
    minimal anonymous evidence.
 6. Export permitted signals and verify Parquet output, manifest checksums, row
    counts, independently recomputable canonical digest tuples, generation-aware
-   canonical-content and revision-aware derived reconciliation summaries,
-   default-generation selection, API-to-Processor correlated watermark
-   request/response, API-to-Jobs scheduling, Jobs-to-Query revision-fenced
-   execution with the returned watermarks, export snapshot holds through
-   terminal completion, safe failure when a held watermark cannot be materialized,
-   Processor-to-Query watermark completion, Query-to-API versioned completion
-   outcomes and API-only lifecycle persistence, rejection of stale outcomes after
+   canonical-content and per-aggregate revision-aware derived reconciliation
+   summaries, default-generation selection, API-to-Processor correlated
+   `ExportSnapshotHoldInstallV1` request/response with complete canonical and
+   derived watermark vectors, API-to-Jobs scheduling, Jobs-to-Query
+   revision-fenced execution with the returned vectors, export snapshot holds
+   through terminal completion, safe failure when any held vector member cannot
+   be materialized, `ExportSnapshotHoldReleaseV1` delivery after completion,
+   failure, and cancellation, Query-to-API versioned completion outcomes and
+   API-only lifecycle persistence, rejection of stale outcomes after
    cancellation or another terminal transition, Jobs-scheduled
    `completed_at + 7 days` expiry and the authoritative API `expired` transition,
    Query-issued URLs no longer than their remaining object lifetime and
