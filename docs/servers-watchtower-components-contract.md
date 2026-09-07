@@ -109,7 +109,9 @@ The allowed protocol and data-flow direction is:
    export download-gateway issuance and `AuthorizationRevocationFenceV1` for
    immediate revocation across affected Query admissions, reads, caches, and
    downloads, and Processor's authenticated
-   `ExportSnapshotHoldInstallV1` interface at export creation. For a canceled
+   `ExportSnapshotHoldInstallV1` interface at export creation. API also receives
+   Query's authenticated `ExportRecoveryInvalidationV1` result when restored
+   completed-export materialization cannot be verified. For a canceled
    export, including one invalidated by ordinary source expiry or retention
    activation, API also sends the
    revision-fenced `ExportCancellationV1` handoff to Jobs before releasing the
@@ -128,7 +130,9 @@ The allowed protocol and data-flow direction is:
    coverage for every subsequent sequence in that stream. A retention-expired
    staged live write uses an idempotent no-row `CanonicalChangeSkipV1` marker
    for its reserved sequence, so live consumers also receive contiguous
-   coverage. It publishes a terminal
+   coverage and persists each live skip marker in the retained canonical replay
+   class so it remains available through the replay horizon. It publishes a
+   terminal
    `RawHandoffDispositionV1` to Ingest for every completed,
    shortened-policy-rejected, or default-expired raw handoff when it remains
    authoritative. It suppresses late processing for an Ingest expiry fence,
@@ -146,7 +150,9 @@ The allowed protocol and data-flow direction is:
    vectors and Jobs-dispatched `ExportExecutionCancellationV1` terminal fences,
    publishes versioned export outcomes for API to record customer-visible
    lifecycle transitions, submits authorized `ProjectionRebuildV1` requests to
-   Processor, and does not call another component for persistence fallback.
+   Processor, sends `ExportRecoveryInvalidationV1` to API when restored completed
+   materialization is missing or conflicting, and does not call another component
+   for persistence fallback.
 6. Jobs receives durable requests, owns scheduling and retry state, and
    dispatches versioned commands to the component owning the affected data.
    Jobs owns baseline lifecycle-purge schedules even when no shortened policy is
@@ -340,13 +346,19 @@ in its restore-independent encrypted S3 export-hold registry. Before API
 persists any terminal export transition or dispatches its cleanup command, it
 also appends the matching cancellation or release intent to that registry;
 the intent precedes `ExportCancellationV1` or
-`ExportSnapshotHoldReleaseV1` dispatch. Before API commits a successful
-`completed` transition, it also appends a completion/expiry intent containing
-the authoritative `completed_at`, export revision, effective export-object
-expiry deadline, desired `ExportExpiryScheduleV1` handoff, and a recovery copy
-of Query's materialization metadata: manifest content and digest, artifact
-object references and digests, complete watermark vectors, and
-`snapshot_generation`. Processor and Query provide an authenticated versioned
+`ExportSnapshotHoldReleaseV1` dispatch. Before sending `ExportCompletionV1`, API
+sets `completed_at` to the canonical UTC timestamp of the durable
+completion/expiry intent append and records that value, the export revision,
+effective export-object expiry deadline, desired `ExportExpiryScheduleV1`
+handoff, and a recovery copy of Query's materialization metadata: manifest
+content and digest, artifact object references and digests, complete watermark
+vectors, and `snapshot_generation`. The recovery copy remains in the registry
+until the associated artifact expires or is durably invalidated and removed;
+reconciliation or replay alone does not permit cleanup. The same
+`completed_at` is carried in
+`ExportCompletionV1`, written to API state only if the final source-expiry
+check succeeds, and used for the export-object expiry schedule. Processor and
+Query provide an authenticated versioned
 `ExportHoldInventoryV1` reconciliation
 response containing each held `export_id`, held revision, and registry digest;
 they do not expose their storage. API loads its registry before accepting
@@ -365,14 +377,19 @@ that snapshot before readiness, and reconciles missing or stale local state
 against it. This owner-store recovery does not depend on an API database
 restore.
 
-Before API records a successful `completed` transition, it sends Jobs an
-idempotent versioned `ExportCompletionV1` request containing `export_id`, the
-held and terminal `export_revision` values, authorized scope,
-`completed_at`, correlation, and idempotency context. Jobs durably marks the
-corresponding execution terminal, fences queued, leased, retry, and in-flight
-work, and acknowledges the completion before API commits the customer-visible
-transition or releases the held revision. API then sends Jobs an idempotent
-versioned `ExportExpiryScheduleV1` request with
+After the completion intent is durable, API sends Jobs an idempotent versioned
+`ExportCompletionV1` request containing `export_id`, the held and terminal
+`export_revision` values, authorized scope, the intent's `completed_at`,
+correlation, and idempotency context. Jobs durably marks the corresponding
+execution terminal, fences queued, leased, retry, and in-flight work, and
+acknowledges the completion. API then atomically rechecks that the current time
+is before the persisted source-expiry deadline and that no newer retention,
+deletion, cancellation, or authorization fence applies immediately before
+committing `completed`. A failed check does not expose the artifact and follows
+the revision-fenced source-expiry cancellation, artifact cleanup, and
+hold-release path. Only after the check succeeds does API commit the
+customer-visible transition and send Jobs an idempotent versioned
+`ExportExpiryScheduleV1` request with
 `expiry_basis=export_object` containing `export_id`, the current
 `export_revision`, authoritative `completed_at`, and the effective
 export-object expiry deadline. The deadline is the earlier of
@@ -387,6 +404,20 @@ downloads even if the object is already inaccessible. A shortened policy
 reschedules every still-downloadable completed artifact whose effective
 export-object deadline moves earlier, and expires and invalidates any artifact
 whose new deadline has already passed.
+
+Query recovery uses the authenticated, idempotent versioned unary
+`ExportRecoveryInvalidationV1` Protobuf-over-HTTP handoff under `/internal/v1`
+from Query to API. It carries the canonical lowercase UUID v7 `export_id`, the
+observed completed `export_revision`, authorized tenant and project scope, the
+recovery failure classification and observed materialization or registry
+generation/digest, correlation identifier, and idempotency context. Query sends
+the result before remaining unready for the affected completed export and
+retries it while API is unavailable. API validates the matching completed
+revision, durably records the recovery invalidation, advances the export to
+terminal `expired` through its existing revision-fenced artifact invalidation
+and hold-release path, and returns a correlated acknowledgement. Query never
+changes API lifecycle state or serves the artifact while this handoff is
+pending.
 
 The projection-rebuild handoff is a versioned unary Protobuf-over-HTTP call
 under `/internal/v1` from Query to Processor. Query sends a canonical lowercase
@@ -480,9 +511,12 @@ recovery metadata from the restore-independent completion intent: manifest
 content and digest, artifact object references and digests, complete watermark
 vectors, export and terminal revisions, and Query's `snapshot_generation`.
 Query rebuilds or verifies its local export metadata from that copy before
-readiness; a missing or conflicting artifact or metadata keeps Query unready
-and requires API's existing terminal invalidation path before the artifact can
-be served.
+readiness. If the artifact or metadata is missing or conflicting, Query sends
+the authenticated `ExportRecoveryInvalidationV1` handoff to API before remaining
+unready for that completed export. API validates the matching completed
+revision, advances it through the existing revision-fenced terminal `expired`
+invalidation and hold-release path, and Query does not serve the artifact while
+the handoff is pending.
 Subsequent policy and deletion mutations use the same generation-aware durable
 handoffs, while this request repairs state after restoration or rebuild.
 
@@ -752,15 +786,17 @@ become runtime acceptance criteria for the owning implementation issues:
     leaves that checkpoint unchanged for an incomplete subrange request, and
     fails safely when coverage is missing or mismatched.
 14. Race export cancellation and terminal completion or failure, then verify
-    `ExportCompletionV1` terminalizes Jobs execution before API exposes
-    completion or schedules object expiry, Jobs cancels and fences queued, leased,
-    retry, and in-flight execution,
+    the completion/expiry intent and recovery copy are durable before
+    `ExportCompletionV1`, its `completed_at` is reused through API and Jobs,
+    and the final source-expiry and retention-fence check occurs immediately
+    before API commits `completed`; Jobs then terminalizes execution before API
+    exposes completion or schedules object expiry, and cancels and fences queued,
+    leased, retry, and in-flight execution,
     Query rejects delayed post-terminal `ExportExecutionV1` commands, and
     revision fencing prevents a stale outcome from changing API state or making
     an invalid artifact issuable; partial failed or canceled objects are
-    removed at terminal transition, API records the authoritative `completed_at`
-    and desired expiry schedule in the restore-independent hold registry before
-    committing completion, and Jobs advances a completed export to `expired`
+    removed at terminal transition, and Jobs advances a completed export to
+    `expired`
     through the `ExportExpiryScheduleV1` handoff with an explicit expiry basis
     at the earlier of the
     seven-day default and export-object policy cutoff. A restored API replays an
@@ -776,7 +812,10 @@ become runtime acceptance criteria for the owning implementation issues:
     cutoff moves earlier, and invalidates artifacts whose new cutoff has passed;
     the restore-independent hold registry records
     cancellation and release intents before dispatch and replays unresolved
-    intents after API restore.
+    intents after API restore, retains the completed-materialization recovery
+    copy while the artifact remains accessible even after reconciliation, and
+    sends `ExportRecoveryInvalidationV1` before leaving Query unready when a
+    restored artifact or metadata is missing or conflicting.
 15. Perform a required component break-glass or backup action while API is
     unavailable, verify the durable audit intent was committed before the
     action with its relational `uuid` type, and for an API PostgreSQL restore
@@ -799,7 +838,10 @@ become runtime acceptance criteria for the owning implementation issues:
     their owner-scoped hold/fence and completed-materialization snapshot
     reconciliation completes before readiness, with Query rebuilding or
     verifying manifests, artifact references, vectors, and
-    `snapshot_generation` before serving a completed export and installing the
+    `snapshot_generation` before serving a completed export; when verification
+    fails, Query retries `ExportRecoveryInvalidationV1` to API while remaining
+    unready and API performs the terminal invalidation before the artifact can
+    be served; Query installs the
     terminal fence before releasing its projection hold; when Jobs' backup
     predates an ordinary default-policy project creation, verify it recreates
     the missing baseline registration idempotently from the inventory before
