@@ -258,55 +258,80 @@ deletion-tombstone registries follow their stated 13-month lifecycle. Restores
 must not reintroduce expired or deleted data and must reapply current registry
 fences before readiness. Authorized project administrators may shorten a project
 retention policy but may not extend it through this contract. API assigns every
-project policy a strictly monotonic generation and records each versioned shortened
-duration policy in its restore-independent retention policy registry. Ingest,
-Processor, Query, and Jobs each durably retain the highest installed generation,
-ignore lower-generation deliveries, and return a matching
-`LifecycleMutationAcknowledgementV1` only after installing the fence and
-durably registering the required purge work with Jobs. Each owner computes the
-earlier of its class-default cutoff and project-policy cutoff from current time
-whenever enforcing admission, read, processing, replay, export, or rebuild
-behavior. API reports success only after every required acknowledgement confirms
-the matching generation, installed fence, and durable purge registration. Until
-acknowledgement, the mutation fails closed. Before
-its acknowledgement, Ingest stops admitting excess records and serving excess raw
-data, Processor durably fences queued, pending-handoff, and replayed work whose
-`accepted_at` falls outside the new limit, prevents canonical or derived
-publication, and recomputes or removes derived results with expired
-contributions, and Query denies excess reads, exports, and rebuilds. Processor
-returns a durable `RawHandoffDispositionV1` message with a terminal
+project policy a strictly monotonic generation and records each requested
+versioned shortened-duration policy in a pending state in its restore-independent
+retention-policy registry. Lifecycle mutations use a prepare/activate barrier.
+During prepare, Ingest, Processor, Query, and Jobs durably retain the highest
+prepared generation, ignore lower-generation deliveries, and install only
+non-destructive pending fences. A pending fence may reject new admission, read,
+processing, export, or rebuild work that would violate the proposed cutoff or
+deletion scope, but it must not purge, anonymize, retire raw state, or destroy
+aggregate contributions. Each owner returns a matching
+`LifecycleMutationAcknowledgementV1` with `phase=prepared` only after its
+pending fence is durable and the required Jobs registration is durable but
+paused. Every durable purge registration has a `purge_registration_id` that is
+a canonical lowercase UUID v7 at component boundaries and a PostgreSQL `uuid`
+in Jobs state.
+
+After every required prepared acknowledgement arrives, API atomically commits
+the matching active policy or tombstone generation and sends the activate phase.
+Only after that commit may Jobs enable the recurring purge schedule and may
+owners perform irreversible retention or deletion work. Owners return a
+generation-matched acknowledgement with `phase=active` after enabling the
+active fence and schedule. API reports successful mutation only after every
+required active acknowledgement confirms the matching generation, installed
+fence, and enabled purge registration. If preparation or activation is
+incomplete, the durable mutation remains `accepted_pending` and is retried;
+API does not return a failed outcome after a destructive effect could have
+started. A pending or active mutation still fails closed for dependent API
+operations until the required owner acknowledgements exist.
+
+After activation, each owner computes the earlier of its class-default cutoff
+and project-policy cutoff from current time whenever enforcing admission, read,
+processing, replay, export, or rebuild behavior. Ingest stops admitting excess
+records and serving excess raw data, Processor durably fences queued,
+pending-handoff, and replayed work whose `accepted_at` falls outside the new
+limit, prevents canonical or derived publication, and recomputes or removes
+derived results with expired contributions, and Query denies excess reads,
+exports, and rebuilds. Processor returns a durable `RawHandoffDispositionV1`
+message with a terminal
 `policy_rejected` disposition for each handoff rejected by the shortened policy;
 for an unprocessed handoff that crosses the seven-day class default without a
 shortened policy, it returns `default_expired` with
 `expiry_basis=class_default` and no retention-policy generation. Ingest records
 either disposition as terminal, retires its outbox entry, and purges the
-corresponding raw object and acceptance metadata. After installing its
-fence, each owner submits a durable recurring
-active-store purge schedule to Jobs for as long as the shortened policy remains
-active. Jobs must durably persist that schedule before the owner acknowledges the
-policy. Jobs owns scheduling and retrying each purge dispatch; on every run, the
-data owner applies the current-time effective cutoff and idempotently purges all
-newly expired data within 14 days. Before any restored or rebuilt Ingest,
+corresponding raw object and acceptance metadata. Jobs owns a durable recurring
+baseline lifecycle-purge registration for every applicable project and data
+class, even when the project keeps the default policy. A shortened policy or
+project deletion adds a generation-scoped registration; its schedule is paused
+during prepare and enabled only after activation. Jobs owns scheduling and
+retrying each purge dispatch; on every run, the data owner applies the
+current-time effective cutoff and idempotently purges all newly expired data
+within 14 days. For derived aggregates, the baseline schedule recomputes or
+removes expired contributions and publishes the resulting revisioned state so
+Query projections cannot retain dormant expired data. Before any restored or
+rebuilt Ingest,
 Processor, Query, or Jobs owner becomes ready, it obtains current retention-policy
 and deletion-tombstone registry snapshots from API through the versioned
 `ControlRegistrySnapshotV1` handoff defined in the component contract, persists
 them before readiness, and enforces them. Each data owner reapplies its effective
-cutoff, fences excess data, and submits its durable recurring active-store purge
-schedule to Jobs; Jobs restores the associated scheduling and deletion fences.
+cutoff and fences excess data; Jobs restores the associated baseline, policy,
+and deletion scheduling and fences.
 There is no cold archive.
 
-Project deletion is project-wide. API creates a versioned deletion generation
-and keyed project tombstone in its append-only restore-independent registry,
-then requires a generation-matched `LifecycleMutationAcknowledgementV1` from
-Ingest, Processor, Query, and Jobs confirming each installed its fence and that
-project purge work is durably registered with Jobs before accepting the deletion;
-it fails closed until all acknowledge. Each owner fences the project for that
-generation before acknowledgement: Ingest rejects collection and pending raw
-handoffs, Processor
-rejects pending or replayed work and canonical or derived republishing, Query
-rejects reads, restoration, exports, and new projection rebuilds, and Jobs
-cancels and fences queued, retry, dead-letter, dispatchable, leased, and
-in-flight non-purge project work. Jobs persists the versioned purge schedule,
+Project deletion is project-wide and uses the same prepare/activate barrier. API
+records a versioned deletion generation and keyed project tombstone in a pending
+state in its append-only restore-independent registry. Each owner installs a
+pending project fence before returning `phase=prepared`: Ingest rejects new
+collection and pending raw handoffs, Processor rejects new pending or replayed
+work and republishing, Query rejects new reads, restoration, exports, and
+projection rebuilds, and Jobs fences new non-purge work. No project data is
+purged or anonymized during prepare. After API commits the active tombstone,
+Jobs enables the versioned project-purge schedule and dispatches it; Ingest,
+Processor, Query, and Jobs return `phase=active` acknowledgements after the
+active fence and purge registration are installed. API fails closed until the
+complete active barrier exists. Jobs cancels and fences queued, retry,
+dead-letter, dispatchable, leased, and in-flight non-purge project work,
 dispatches idempotent owner-specific purge or anonymization commands, retries
 them until completion, and rejects late non-purge execution outcomes so they
 cannot recreate project-scoped execution state. Query invalidates cache entries
@@ -367,13 +392,28 @@ selected signals, and whether derived results are selected. Processor returns a
 correlated, versioned response with
 the canonical change watermark for that scope and, when applicable, the
 authoritative derived-state revision watermark. API persists those watermarks
-and carries them in the versioned work dispatched to Jobs and Query; Query does
-not infer them from its local projection. After its applicable projections
-reach those watermarks, Query emits a versioned export outcome containing
-`export_id`, `export_revision`, outcome, manifest, watermarks, and snapshot
-generation; API alone records the resulting lifecycle transition. The manifest
-records the watermarks and Query snapshot generation. Exports never include raw
-data, caches, or audit records.
+and sends a scheduling request containing them only to Jobs. Jobs durably owns
+the export schedule, lease, retry, and cancellation state, then dispatches a
+revision-fenced `ExportExecutionV1` command to Query carrying the API-persisted
+watermarks, authorized scope, range, selected signals, and `export_revision`.
+Query does not execute an export from a direct API dispatch or infer an
+authoritative watermark from its local projection.
+
+Before Query may materialize an export, Processor and Query durably install an
+export-scoped snapshot hold for the requested inputs and watermarks. The hold
+is keyed by `export_id` and `export_revision`, covers the selected canonical or
+derived source and Query projection, and remains until the export reaches a
+terminal state. Query records an immutable snapshot generation only after all
+required inputs are materialized at the returned watermarks. If a hold cannot
+be installed or a watermark can no longer be materialized, Query emits a
+terminal `failed` outcome and no partial artifact; it never silently omits
+records present at request creation. After its applicable projections reach the
+watermarks, Query emits a versioned export outcome containing `export_id`,
+`export_revision`, outcome, manifest, watermarks, and snapshot generation; API
+alone records the resulting lifecycle transition and publishes the terminal
+hold-release command to the owning stores. The manifest records the watermarks
+and Query snapshot generation. Exports never include raw data, caches, or audit
+records.
 
 An export contains Parquet data and a JSON manifest with the schema version,
 authorized scope, selected signals, `accepted_at` range, object sizes, and
@@ -401,7 +441,12 @@ or otherwise stale outcomes and every outcome received after a terminal state
 has been recorded. Cancellation advances the revision and fences in-flight
 work, so a late completion cannot restore a canceled export and a late failure
 cannot overwrite a successful one. Query stops or invalidates the associated
-artifact when cancellation is fenced. API records `completed_at` as the UTC time
+artifact when cancellation is fenced. Jobs schedules an idempotent
+`ExportExpiryV1` handoff for `completed_at + 7 days`. API authoritatively
+transitions a still-completed export to `expired`, advances its revision, and
+publishes the invalidation to Query even if the artifact has already become
+inaccessible. Query invalidates the artifact and rejects every expired download.
+API records `completed_at` as the UTC time
 it persists a successful `completed` transition, and export objects are retained
 for seven days from that timestamp, independent of the records' `accepted_at`
 values. API rechecks authorization immediately before requesting a Query-owned
@@ -445,6 +490,14 @@ extension attributes, but excluding storage-engine metadata, reconciliation
 metadata, and the digest itself. Every authoritative canonical row, replay
 copy, Query projection row, and exported canonical row carries or deterministically
 recomputes the same content digest.
+The digest projection uses an explicit type tag for every extension value:
+scalars use `{"type": "integer", "value": 1}` or the corresponding `null`,
+`boolean`, `string`, or `float` type; homogeneous arrays use
+`{"type": "array", "item_type": "integer", "value": [...]}`. Consequently,
+an integer-valued float such as `1.0` retains `type=float` in the digest
+projection and cannot collide with an integer `1`; the numeric value is still
+encoded with RFC 8785 canonical JSON. This tagged representation is identical
+across authoritative storage, replay, Query projections, and exports.
 The required tuples are `{"watchtower_id": ...}` for raw acceptance and
 handoff; `{"watchtower_id": ..., "processing_generation": ..., "canonical_content_digest": ...}`
 for canonical history, replay, Query projections, default-generation selection,
@@ -552,7 +605,9 @@ The owning implementation contracts must make these scenarios testable:
    without Watchtower ID collision or cross-tenant disclosure; verify project and
    Watchtower IDs use the canonical UUID v7/PostgreSQL `uuid` representation and
    reject out-of-range extension integers and non-finite extension floats before
-   canonicalization.
+   canonicalization; verify tagged integer and finite-float values produce
+   different canonical-content digests even when their numeric values compare
+   equal.
 2. Fail S3, PostgreSQL, ClickHouse, and MSK operations before and after local
    commits; verify no false successful acceptance and idempotent recovery.
 3. Verify raw-object immutability, SHA-256 and size reconciliation, required
@@ -571,31 +626,40 @@ The owning implementation contracts must make these scenarios testable:
    canonical replay copies remain non-authoritative, have retention-homogeneous
    expiry, reconcile to their represented canonical versions, and reject a
    changed non-key canonical field when its identity pair is unchanged.
-5. Shorten retention and delete a project; verify Ingest, Processor, Query, and
-   Jobs install and enforce each deletion fence before acknowledgement; fencing
-   of pending, handoff, replayed, queued, retry, dead-letter, dispatchable,
-   leased, and in-flight work; rejection of late execution outcomes; terminal
-   disposition and retirement of policy-fenced raw handoffs;
-   derived-aggregate recomputation without expired contributions; current-time
-   duration enforcement; durable Jobs schedule registration before each owner
-   acknowledges a shortened policy; durable project-purge registration before
-   deletion acknowledgement; recurring Jobs-scheduled, owner-run active
-   purges of data that expires after policy installation within 14 days;
+5. Shorten retention and delete a project; verify prepare acknowledgements
+   install only non-destructive pending fences and paused Jobs registrations,
+   activation commits the barrier before any purge or anonymization, and an
+   unavailable owner leaves the mutation durably `accepted_pending` rather than
+   failing after destructive work starts; verify canonical lowercase UUID v7
+   `purge_registration_id` values and PostgreSQL `uuid` Jobs state; fencing of
+   pending, handoff, replayed, queued, retry, dead-letter, dispatchable, leased,
+   and in-flight work; rejection of late execution outcomes; terminal disposition
+   and retirement of policy-fenced raw handoffs; derived-aggregate recomputation
+   without expired contributions; current-time duration enforcement; baseline
+   Jobs schedules for default lifecycles even without a shortened policy; recurring
+   Jobs-scheduled, owner-run active purges of data that expires after policy
+   installation within 14 days;
    purge or irreversible anonymization of Jobs project-scoped operational state;
    backup purge or irreversible inaccessibility within 90 days of each applicable
    expiry, including deleted-project data; removal of every project
    retention-policy registry record; restore-independent retention and
    tombstone-registry recovery before any restored or rebuilt owner accepts
    traffic; export cancellation; cache invalidation; generation-matched
-   `LifecycleMutationAcknowledgementV1` outcomes; append-only audit rows with
-   irreversibly destroyed project context; and minimal anonymous evidence.
+   `LifecycleMutationAcknowledgementV1` outcomes; durable audit intent before a
+   required audited action and correlated outcome evidence after a crash;
+   append-only audit rows with irreversibly destroyed project context; and
+   minimal anonymous evidence.
 6. Export permitted signals and verify Parquet output, manifest checksums, row
    counts, independently recomputable canonical digest tuples, generation-aware
    canonical-content and revision-aware derived reconciliation summaries,
    default-generation selection, API-to-Processor correlated watermark
-   request/response, Processor-to-Query watermark completion, Query-to-API
-   versioned completion outcomes and API-only lifecycle persistence, rejection
-   of stale outcomes after cancellation or another terminal transition,
+   request/response, API-to-Jobs scheduling, Jobs-to-Query revision-fenced
+   execution with the returned watermarks, export snapshot holds through
+   terminal completion, safe failure when a held watermark cannot be materialized,
+   Processor-to-Query watermark completion, Query-to-API versioned completion
+   outcomes and API-only lifecycle persistence, rejection of stale outcomes after
+   cancellation or another terminal transition, Jobs-scheduled
+   `completed_at + 7 days` expiry and the authoritative API `expired` transition,
    Query-issued URLs no longer than their remaining object lifetime and
    seven-day object expiry anchored at `completed_at`, immediate cleanup of
    failed or canceled partial objects, revision-fenced authorization revocation,
