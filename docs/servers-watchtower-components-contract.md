@@ -79,7 +79,7 @@ authorization PRD.
 | Ingest | Protocol admission, raw-record writes, and recoverable handoff capacity. | Ingest owns admission outcomes and stops successful admission when safe capacity is exhausted; accepted raw records and handoffs remain recoverable. |
 | API | Control-plane, artifact, release, and Sentry management request load. | API owns control mutations and management compatibility responses; API failure does not stop valid Ingest admission or Query reads while their security projections remain fresh. |
 | Processor | Asynchronous normalization, privacy, enrichment, symbolication, and aggregate processing backlog. | Processor owns processing lag and recovery; failure preserves durable handoff work and does not create public business routes or direct storage fallbacks. |
-| Query | Native and compatible read load, projection consumption, indexes, and caches. | Query owns query results and projection freshness; Query failure stops query routes and Sentry management reads but not API-owned mutations. |
+| Query | Native and compatible read load, projection consumption, indexes, and caches. | Query owns query results and projection freshness; Query failure stops query routes and Sentry management reads. Ordinary API-owned mutations continue, but mutations that require Query's synchronous durable fence or acknowledgement fail closed while Query is unavailable. |
 | Jobs | Scheduling, lease, retry, dead-letter, and asynchronous execution load. | Jobs owns scheduling and execution outcomes; failure preserves durable requests and domain owners remain the only writers of domain state. |
 | Web | Browser asset delivery and client-local UI work. | Web owns the browser experience and static assets; Web failure does not grant the browser server authority or stop server-owned mutations and processing. |
 
@@ -112,11 +112,12 @@ The allowed protocol and data-flow direction is:
 6. Jobs receives durable requests, owns scheduling and retry state, and
    dispatches versioned commands to the component owning the affected data.
    Data owners durably register retention and project-deletion purge work with
-   Jobs before acknowledging the corresponding policy or deletion. Jobs also
-   obtains the current retention-policy and deletion-tombstone snapshots through
-   its authenticated `ControlRegistrySnapshotV1` request to API before
-   readiness or after restoration. The owner performs the idempotent side effect
-   and publishes the outcome.
+   Jobs before acknowledging the corresponding policy or deletion. Ingest,
+   Processor, Query, and Jobs each obtain the current retention-policy and
+   deletion-tombstone snapshots through an authenticated
+   `ControlRegistrySnapshotV1` request to API before readiness or after
+   restoration. The owner performs the idempotent side effect and publishes the
+   outcome.
 7. Ingest, Processor, Query, and Jobs submit required evidence for break-glass,
    restoration, key, replication, backup, and restore actions to API through a
    versioned durable audit-evidence message. API validates the producer,
@@ -127,8 +128,11 @@ The allowed protocol and data-flow direction is:
 This direction contains no circular protocol or persistence dependency. API
 outages do not immediately stop valid Ingest admission or Query reads while
 their security projections remain valid. Query outages stop Query routes and
-Sentry management reads, but not API-owned mutations. Processor or Jobs
-outages preserve durable work for later processing.
+Sentry management reads, but not ordinary API-owned mutations. API-owned
+mutations that require Query's synchronous durable fence or acknowledgement,
+including retention-policy shortening, project deletion, and
+authorization-revocation fencing, fail closed while Query is unavailable.
+Processor or Jobs outages preserve durable work for later processing.
 
 ## Data Flow and Failure Boundaries
 
@@ -203,18 +207,21 @@ under `/internal/v1` from Query to Processor. Query sends a canonical lowercase
 UUID v7 `rebuild_id`, authorized tenant and project scope, `accepted_at` range,
 selected signals, derived-selection flag, correlation identifier, and
 idempotency key. Processor validates the authorization, retention, and deletion
-fences, durably records the request idempotently before acknowledging it, and
-republishes eligible versioned canonical or derived changes through its normal
-change path. The correlated response reports durable acceptance or a terminal
-safe error; Query never accesses Processor persistence directly.
+fences, durably records the request and its idempotency state with `rebuild_id`
+stored as PostgreSQL `uuid` before acknowledging it, and republishes eligible
+versioned canonical or derived changes through its normal change path. The
+correlated response reports durable acceptance or a terminal safe error; Query
+never accesses Processor persistence directly.
 
 The registry-snapshot handoff is a versioned unary Protobuf-over-HTTP call under
-`/internal/v1` from Jobs to API. Jobs requests the current retention-policy and
-deletion-tombstone snapshots with its correlation and idempotency context. API
-returns the versioned snapshots and their highest generations; Jobs persists
-them before readiness and fails closed if the snapshot cannot be installed.
-Subsequent policy and deletion mutations use the same generation-aware durable
-handoffs, while this request repairs state after restoration or rebuild.
+`/internal/v1` from each of Ingest, Processor, Query, and Jobs to API. Each owner
+requests the current retention-policy and deletion-tombstone snapshots with its
+authenticated owner identity, correlation, and idempotency context. API returns
+the versioned snapshots and their highest generations; the requesting owner
+persists them before readiness and fails closed if the snapshot cannot be
+installed. Subsequent policy and deletion mutations use the same
+generation-aware durable handoffs, while this request repairs state after
+restoration or rebuild.
 
 The authorization-revocation fence is a versioned unary Protobuf-over-HTTP call
 under `/internal/v1` from API to Query. API sends the affected actor, project or
@@ -361,7 +368,9 @@ become runtime acceptance criteria for the owning implementation issues:
    security projection, then cross its freshness boundary and fail closed.
 6. Redeliver a retention or deletion request and verify Jobs durably schedules
    it before acknowledgement while the data owner performs one idempotent
-   effect without Jobs writing its store.
+   effect without Jobs writing its store; when Query is unavailable, the
+   barriered API mutation fails closed while unrelated API-owned mutations retain
+   normal failure isolation.
 7. Reject forged tenant context, invalid workload identity, unauthorized
    broker access, and cross-tenant projection data.
 8. Exercise every canonical error mapping, deadline, cancellation, retryable
@@ -386,9 +395,11 @@ become runtime acceptance criteria for the owning implementation issues:
     appends the resulting audit event without direct storage writes.
 16. Revoke export authorization after URL issuance and verify the synchronous
     revision fence blocks the next issuance and download despite stale
-    asynchronous projection state.
-17. Restore Jobs independently and verify it obtains and persists current
-    retention-policy and deletion-tombstone snapshots before readiness.
+    asynchronous projection state; when Query is unavailable, API fails closed
+    rather than acknowledging the revocation.
+17. Restore Ingest, Processor, Query, and Jobs independently and verify each
+    obtains and persists current retention-policy and deletion-tombstone
+    snapshots before readiness.
 
 ## Deferred Decisions and Non-Goals
 

@@ -44,7 +44,7 @@ Every canonical record contains the following typed fields:
 | --- | --- |
 | `tenant_id` | The authorized tenant owning the record. |
 | `project_id` | The authorized project owning the record, serialized as a canonical lowercase UUID v7 at external boundaries and stored as PostgreSQL `uuid` in repository-owned relational state. |
-| `watchtower_id` | A Watchtower-generated canonical lowercase UUID v7 logical-record identifier. It is stable across reprocessing and is never supplied by an external protocol. |
+| `watchtower_id` | A Watchtower-generated canonical lowercase UUID v7 logical-record identifier. It is serialized as a canonical lowercase UUID v7 at external boundaries and stored as PostgreSQL `uuid` wherever it is held in repository-owned relational state. It is stable across reprocessing and is never supplied by an external protocol. |
 | `processing_generation` | A Processor-assigned immutable canonical lowercase UUID v7 identifier for a canonical result. It is serialized as a canonical lowercase UUID v7 at external boundaries and stored as PostgreSQL `uuid` in Processor selection state. Together with `watchtower_id`, it identifies a canonical row version. |
 | `accepted_at` | The time Watchtower durably accepts the record, serialized as UTC RFC 3339 with nanosecond precision. It is the retention and partitioning clock. |
 | `observed_at` | The source observation time serialized as UTC RFC 3339 with nanosecond precision, or an explicit typed `not_applicable` value. A missing field is not a not-applicable value. |
@@ -153,8 +153,9 @@ environment/component/tenant/project/accepted-date/<watchtower-uuid-v7>
 ```
 
 The Ingest PostgreSQL acceptance record stores the object key, SHA-256 digest,
-size, `accepted_at`, tenant, project, Watchtower ID, and outbox state. A raw
-record is not successfully acknowledged unless the immutable object exists,
+size, `accepted_at`, tenant, project, `watchtower_id` as PostgreSQL `uuid`, and
+outbox state. A raw record is not successfully acknowledged unless the
+immutable object exists,
 its digest and size have been verified, and the acceptance metadata and
 transactional outbox commit. Orphaned or incomplete attempts are reconciled
 without being reported as successful acceptance. The raw object, acceptance
@@ -237,7 +238,14 @@ applicable replay horizon.
 Retention is calculated from `accepted_at`, except that derived aggregates and
 their replay batches and Query projections use the retention-windowed lifecycle
 defined above, and export objects use the `completed_at` lifecycle anchor defined
-in the Export Contract. Authorized project administrators may shorten a project
+in the Export Contract. Backup copies of project data may outlive active-store
+expiry only as a bounded recovery exception: each expired record or state item
+must be purged from backups or made irreversibly inaccessible within 90 days of
+its effective expiry. This deadline covers raw, replay, canonical, derived,
+projection, and export data; the restore-independent retention-policy and
+deletion-tombstone registries follow their stated 13-month lifecycle. Restores
+must not reintroduce expired or deleted data and must reapply current registry
+fences before readiness. Authorized project administrators may shorten a project
 retention policy but may not extend it through this contract. API assigns every
 project policy a strictly monotonic generation and records each versioned shortened
 duration policy in its restore-independent retention policy registry. Ingest,
@@ -261,14 +269,14 @@ active-store purge schedule to Jobs for as long as the shortened policy remains
 active. Jobs must durably persist that schedule before the owner acknowledges the
 policy. Jobs owns scheduling and retrying each purge dispatch; on every run, the
 data owner applies the current-time effective cutoff and idempotently purges all
-newly expired data within 14 days. Before any restored or rebuilt API, Ingest,
+newly expired data within 14 days. Before any restored or rebuilt Ingest,
 Processor, Query, or Jobs owner becomes ready, it obtains current retention-policy
-and deletion-tombstone registry snapshots from API and enforces them. Jobs obtains
-its snapshot through the versioned `ControlRegistrySnapshotV1` handoff and must
-persist it before readiness. Each data owner reapplies its effective cutoff,
-fences excess data, and submits its durable recurring active-store purge schedule
-to Jobs; Jobs restores the associated scheduling and deletion fences. There is no
-cold archive.
+and deletion-tombstone registry snapshots from API through the versioned
+`ControlRegistrySnapshotV1` handoff defined in the component contract, persists
+them before readiness, and enforces them. Each data owner reapplies its effective
+cutoff, fences excess data, and submits its durable recurring active-store purge
+schedule to Jobs; Jobs restores the associated scheduling and deletion fences.
+There is no cold archive.
 
 Project deletion is project-wide. API creates a versioned deletion generation
 and keyed project tombstone in its append-only restore-independent registry,
@@ -287,11 +295,11 @@ cannot recreate project-scoped execution state. Query invalidates cache entries
 immediately. Active stores, including raw, canonical, derived, projections,
 replay batches, export objects, and Jobs project-scoped operational state, are
 purged or irreversibly anonymized within 14 days. Backups are purged within 90
-days, and deleted project data is not restored from a backup. Before a restored
-API database accepts traffic, API loads the current registry and reapplies every
-current tombstone to identify, fence, and purge deleted-project rows. Before
-accepting deletion, API irreversibly removes every retention-policy registry
-version for the project. API retains the non-customer-readable registry tombstone
+days of deletion, and deleted project data is not restored from a backup. Before
+a restored API database accepts traffic, API loads the current registry and
+reapplies every current tombstone to identify, fence, and purge deleted-project
+rows. Before accepting deletion, API irreversibly removes every retention-policy
+registry version for the project. API retains the non-customer-readable registry tombstone
 for 13 months. Only irreversible minimal evidence remains after project deletion:
 deletion timestamp, result, correlation ID, and the keyed tombstone, without
 tenant-identifying or customer-payload content.
@@ -511,9 +519,9 @@ platform-wide targets.
 The owning implementation contracts must make these scenarios testable:
 
 1. Store equivalent external event, trace, or span identifiers for two tenants
-   without Watchtower ID collision or cross-tenant disclosure; verify project IDs
-   use the canonical UUID v7/PostgreSQL `uuid` representation and reject
-   non-finite extension floats before canonicalization.
+   without Watchtower ID collision or cross-tenant disclosure; verify project and
+   Watchtower IDs use the canonical UUID v7/PostgreSQL `uuid` representation and
+   reject non-finite extension floats before canonicalization.
 2. Fail S3, PostgreSQL, ClickHouse, and MSK operations before and after local
    commits; verify no false successful acceptance and idempotent recovery.
 3. Verify raw-object immutability, SHA-256 and size reconciliation, required
@@ -524,7 +532,8 @@ The owning implementation contracts must make these scenarios testable:
 4. Rebuild eligible canonical and derived Query projections through an
    authorized, durably acknowledged Query-to-Processor `ProjectionRebuildV1`
    request and Processor republishing without direct Processor storage access;
-   verify that
+   verify that the canonical lowercase UUID v7 `rebuild_id` is persisted as
+   PostgreSQL `uuid` in Processor's durable request and idempotency state, that
    canonical replay copies remain non-authoritative, have retention-homogeneous
    expiry, reconcile to their represented canonical versions, and reject a
    changed non-key canonical field when its identity pair is unchanged.
@@ -539,10 +548,11 @@ The owning implementation contracts must make these scenarios testable:
    deletion acknowledgement; recurring Jobs-scheduled, owner-run active
    purges of data that expires after policy installation within 14 days;
    purge or irreversible anonymization of Jobs project-scoped operational state;
-   backup purge within 90 days; removal of every project retention-policy registry
-   record; restore-independent retention and tombstone-registry recovery before
-   any restored or rebuilt owner accepts traffic; export cancellation; cache
-   invalidation; and
+   backup purge or irreversible inaccessibility within 90 days of each applicable
+   expiry, including deleted-project data; removal of every project
+   retention-policy registry record; restore-independent retention and
+   tombstone-registry recovery before any restored or rebuilt owner accepts
+   traffic; export cancellation; cache invalidation; and
    minimal anonymous evidence.
 6. Export permitted signals and verify Parquet output, manifest checksums, row
    counts, independently recomputable canonical digest tuples, generation-aware
