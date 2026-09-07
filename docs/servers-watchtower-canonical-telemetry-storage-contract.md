@@ -103,10 +103,12 @@ canonical telemetry.
 | Derived aggregates | Processor; authoritative for mutable derived results | Processor-owned PostgreSQL schemas and encrypted project-scoped derived replay batches | Retention-windowed to thirteen UTC calendar months after `accepted_at` by default or the shortened project policy; expired contributions are removed before they can remain represented in the aggregate, replay batches, or Query projections |
 | Compatibility-only representations | The sole owning adapter for each protocol interface; authoritative only for that boundary | Request-scoped memory or an adapter-owned boundary defined by #16 or its signal contract | No canonical retention; never a shared persistence model |
 | Query projections | Query; authoritative only for read projection state | Query-owned ClickHouse databases or schemas | Rebuildable canonical-signal projections are retained for 90 days; derived-aggregate projections use their authoritative aggregate's lifecycle and retention window; all are purged with the project |
+| Query export metadata | Query; authoritative for export materialization state and `snapshot_generation` | Query-owned PostgreSQL export-metadata boundary | Retained with the export lifecycle and purged with the project; it is not a second export authority and contains no raw telemetry |
 | Query cache | Query; never authoritative | Encrypted Query-owned cache | At most 15 minutes; immediately invalidated for retention, deletion, or authorization changes |
 | Export objects | Query; non-authoritative customer-download artifacts | Encrypted Query-owned project-scoped S3 export prefix | Seven days from API `completed_at` for successful artifacts; artifacts from any attempt that terminates without successful `completed`, including failed or canceled attempts, are removed or made inaccessible at terminal transition, and retention-fenced or deleted-project exports are removed or made inaccessible immediately |
-| Audit events | API for contract-level lifecycle and access audit authority | API-owned append-only PostgreSQL audit boundary with erasable encrypted project-scoped context | Detailed history follows #15; deleted projects retain only minimal anonymous evidence |
+| Audit events | API for contract-level lifecycle and access audit authority | API-owned append-only PostgreSQL audit boundary with erasable encrypted project-scoped context, plus a restore-independent immutable audit journal | Detailed history follows #15; every journaled event is replayable after an API database restore, and deleted projects retain only minimal anonymous evidence |
 | API restore audit intents | API; authoritative for pre-restore intent evidence until API records the outcome in its audit boundary | API-owned encrypted immutable S3 audit-intent prefix independent of API PostgreSQL backups | Retained through restore completion and evidence recording, then follows the applicable audit-retention policy; never stored only in the API restore target |
+| API export hold registry | API; authoritative for restore-independent export hold and terminal-release evidence | API-owned encrypted immutable S3 export-hold registry prefix independent of API PostgreSQL backups | Retained until every held revision is terminally released or reconciled, then follows export and project-deletion cleanup |
 | Retention policy registry | API; authoritative for shortened-retention duration policies, their current-time effective cutoffs, and restore cleanup | API-owned encrypted immutable S3 control-registry prefix, independent of API PostgreSQL backups | The active policy persists until superseded and its effective cutoff is computed from that duration at enforcement time; superseded versioned policy records are retained for 13 months and the active policy is loaded before restored owners accept traffic |
 | Deletion tombstone registry | API; authoritative for deletion fencing and restore cleanup | API-owned encrypted immutable S3 control-registry prefix, independent of API PostgreSQL backups | Non-customer-readable keyed tombstones retained for 13 months; loaded before restored owners accept traffic |
 | Processing and operational state | The component performing the operation | Its own PostgreSQL database or explicitly owned state boundary | Owned and retained by that component; no cross-component writer |
@@ -147,8 +149,8 @@ access to another component's storage are prohibited.
 | --- | --- |
 | Ingest | Encrypted immutable raw S3 objects, PostgreSQL acceptance metadata, and the transactional processing outbox. |
 | Processor | The four immutable canonical ClickHouse histories, encrypted project-scoped non-authoritative replay batches, PostgreSQL processing state, and mutable derived aggregates. |
-| Query | Independently owned ClickHouse read projections, encrypted non-authoritative cache, and encrypted project-scoped S3 export prefix. |
-| API | Authoritative control-plane and audit state in its own PostgreSQL boundary, plus encrypted immutable S3 control-registry prefixes for restore-independent retention policies, deletion tombstones, and API restore audit intents. |
+| Query | Independently owned ClickHouse read projections, Query-owned PostgreSQL export metadata, encrypted non-authoritative cache, and encrypted project-scoped S3 export prefix. |
+| API | Authoritative control-plane and audit state in its own PostgreSQL boundary, plus encrypted immutable S3 control-registry prefixes for restore-independent retention policies, deletion tombstones, API restore audit intents, and export holds. |
 | Jobs | Scheduling, leases, retries, dead-letter state, execution history, and orchestration state in its own PostgreSQL boundary. |
 | Web | No server-authoritative storage. |
 
@@ -179,6 +181,30 @@ ordered by:
 ```text
 tenant_id, project_id, observed_at, watchtower_id, processing_generation
 ```
+
+The monthly ClickHouse partition is a physical storage choice and is not the
+canonical change partition used for export watermarks. Processor defines one
+logical canonical-change partition for each `(tenant_id, project_id,
+signal_family)` tuple, where `signal_family` is one of
+`error_occurrences`, `metric_points`, `log_records`, or `spans`. Processor is
+the sole authority for a partition's strictly increasing unsigned 64-bit
+`canonical_change_sequence`. It allocates the sequence, the canonical change
+record, and the durable canonical-change outbox entry in one Processor-local
+transaction; a retry reuses the same partition and sequence rather than
+allocating another one. The sequence and the canonical-content digest are
+stored with the canonical replay metadata and published in every versioned
+Processor-to-Query canonical-change message. A committed sequence has no
+unpublished gap: recovery replays the durable outbox or retained replay batch
+before reporting that partition's watermark as available. A conflicting
+payload or digest for an existing `(partition, sequence)` is an integrity
+failure.
+
+Query stores the highest contiguous applied sequence and its digest for each
+logical partition. It rejects a gap or a conflicting equal sequence and
+replays missing sequences through the normal Processor-owned change path.
+Export watermark vectors use these exact partition identities and sequences;
+the vector is complete only when every requested partition is materialized
+through its requested sequence. No sequence is compared across partitions.
 
 Every PostgreSQL multi-tenant table enables row-level security. Tenant-scoped
 rows and queries require an authorized tenant predicate; project-scoped rows
@@ -243,7 +269,13 @@ publishes the existing versioned changes through the normal Processor-to-Query
 path. Query never reads Processor S3, Processor PostgreSQL, or Processor
 ClickHouse directly. Rebuilds are idempotent and cannot republish a deleted
 project. Consumers must understand every message schema version retained in the
-applicable replay horizon.
+applicable replay horizon. Canonical-change messages carry the Processor-owned
+`(tenant_id, project_id, signal_family)` partition identity,
+`canonical_change_sequence`, and canonical-content digest defined in the
+storage topology. Processor publishes committed sequences through its durable
+outbox and retained replay batches; Query applies only contiguous sequences,
+rejects gaps or conflicting equal sequences, and reports a partition watermark
+only after all preceding sequences are applied.
 
 ## Retention, Deletion, and Reprocessing
 
@@ -319,7 +351,16 @@ records and serving excess raw data, Processor durably fences queued,
 pending-handoff, and replayed work whose `accepted_at` falls outside the new
 limit, prevents canonical or derived publication, and recomputes or removes
 derived results with expired contributions, and Query denies excess reads,
-exports, and rebuilds. Processor returns a durable `RawHandoffDispositionV1`
+exports, and rebuilds. Before API commits an activated shortened policy, it
+identifies every non-terminal export whose requested range or selected source
+would cross the new cutoff, advances that export to `canceled` with a new
+`export_revision`, and sends the existing revision-fenced
+`ExportCancellationV1` path with `cancellation_reason=retention_policy`.
+Jobs cancels and fences its execution state, Query installs the matching
+terminal execution fence, and API does not complete policy activation or
+release the held revisions until Jobs and Query acknowledge those fences and
+the normal hold-release command is durably accepted. Processor returns a durable
+`RawHandoffDispositionV1`
 message with a terminal
 `policy_rejected` disposition for each handoff rejected by the shortened policy;
 for an unprocessed handoff that crosses the seven-day class default without a
@@ -331,7 +372,13 @@ current cutoff, enumerates its own eligible acceptance state, durably records a
 `default_expired` fence for each handoff, retires each matching outbox entry,
 and purges the raw object and acceptance metadata without waiting for
 Processor. `RawPayloadFetchV1` and late Processor dispositions reject a handoff
-already fenced by Ingest expiry. Jobs owns a durable recurring
+already fenced by Ingest expiry. When Ingest records that fence, it also emits
+the durable project-scoped `RawHandoffExpiryFenceV1` to Processor. Processor
+persists the highest fence for the handoff and performs an authoritative
+current-cutoff and local-fence check immediately before committing or
+publishing any canonical or derived result. A denied final check records the
+appropriate terminal disposition and cannot publish canonical changes. Jobs
+owns a durable recurring
 baseline lifecycle-purge registration for every applicable project and data
 class, even when the project keeps the default policy. Project creation causes
 API to run the generation-matched `project_create` lifecycle barrier: each
@@ -341,12 +388,12 @@ and API exposes the project only after every owner acknowledges the active
 barrier. A
 shortened policy or project deletion adds a generation-scoped registration; its
 schedule is paused during prepare and enabled only after the activation
-handshake. Jobs owns scheduling and
-retrying each purge dispatch; on every run, the data owner applies the
-current-time effective cutoff and idempotently purges all newly expired data
-within 14 days. For derived aggregates, the baseline schedule recomputes or
-removes expired contributions and publishes the resulting revisioned state so
-Query projections cannot retain dormant expired data. Before any restored or
+handshake. Jobs owns scheduling and retrying each purge dispatch at the
+effective cutoff. At that cutoff, the data owner fences access and removes or
+irreversibly anonymizes active data; retries are recovery mechanics and do not
+create a 14-day grace period. For derived aggregates, the baseline schedule
+recomputes or removes expired contributions and publishes the resulting
+revisioned state so Query projections cannot retain dormant expired data. Before any restored or
 rebuilt Ingest,
 Processor, Query, or Jobs owner becomes ready, it obtains current retention-policy
 and deletion-tombstone registry snapshots from API through the versioned
@@ -374,8 +421,13 @@ them until completion, and rejects late non-purge execution outcomes so they
 cannot recreate project-scoped execution state. Query invalidates cache entries
 immediately. Active stores, including raw, canonical, derived, projections,
 replay batches, export objects, and Jobs project-scoped operational state, are
-purged or irreversibly anonymized within 14 days. Backups are purged within 90
-days of deletion, and deleted project data is not restored from a backup. Before
+purged or irreversibly anonymized within 14 days. Jobs retains only the minimal
+tombstone-keyed deletion orchestration needed to address outstanding owner
+purges: the target owner, registration, retry, and completion state contain no
+customer payload and survive the 14-day active-store deadline until every
+owner confirms completion. Jobs then purges or irreversibly anonymizes that
+orchestration state. Backups are purged within 90 days of deletion, and deleted
+project data is not restored from a backup. Before
 a restored API database accepts traffic, API loads the current registry and
 reapplies every current tombstone to identify, fence, and purge deleted-project
 rows. While deletion is pending, API retains every active and effective
@@ -430,7 +482,12 @@ work. API assigns each export a canonical lowercase UUID v7 `export_id`, stores
 it as PostgreSQL `uuid` in API state, and uses that canonical lowercase UUID v7
 representation at every external boundary. Query produces selected-signal
 canonical and derived snapshots from its own projections into its encrypted
-project-scoped S3 export prefix. At export creation, API sends Processor an
+project-scoped S3 export prefix. Before requesting a hold, API durably records
+an export-hold intent in its restore-independent `API export hold registry`.
+The registry is append-only, keyed by `export_id` and held
+`export_revision`, and records the authorized scope, requested range, selected
+signals, and every hold, cancellation, and release acknowledgement. At export
+creation, API sends Processor an
 authenticated, versioned `ExportSnapshotHoldInstallV1` request containing
 `export_id` and `export_revision`, authorized tenant and project scope,
 `accepted_at` range, selected signals, and whether derived results are selected.
@@ -450,9 +507,10 @@ selected signals, and `export_revision`. Query does not execute an export from
 a direct API dispatch or infer an authoritative watermark from its local
 projection.
 
-When API records cancellation, it sends the revision-fenced
+When API records cancellation, including cancellation caused by an activated
+shortened retention policy, it sends the revision-fenced
 `ExportCancellationV1` command to Jobs with the held and terminal export
-revisions. Jobs durably cancels and fences queued, leased, retry, and in-flight
+revisions and the cancellation reason. Jobs durably cancels and fences queued, leased, retry, and in-flight
 execution state, then sends Query a matching
 `ExportExecutionCancellationV1` terminal fence. Query persists the fence before
 acknowledging it and rejects stale or post-terminal `ExportExecutionV1`
@@ -465,11 +523,15 @@ Before Query may materialize an export, Processor's
 requested inputs and exact watermark vectors. Each hold is keyed by `export_id`
 and `export_revision`, covers every selected canonical partition or derived
 aggregate and the Query projection, and remains until the export reaches a
-terminal state. Query records an immutable `snapshot_generation` only after every
+terminal state. Processor and Query report their held `(export_id,
+export_revision)` inventory through the authenticated versioned
+`ExportHoldInventoryV1` reconciliation interface. Query records
+an immutable `snapshot_generation` only after every
 canonical vector sequence and derived aggregate revision is materialized at the
 requested target. `snapshot_generation` is a Query-created canonical lowercase
 UUID v7 at external and component boundaries and is stored as PostgreSQL `uuid`
-in Query export metadata. If a hold cannot be installed or any vector member can no
+in Query's owned PostgreSQL export-metadata boundary. If a hold cannot be
+installed or any vector member can no
 longer be materialized, Query emits a terminal `failed` outcome and no partial
 artifact; it never silently omits records present at request creation. After
 all requested vectors are complete, Query emits a versioned export outcome
@@ -480,7 +542,12 @@ Query. The release contains both the `held_export_revision` used to key the
 installed hold and the current terminal `export_revision`, so cancellation can
 advance the API revision without losing the old hold key. The release is
 idempotent and revision-fenced, and remains durably retryable until both owners
-confirm it. Query installs or verifies the terminal execution fence before
+confirm it. API appends the terminal release acknowledgements to the
+restore-independent hold registry. After an API database restore, API loads
+that registry before accepting traffic, reconciles the owner hold inventories,
+and retries the matching install, cancellation, or release command for every
+unresolved registry entry. A hold cannot be treated as orphaned merely because
+it is absent from the restored PostgreSQL backup. Query installs or verifies the terminal execution fence before
 releasing its projection hold, so a delayed execution command cannot recreate a
 hold or artifact after the terminal transition. The manifest records the complete
 vectors and Query `snapshot_generation`. Exports never include raw data, caches,
@@ -634,9 +701,15 @@ Immutable audit events are required for break-glass access, exports, deletion,
 restoration attempts, reprocessing, retention changes, and key, replication,
 backup, or restore actions. API remains the contract-level audit writer;
 component logs and Jobs execution history do not replace the audit boundary.
-Project-scoped audit context is erasable encrypted context: deletion destroys
-its project key while preserving the append-only event rows and minimal
-anonymous deletion evidence.
+Before acknowledging an audit event in its PostgreSQL boundary, API durably
+appends the same immutable event, its audit sequence, and its integrity digest
+to the restore-independent encrypted S3 audit journal. The journal is a replay
+boundary, not a second audit writer. After an API PostgreSQL restore, API
+reconciles the restored rows with journal entries after the selected backup,
+replays missing events idempotently, and records the recovery evidence before
+accepting traffic. Project-scoped audit context is erasable encrypted context:
+deletion destroys its project key while preserving the append-only event rows,
+journal replay records, and minimal anonymous deletion evidence.
 
 Threat-model review is required before accepting this contract and before each
 implementation release. Customer-facing retention, deletion, export, and
@@ -696,7 +769,9 @@ The owning implementation contracts must make these scenarios testable:
    `default_expired` disposition for an unprocessed handoff beyond the class
    default, the project-scoped Jobs-to-Ingest `RawRetentionExpiryV1` sweep
    during Processor outage, Ingest enumeration of expired state, rejection of
-   late fetches or dispositions after the Ingest expiry fence, and
+   late fetches or dispositions after the Ingest expiry fence, durable
+   `RawHandoffExpiryFenceV1` delivery, and Processor's final cutoff/fence check
+   before canonical commit and publication, and
    generation-aware reconciliation of each completed handoff to a promoted
    canonical default or durable terminal disposition before raw retirement.
 4. Rebuild eligible canonical and derived Query projections through an
@@ -726,16 +801,19 @@ The owning implementation contracts must make these scenarios testable:
    and retirement of policy-fenced raw handoffs; derived-aggregate recomputation
    without expired contributions; UTC thirteen-calendar-month arithmetic with
    end-of-month clamping; current-time duration enforcement; baseline
-   Jobs schedules for default lifecycles even without a shortened policy; recurring
-   Jobs-scheduled, owner-run active purges of data that expires after policy
-   installation within 14 days;
-   purge or irreversible anonymization of Jobs project-scoped operational state;
+   Jobs schedules for default lifecycles even without a shortened policy;
+   recurring Jobs-scheduled, owner-run active purges at each effective cutoff
+   without a grace period; retention of minimal tombstone-keyed Jobs deletion
+   orchestration until every owner confirms purge completion;
+   purge or irreversible anonymization of Jobs project-scoped operational state
+   after the minimal tombstone-keyed deletion orchestration completes;
    backup purge or irreversible inaccessibility within 90 days of each applicable
    expiry, including the activation-relative deadline for data made newly
    ineligible by a shortened policy; retention of the active project policy
    until tombstone activation and only then its removal; restore-independent
-   retention, tombstone, and API audit-intent registry recovery before any
-   restored or rebuilt owner accepts traffic; export cancellation; cache
+   retention, tombstone, API audit-intent, API audit-journal, and export-hold
+   registry recovery before any restored or rebuilt owner accepts traffic;
+   export cancellation; cache
    invalidation; generation-matched
    `LifecycleMutationAcknowledgementV1` outcomes; durable audit intent before a
    required audited action and correlated outcome evidence after a crash;
@@ -745,8 +823,9 @@ The owning implementation contracts must make these scenarios testable:
    counts, independently recomputable canonical digest tuples, generation-aware
    canonical-content and per-aggregate revision-aware derived reconciliation
    summaries, default-generation selection, API-to-Processor correlated
-   `ExportSnapshotHoldInstallV1` request/response with complete canonical and
-   derived watermark vectors, API-to-Jobs scheduling, Jobs-to-Query
+   `ExportSnapshotHoldInstallV1` request/response with complete canonical
+   partition-sequence and derived watermark vectors, API-to-Jobs scheduling,
+   Jobs-to-Query
    revision-fenced execution with the returned vectors, export snapshot holds
    through terminal completion, safe failure when any held vector member cannot
    be materialized, `ExportSnapshotHoldReleaseV1` delivery after completion,
@@ -757,7 +836,8 @@ The owning implementation contracts must make these scenarios testable:
    `ExportCancellationV1` and `ExportExecutionCancellationV1` terminal fences,
    `ExportExpiryScheduleV1` handoff carrying authoritative `completed_at`, Jobs-scheduled
    `completed_at + 7 days` expiry and the authoritative API `expired` transition,
-   Query-issued URLs no longer than their remaining object lifetime and
+   Query-owned PostgreSQL export metadata, restore reconciliation of Processor
+   and Query hold inventories, Query-issued URLs no longer than their remaining object lifetime and
    seven-day object expiry anchored at `completed_at`, immediate cleanup of
    failed or canceled partial objects, revision-fenced authorization revocation,
    authorization recheck, rate limits, and oversized-request

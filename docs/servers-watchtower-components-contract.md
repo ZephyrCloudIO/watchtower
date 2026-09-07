@@ -62,9 +62,9 @@ They have no public business routes.
 | Component | Authoritative state, owned projection, or cache |
 | --- | --- |
 | Ingest | Raw accepted records, recoverable processing handoff/outbox, and local projections of API-published security or control changes. |
-| API | Control-plane state, artifact authority, versioned change events describing those authoritative changes, and the append-only contract-level audit event boundary. |
+| API | Control-plane state, artifact authority, versioned change events describing those authoritative changes, the append-only contract-level audit event boundary, and restore-independent audit journal and export-hold registry state. |
 | Processor | Canonical telemetry, processing state, and derived domain aggregates. |
-| Query | Query-owned read projections, search and analytical indexes, caches, and provider query orchestration state. |
+| Query | Query-owned read projections, search and analytical indexes, PostgreSQL export metadata including `snapshot_generation`, caches, and provider query orchestration state. |
 | Jobs | Durable scheduling requests, leases, retry state, dead-letter state, and execution history. |
 | Web | Released static assets and bounded client-local UI state only; it has no server-authoritative data. |
 
@@ -97,16 +97,18 @@ The allowed protocol and data-flow direction is:
    messages or Jobs' `RawRetentionExpiryV1` commands before retiring the
    corresponding raw state. Processor retrieves referenced raw bytes only
    through Ingest's authenticated `RawPayloadFetchV1` interface, and Ingest's
-   durable expiry fence rejects late fetches or dispositions.
+   durable expiry fence rejects late fetches or dispositions. Ingest also
+   publishes the durable `RawHandoffExpiryFenceV1` to Processor when it
+   records an expiry fence.
 3. API accepts control-plane, release, artifact, and Sentry management
    commands. It publishes versioned change events. API may call Query's
    authenticated internal interfaces for Sentry management reads and authorized
    export download-gateway issuance and `AuthorizationRevocationFenceV1` for
    immediate export-download revocation, and Processor's authenticated
    `ExportSnapshotHoldInstallV1` interface at export creation. For a canceled
-   export, API also sends the revision-fenced `ExportCancellationV1` handoff to
-   Jobs before releasing the snapshot hold, but never reads another component's
-   persistence directly.
+   export, including one invalidated by retention activation, API also sends the
+   revision-fenced `ExportCancellationV1` handoff to Jobs before releasing the
+   snapshot hold, but never reads another component's persistence directly.
 4. Processor consumes Ingest handoff work and relevant API changes. It
    publishes canonical and derived changes, installs the export-scoped hold and
    returns the authoritative export watermark vector for API's versioned
@@ -114,9 +116,14 @@ The allowed protocol and data-flow direction is:
    `ProjectionRebuildV1` requests, and publishes a terminal
    `RawHandoffDispositionV1` to Ingest for every completed,
    shortened-policy-rejected, or default-expired raw handoff when it remains
-   authoritative. It suppresses late processing for an Ingest expiry fence.
+   authoritative. It suppresses late processing for an Ingest expiry fence,
+   persists the highest `RawHandoffExpiryFenceV1` for each handoff, and performs
+   the authoritative cutoff and local-fence check immediately before canonical
+   commit and publication. Canonical changes use the Processor-owned
+   `(tenant_id, project_id, signal_family)` partition and monotonic sequence
+   defined by the canonical storage contract.
 5. Query consumes API changes and Processor changes into its own projections,
-   indexes, and caches. It consumes Jobs-dispatched revision-fenced
+   indexes, PostgreSQL export metadata, and caches. It consumes Jobs-dispatched revision-fenced
    `ExportExecutionV1` commands carrying API-persisted Processor watermark
    vectors and Jobs-dispatched `ExportExecutionCancellationV1` terminal fences,
    publishes versioned export outcomes for API to record customer-visible
@@ -129,7 +136,9 @@ The allowed protocol and data-flow direction is:
    an idempotent `ExportCancellationV1` from API durably records the terminal
    export revision, cancels queued, leased, retry, and in-flight work, and
    dispatches `ExportExecutionCancellationV1` to Query before acknowledging the
-   cancellation to API. During the API `project_create` barrier, each
+   cancellation to API. During retention activation, Jobs keeps the mutation
+   pending until affected export cancellation fences and hold-release
+   acknowledgements complete. During the API `project_create` barrier, each
    applicable data owner sends an idempotent baseline
    `LifecyclePurgeRegistrationV1` request for the default-policy generation,
    so Jobs has a versioned registration for every baseline schedule before API
@@ -154,7 +163,10 @@ The allowed protocol and data-flow direction is:
    versioned durable audit-evidence message. API validates the producer,
    context, correlation, and idempotency data and is the only component that
    appends the contract-level audit event; components do not write API audit
-   storage directly. A restore or replacement of a component's own database
+   storage directly. API appends each acknowledged audit event to its
+   restore-independent immutable S3 audit journal before acknowledging the
+   PostgreSQL audit commit. After an API PostgreSQL restore, API replays journal
+   entries missing from the restored boundary before accepting traffic. A restore or replacement of a component's own database
    requires a durable audit intent before the target store is replaced. For an
    API PostgreSQL restore or replacement, the intent is written first to the
    restore-independent API audit-intent prefix and survives any API database
@@ -250,7 +262,7 @@ hold or any requested vector member cannot be materialized.
 When API records a canceled export, it sends an idempotent, revision-fenced
 `ExportCancellationV1` command to Jobs containing `export_id`, the held export
 revision, the terminal export revision, terminal outcome, authorized scope,
-correlation, and idempotency context. Jobs durably records the terminal fence,
+cancellation reason, correlation, and idempotency context. Jobs durably records the terminal fence,
 cancels queued, leased, retry, and in-flight execution state, and sends Query a
 revision-fenced `ExportExecutionCancellationV1` command containing the same
 export and terminal revision. Query durably records the terminal execution
@@ -272,6 +284,16 @@ cancellation or owner failure cannot strand an inferred hold indefinitely.
 Query installs the terminal execution fence before releasing its projection
 hold, so a delayed execution command cannot recreate a hold or artifact after
 the terminal transition.
+
+API records an export-hold intent before installing a Processor or Query hold
+in its restore-independent encrypted S3 export-hold registry. Processor and
+Query provide an authenticated versioned `ExportHoldInventoryV1` reconciliation
+response containing each held `export_id`, held revision, and registry digest;
+they do not expose their storage. API loads its registry before accepting
+traffic after an API database restore, reconciles both inventories, and retries
+the matching hold install, cancellation, or release command for every
+unresolved entry. A hold is not orphaned merely because it is absent from the
+restored API PostgreSQL backup.
 
 When API records a successful `completed` transition, it sends Jobs an
 idempotent versioned `ExportExpiryScheduleV1` request containing `export_id`,
@@ -316,6 +338,15 @@ raw object, acceptance metadata, and outbox entry without waiting for
 Processor. A later `RawPayloadFetchV1` request or `RawHandoffDispositionV1`
 delivery for a fenced handoff is rejected as stale and cannot publish or revive
 canonical work.
+
+When Ingest records a class-default or shortened-policy expiry fence, it also
+publishes a versioned durable `RawHandoffExpiryFenceV1` message to Processor.
+The message carries the scoped `watchtower_id`, accepted-at cutoff, policy or
+class-default basis, fence generation, correlation identifier, and idempotency
+key. Processor persists the highest fence and must perform a final authoritative
+cutoff and local-fence check immediately before canonical or derived commit and
+publication; a denied check records the matching terminal disposition without
+publishing canonical changes.
 
 The raw-handoff completion path is a versioned durable `RawHandoffDispositionV1`
 message from Processor to Ingest using the common asynchronous envelope. Its
@@ -434,7 +465,12 @@ object store. Its only permitted use is the matching owner-mediated interface.
 Credentials and unrestricted customer payloads are prohibited. Delivery is at
 least once and consumers are idempotent. There is no global ordering guarantee
 unless a downstream domain PRD explicitly declares ordering for an aggregate
-partition.
+partition. The canonical telemetry contract additionally defines ordering for
+each Processor-owned `(tenant_id, project_id, signal_family)` canonical-change
+partition: its unsigned 64-bit `canonical_change_sequence` is allocated by
+Processor, persisted with the durable outbox and replay metadata, published in
+the canonical change, and applied contiguously by Query. Partition sequences
+are never compared as one global order.
 
 Before a component begins a break-glass or other audited side effect, it
 durably commits an `AuditIntentV1` record in its own transactional outbox. The
@@ -454,8 +490,12 @@ the evidence or records an explicit unknown outcome before considering the
 action complete.
 Neither intent nor evidence contains raw payloads or secrets. A component may
 retain and retry its local outbox while API is unavailable; API remains the sole
-audit writer and correlates the intent with its immutable audit event. Component
-logs and Jobs execution history are not audit records.
+audit writer and correlates the intent with its immutable audit event. API also
+records each audit event in the restore-independent immutable audit journal
+before acknowledging the PostgreSQL audit commit. After restoring API
+PostgreSQL, API replays journal entries missing from the restored audit
+boundary before accepting traffic. Component logs and Jobs execution history
+are not audit records.
 
 ## Security and Configuration
 
