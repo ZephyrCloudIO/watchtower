@@ -693,12 +693,16 @@ parameters, entry count, page count, and final digest; it never inlines one
 entry or an unbounded page-digest list for every aggregate. Its pages contain
 the requested fully qualified aggregate keys and their `authoritative_revision`
 values, including explicit empty revision entries, in a deterministic order.
-During the export hold, Processor freezes each captured derived aggregate's
+During the export hold, Processor records each captured derived aggregate's
 state, selected source set, and `authoritative_revision`, including explicit
-empty revision entries, until the matching hold release. Contributions or
-retention recomputations for those aggregates are queued and cannot publish a
-higher revision during the hold, so every descriptor page remains materializable
-at its captured revision. Entries from different partitions, records, or
+empty revision entries, in immutable export-specific/MVCC snapshot state keyed
+by `export_id` and `export_revision`. The live aggregate remains authoritative
+and continues to accept contributions and retention recomputations: expired
+contributions are removed, and higher revisions may publish to Query during the
+hold. Export materialization reads the captured snapshot state, so live
+revisions cannot change its descriptor pages; this snapshot does not extend the
+earliest effective source-retention cutoff or bypass the existing source-expiry
+cancellation and release path. Entries from different partitions, records, or
 aggregates are never compared as one global order, and missing or conflicting
 descriptor or page coverage is invalid. API persists the canonical
 partition-sequence vector, the selection
@@ -1196,7 +1200,9 @@ The owning implementation contracts must make these scenarios testable:
    `ExportSnapshotHoldInstallV1` request/response with the canonical
    partition-sequence vector plus bounded derived-revision and immutable
    selection-snapshot descriptors, paginated derived-revision and selection
-   pages with per-page and final digests, promotion fencing for held selections,
+   pages with per-page and final digests, live derived-aggregate retention
+   recomputation and publication while an export hold retains an immutable
+   captured revision, promotion fencing for held selections,
    API-to-Jobs scheduling,
    the durable completion/expiry intent and complete recovery copy before
    `ExportCompletionV1`, `completed_at` reuse from that intent through API and
