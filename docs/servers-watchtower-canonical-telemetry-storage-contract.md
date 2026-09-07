@@ -256,7 +256,11 @@ the published-contiguous watermark `N` for an explicit empty partition. It
 also carries the first retained sequence for a non-empty window or an
 explicit empty-partition value, a fixed per-partition `target_sequence` equal
 to the available watermark captured when Processor durably accepts the rebuild
-request, and an integrity digest over those values. The empty-partition value
+request, and an integrity digest over those values. When derived data is
+selected, Processor also captures a monotonically ordered durable
+`derived_change_sequence` target for the selected scope and retains every
+later derived change, including newly created aggregates, in a rebuild-scoped
+durable buffer or replay stream. The empty-partition value
 is used when all changes through `N` have expired, so the marker carries
 `baseline_sequence = N` rather than an unavailable predecessor. Reserved,
 staged, or otherwise unpublished sequences are excluded from both `N` and the
@@ -277,10 +281,14 @@ unchanged. An unexpired row omitted by a narrower request is not a valid skip.
 Query verifies complete contiguous coverage, advances its checkpoint over
 changes and retention-excluded skip ranges, and writes every eligible row in
 the covered window; missing, stale, conflicting, or unauthorized coverage
-fails the rebuild safely. Query marks the rebuild complete only after it has
-verified contiguous coverage through the authenticated `target_sequence` for
-every requested partition; sequences published after that fixed target remain
-on the normal live-change path. An empty retained window records the
+fails the rebuild safely. Processor seals the derived buffer with an
+authenticated `ProjectionRebuildDerivedCutoverV1` marker carrying a later
+`derived_cutover_sequence` and the descriptor/fence digest. Query marks the
+rebuild complete only after it has verified contiguous coverage through the
+authenticated `target_sequence` for every requested partition, applied every
+buffered derived change through that cutover, and atomically recorded the
+derived cursor and cutover fence; sequences published after that fixed target
+remain on the normal live-change path. An empty retained window records the
 published-contiguous watermark `N` as its baseline, allowing Query to accept
 the next live sequence without resetting the partition. A missing, conflicting,
 or stale marker fails the rebuild safely; it cannot reset a live partition or
@@ -532,7 +540,12 @@ retention-policy, deletion-tombstone, and applicable authorization-revocation
 registry snapshots from API through the versioned
 `ControlRegistrySnapshotV1` handoff defined in the component contract, persists
 the complete paginated snapshot before readiness, completes the final generation
-cutover check defined in the component contract, and enforces them. Each data
+cutover check defined in the component contract, and enforces them. The
+active-project baseline inventory, including projects with the default policy,
+is sourced from API's restore-independent lifecycle registry rather than
+reconstructed from a restorable API PostgreSQL backup; API persists each
+project-creation generation before exposing the project and retains it until no
+restorable API or Jobs backup can predate it. Each data
 owner reapplies its effective cutoff and fences excess data; Jobs restores the
 associated baseline, policy,
 and deletion scheduling and fences. Before a restored or rebuilt Processor,
@@ -586,8 +599,12 @@ cold archive.
 
 Project deletion is project-wide and uses the same prepare/activate barrier. API
 records a versioned deletion generation and keyed project tombstone in a pending
-state in its append-only restore-independent registry. Each owner installs a
-pending project fence before returning `phase=prepared`: Ingest rejects new
+state in its append-only restore-independent registry. API is an explicit fifth
+lifecycle participant: it records a pending local fence and
+`LifecyclePurgeRegistrationV1` for its project control-plane rows, export-hold
+registry entries, and erasable audit context. Each data owner and API's local
+participant installs a pending project fence before returning `phase=prepared`:
+Ingest rejects new
 collection and pending raw handoffs, Processor rejects new pending or replayed
 work and republishing, Query rejects new reads, restoration, exports, and
 projection rebuilds, and Jobs fences new non-purge work. A pending deletion
@@ -596,21 +613,23 @@ prepare; previously active baseline and retention-policy schedules continue to
 enforce their own effective cutoffs. While the tombstone remains non-active,
 each owner and Jobs activates its prepared purge registration and returns a
 generation-matched `phase=active` acknowledgement. API commits the active
-tombstone only after every required active acknowledgement; only then does Jobs
-enable the versioned project-purge schedule and dispatch it. API fails closed
+tombstone only after every required active acknowledgement, including API's
+local participant; only then does Jobs enable the versioned project-purge
+schedule and dispatch it to every owner, including API. API fails closed
 until the complete active barrier exists. Jobs cancels and fences queued, retry,
 dead-letter, dispatchable, leased, and in-flight non-purge project work,
 dispatches idempotent owner-specific purge or anonymization commands, retries
 them until completion, and rejects late non-purge execution outcomes so they
 cannot recreate project-scoped execution state. Query invalidates cache entries
-immediately. Active stores, including raw, canonical, derived, projections,
+immediately. Active stores, including API's project-scoped control-plane rows,
+export-hold registry entries, and raw, canonical, derived, projections,
 replay batches, export objects, and Jobs project-scoped operational state, are
 purged or irreversibly anonymized within 14 days. Jobs retains only the minimal
 tombstone-keyed deletion orchestration needed to address outstanding owner
 purges: the target owner, registration, retry, and completion state contain no
 customer payload and survive the 14-day active-store deadline until every
-owner confirms completion. Jobs then purges or irreversibly anonymizes that
-orchestration state. Backups are purged within 90 days of deletion, and deleted
+owner, including API, confirms completion. Jobs then purges or irreversibly
+anonymizes that orchestration state. Backups are purged within 90 days of deletion, and deleted
 project data is not restored from a backup. Before
 a restored API database accepts traffic, API loads the current registry and
 reapplies every current tombstone to identify, fence, and purge deleted-project
@@ -726,7 +745,15 @@ entries, or derived contributions. API records a present source-expiry deadline
 in the hold registry and uses the versioned `ExportExpiryScheduleV1` handoff
 with `expiry_basis=source_retention`; it omits that source-retention schedule
 when the value is absent. The ordinary completed-object expiry schedule remains
-required for every successful export. Jobs schedules an idempotent
+required for every successful export. Jobs includes a present source deadline
+and `expiry_basis=source_retention` in the Jobs-to-Query `ExportExecutionV1`
+command and durably stores it with the Query projection hold. Jobs also
+schedules an idempotent `ExportExecutionSourceExpiryFenceV1` delivery to
+Query at that deadline. Query applies the persisted deadline independently
+of API availability, fences local execution and its projection hold, removes
+or invalidates partial artifacts, and rejects delayed execution commands,
+outcomes, and downloads; it does not change API lifecycle state or release
+Processor's authoritative hold. Jobs also schedules an idempotent
 `ExportExpiryV1` delivery for a present source deadline. For a non-terminal
 export, API treats that delivery as source-retention expiry, appends a
 cancellation intent, advances the export revision, and follows the existing
@@ -1118,7 +1145,10 @@ The owning implementation contracts must make these scenarios testable:
    captures an authenticated fixed available `target_sequence` for every
    requested partition and an immutable bounded derived key/revision target
    descriptor of every eligible aggregate key and `authoritative_revision` at
-   acceptance when derived data is selected, and accepts a first
+   acceptance when derived data is selected, retains post-target derived
+   changes including a newly created aggregate in a durable rebuild buffer, and
+   emits and validates an authenticated
+   `ProjectionRebuildDerivedCutoverV1` through a later derived cursor, and accepts a first
    sequence greater than one without
    a false gap; emits and validates
    contiguous authenticated `ProjectionRebuildSkipV1` coverage only for
@@ -1136,7 +1166,12 @@ The owning implementation contracts must make these scenarios testable:
 5. Create a project through the generation-matched `project_create`
    `LifecycleMutationV1` barrier and verify it remains unavailable until every
    applicable owner has an active baseline Jobs registration and matching
-   acknowledgement. Shorten retention and delete a project; verify each owner
+   acknowledgement. Verify the active-project generation inventory is persisted
+   outside API PostgreSQL before a default-policy project is exposed and lets
+   Jobs recreate its baseline registration after stale API and Jobs restores.
+   Shorten retention and delete a project; verify API participates as a fifth
+   purge owner for its control-plane rows, export-hold registry entries, and
+   erasable audit context, with completion gated on its acknowledgement. Verify each owner
    receives the complete proposed policy and uses the versioned
    `LifecyclePurgeRegistrationV1` handoff and cannot return a prepare
    acknowledgement until its matching paused Jobs registration is durable,
@@ -1226,9 +1261,10 @@ The owning implementation contracts must make these scenarios testable:
    authoritative `completed_at` for completed artifacts, the
    restore-independent completion/expiry intent, replay of an unresolved
    completion handoff before expiry scheduling after API restore, source-expiry
-   cancellation at
-   the earliest held-source cutoff, rejection of completion outcomes at or
-   after that persisted source deadline regardless of delivery order, rejection
+   cancellation at the earliest held-source cutoff, rejection of completion
+   outcomes at or after that persisted source deadline regardless of delivery
+   order, owner-side Query fencing and partial-artifact cleanup through a
+   durable Jobs-to-Query source-expiry fence during an API outage, rejection
    and cleanup when the export-object deadline has passed, and successful
    completion of an empty export without a source-retention check,
    Jobs-scheduled artifact expiry at the
