@@ -100,12 +100,13 @@ canonical telemetry.
 | Canonical telemetry | Processor; authoritative for the four signal histories | Four independent ClickHouse canonical table families | Immutable history for 90 days from `accepted_at` |
 | Canonical replay representations | Processor; non-authoritative, immutable replay copies of canonical changes | Processor-owned encrypted project-scoped S3 replay-batch prefix with separate class metadata | 90 days from each represented record's `accepted_at`; purged with its project |
 | Default-generation selections | Processor; authoritative mapping of each `watchtower_id` to its promoted `processing_generation` | Processor-owned PostgreSQL selection state with `processing_generation` stored as `uuid`, plus monotonically revisioned selection changes in Processor canonical replay batches | Retained while its canonical record is eligible; rebuilt from retained selection changes and validated against canonical history before Processor republishes it to Query after recovery |
-| Derived aggregates | Processor; authoritative for mutable derived results | Processor-owned PostgreSQL schemas and encrypted project-scoped derived replay batches | Retention-windowed to thirteen months from `accepted_at` by default or the shortened project policy; expired contributions are removed before they can remain represented in the aggregate, replay batches, or Query projections |
+| Derived aggregates | Processor; authoritative for mutable derived results | Processor-owned PostgreSQL schemas and encrypted project-scoped derived replay batches | Retention-windowed to thirteen UTC calendar months after `accepted_at` by default or the shortened project policy; expired contributions are removed before they can remain represented in the aggregate, replay batches, or Query projections |
 | Compatibility-only representations | The sole owning adapter for each protocol interface; authoritative only for that boundary | Request-scoped memory or an adapter-owned boundary defined by #16 or its signal contract | No canonical retention; never a shared persistence model |
 | Query projections | Query; authoritative only for read projection state | Query-owned ClickHouse databases or schemas | Rebuildable canonical-signal projections are retained for 90 days; derived-aggregate projections use their authoritative aggregate's lifecycle and retention window; all are purged with the project |
 | Query cache | Query; never authoritative | Encrypted Query-owned cache | At most 15 minutes; immediately invalidated for retention, deletion, or authorization changes |
 | Export objects | Query; non-authoritative customer-download artifacts | Encrypted Query-owned project-scoped S3 export prefix | Seven days from API `completed_at` for successful artifacts; artifacts from any attempt that terminates without successful `completed`, including failed or canceled attempts, are removed or made inaccessible at terminal transition, and retention-fenced or deleted-project exports are removed or made inaccessible immediately |
 | Audit events | API for contract-level lifecycle and access audit authority | API-owned append-only PostgreSQL audit boundary with erasable encrypted project-scoped context | Detailed history follows #15; deleted projects retain only minimal anonymous evidence |
+| API restore audit intents | API; authoritative for pre-restore intent evidence until API records the outcome in its audit boundary | API-owned encrypted immutable S3 audit-intent prefix independent of API PostgreSQL backups | Retained through restore completion and evidence recording, then follows the applicable audit-retention policy; never stored only in the API restore target |
 | Retention policy registry | API; authoritative for shortened-retention duration policies, their current-time effective cutoffs, and restore cleanup | API-owned encrypted immutable S3 control-registry prefix, independent of API PostgreSQL backups | The active policy persists until superseded and its effective cutoff is computed from that duration at enforcement time; superseded versioned policy records are retained for 13 months and the active policy is loaded before restored owners accept traffic |
 | Deletion tombstone registry | API; authoritative for deletion fencing and restore cleanup | API-owned encrypted immutable S3 control-registry prefix, independent of API PostgreSQL backups | Non-customer-readable keyed tombstones retained for 13 months; loaded before restored owners accept traffic |
 | Processing and operational state | The component performing the operation | Its own PostgreSQL database or explicitly owned state boundary | Owned and retained by that component; no cross-component writer |
@@ -147,7 +148,7 @@ access to another component's storage are prohibited.
 | Ingest | Encrypted immutable raw S3 objects, PostgreSQL acceptance metadata, and the transactional processing outbox. |
 | Processor | The four immutable canonical ClickHouse histories, encrypted project-scoped non-authoritative replay batches, PostgreSQL processing state, and mutable derived aggregates. |
 | Query | Independently owned ClickHouse read projections, encrypted non-authoritative cache, and encrypted project-scoped S3 export prefix. |
-| API | Authoritative control-plane and audit state in its own PostgreSQL boundary, plus encrypted immutable S3 control-registry prefixes for restore-independent retention policies and deletion tombstones. |
+| API | Authoritative control-plane and audit state in its own PostgreSQL boundary, plus encrypted immutable S3 control-registry prefixes for restore-independent retention policies, deletion tombstones, and API restore audit intents. |
 | Jobs | Scheduling, leases, retries, dead-letter state, execution history, and orchestration state in its own PostgreSQL boundary. |
 | Web | No server-authoritative storage. |
 
@@ -249,22 +250,35 @@ applicable replay horizon.
 Retention is calculated from `accepted_at`, except that derived aggregates and
 their replay batches and Query projections use the retention-windowed lifecycle
 defined above, and export objects use the `completed_at` lifecycle anchor defined
-in the Export Contract. For each data class, the effective cutoff is the earlier
-of that class's default lifecycle cutoff and the cutoff computed from the active
-project policy using the class's lifecycle anchor. A project policy can only
-shorten a class's default lifetime and never extend it. Backup copies of project
-data may outlive active-store
-expiry only as a bounded recovery exception: each expired record or state item
-must be purged from backups or made irreversibly inaccessible within 90 days of
-its effective expiry. This deadline covers raw, replay, canonical, derived,
-projection, and export data; the restore-independent retention-policy and
-deletion-tombstone registries follow their stated 13-month lifecycle. Restores
+in the Export Contract. A thirteen-month lifecycle is computed in UTC calendar
+arithmetic: add thirteen to the UTC year/month, preserve the UTC day, clock
+time, and nanoseconds when valid, and clamp an otherwise invalid day to the
+last day of the target month. It is not a fixed day count. Processor, Query,
+Jobs, API restore cleanup, and every other owner use this same function; an
+item expires when the current UTC instant is at or after its computed cutoff.
+For each data class, the effective cutoff is the earlier of that class's
+default lifecycle cutoff and the cutoff computed from the active project policy
+using the class's lifecycle anchor. A project policy can only shorten a class's
+default lifetime and never extend it. Backup copies of project data may outlive
+active-store expiry only as a bounded recovery exception: each expired record
+or state item must be purged from backups or made irreversibly inaccessible
+within 90 days of its effective expiry. If a newly activated policy makes an
+item already past its effective expiry newly ineligible, its backup deadline is
+instead `max(effective_expiry, policy_activation_at) + 90 days`, using the
+activation timestamp stored with that policy generation. This deadline covers
+raw, replay, canonical, derived, projection, and export data; the
+restore-independent retention-policy and deletion-tombstone registries follow
+their stated 13-month lifecycle. Restores
 must not reintroduce expired or deleted data and must reapply current registry
 fences before readiness. Authorized project administrators may shorten a project
 retention policy but may not extend it through this contract. API assigns every
 project policy a strictly monotonic generation and records each requested
 versioned shortened-duration policy in a pending state in its restore-independent
-retention-policy registry. Lifecycle mutations use a prepare/activate barrier.
+retention-policy registry, including its policy activation timestamp after
+activation. Lifecycle mutations use a prepare/activate barrier, and
+`LifecycleMutationV1` carries the complete immutable proposed policy, its
+per-class proposed cutoffs, and a policy digest so every owner can install the
+same pending fence without resolving an unavailable registry record.
 During prepare, Ingest, Processor, Query, and Jobs durably retain the highest
 prepared generation, ignore lower-generation deliveries, and install only
 non-destructive pending fences. A pending fence may reject new admission, read,
@@ -312,16 +326,19 @@ for an unprocessed handoff that crosses the seven-day class default without a
 shortened policy, it returns `default_expired` with
 `expiry_basis=class_default` and no retention-policy generation. If that cutoff
 arrives while Processor is unavailable, Jobs sends the versioned
-`RawRetentionExpiryV1` command to Ingest. Ingest verifies the current cutoff,
-durably records the same `default_expired` fence, retires the matching outbox
-entry, and purges the raw object and acceptance metadata without waiting for
+`RawRetentionExpiryV1` project-scoped sweep to Ingest. Ingest verifies the
+current cutoff, enumerates its own eligible acceptance state, durably records a
+`default_expired` fence for each handoff, retires each matching outbox entry,
+and purges the raw object and acceptance metadata without waiting for
 Processor. `RawPayloadFetchV1` and late Processor dispositions reject a handoff
 already fenced by Ingest expiry. Jobs owns a durable recurring
 baseline lifecycle-purge registration for every applicable project and data
 class, even when the project keeps the default policy. Project creation causes
-each applicable data owner to submit an idempotent baseline
-`LifecyclePurgeRegistrationV1` with the active default-policy generation; Jobs
-returns and persists an active registration before acknowledging that owner. A
+API to run the generation-matched `project_create` lifecycle barrier: each
+applicable data owner submits an idempotent baseline
+`LifecyclePurgeRegistrationV1`, Jobs returns and persists an active registration,
+and API exposes the project only after every owner acknowledges the active
+barrier. A
 shortened policy or project deletion adds a generation-scoped registration; its
 schedule is paused during prepare and enabled only after the activation
 handshake. Jobs owns scheduling and
@@ -433,6 +450,15 @@ selected signals, and `export_revision`. Query does not execute an export from
 a direct API dispatch or infer an authoritative watermark from its local
 projection.
 
+When API records cancellation, it sends the revision-fenced
+`ExportCancellationV1` command to Jobs with the held and terminal export
+revisions. Jobs durably cancels and fences queued, leased, retry, and in-flight
+execution state, then sends Query a matching
+`ExportExecutionCancellationV1` terminal fence. Query persists the fence before
+acknowledging it and rejects stale or post-terminal `ExportExecutionV1`
+commands. API does not release the held revision until Jobs and Query confirm
+the cancellation fence.
+
 Before Query may materialize an export, Processor's
 `ExportSnapshotHoldInstallV1` response and the Jobs-to-Query
 `ExportExecutionV1` command durably establish export-scoped holds for the
@@ -454,7 +480,9 @@ Query. The release contains both the `held_export_revision` used to key the
 installed hold and the current terminal `export_revision`, so cancellation can
 advance the API revision without losing the old hold key. The release is
 idempotent and revision-fenced, and remains durably retryable until both owners
-confirm it. The manifest records the complete
+confirm it. Query installs or verifies the terminal execution fence before
+releasing its projection hold, so a delayed execution command cannot recreate a
+hold or artifact after the terminal transition. The manifest records the complete
 vectors and Query `snapshot_generation`. Exports never include raw data, caches,
 or audit records.
 
@@ -666,11 +694,11 @@ The owning implementation contracts must make these scenarios testable:
    enforcement without allowing a project duration to extend a shorter class
    default, redelivery of unprocessed work after the MSK window expires, the
    `default_expired` disposition for an unprocessed handoff beyond the class
-   default, the Jobs-to-Ingest `RawRetentionExpiryV1` path during Processor
-   outage, rejection of late fetches or dispositions after the Ingest expiry
-   fence, and generation-aware reconciliation of each completed handoff to a
-   promoted canonical default or durable terminal disposition before raw
-   retirement.
+   default, the project-scoped Jobs-to-Ingest `RawRetentionExpiryV1` sweep
+   during Processor outage, Ingest enumeration of expired state, rejection of
+   late fetches or dispositions after the Ingest expiry fence, and
+   generation-aware reconciliation of each completed handoff to a promoted
+   canonical default or durable terminal disposition before raw retirement.
 4. Rebuild eligible canonical and derived Query projections through an
    authorized, durably acknowledged Query-to-Processor `ProjectionRebuildV1`
    request and Processor republishing without direct Processor storage access;
@@ -679,8 +707,12 @@ The owning implementation contracts must make these scenarios testable:
    canonical replay copies remain non-authoritative, have retention-homogeneous
    expiry, reconcile to their represented canonical versions, and reject a
    changed non-key canonical field when its identity pair is unchanged.
-5. Shorten retention and delete a project; verify each owner uses the
-   versioned `LifecyclePurgeRegistrationV1` handoff and cannot return a prepare
+5. Create a project through the generation-matched `project_create`
+   `LifecycleMutationV1` barrier and verify it remains unavailable until every
+   applicable owner has an active baseline Jobs registration and matching
+   acknowledgement. Shorten retention and delete a project; verify each owner
+   receives the complete proposed policy and uses the versioned
+   `LifecyclePurgeRegistrationV1` handoff and cannot return a prepare
    acknowledgement until its matching paused Jobs registration is durable,
    require each owner to activate that registration with Jobs before returning
    `phase=active`, install only non-destructive pending fences, activation
@@ -692,16 +724,19 @@ The owning implementation contracts must make these scenarios testable:
    pending, handoff, replayed, queued, retry, dead-letter, dispatchable, leased,
    and in-flight work; rejection of late execution outcomes; terminal disposition
    and retirement of policy-fenced raw handoffs; derived-aggregate recomputation
-   without expired contributions; current-time duration enforcement; baseline
+   without expired contributions; UTC thirteen-calendar-month arithmetic with
+   end-of-month clamping; current-time duration enforcement; baseline
    Jobs schedules for default lifecycles even without a shortened policy; recurring
    Jobs-scheduled, owner-run active purges of data that expires after policy
    installation within 14 days;
    purge or irreversible anonymization of Jobs project-scoped operational state;
    backup purge or irreversible inaccessibility within 90 days of each applicable
-   expiry, including deleted-project data; retention of the active project policy
-   until tombstone activation and only then its removal; restore-independent retention and
-   tombstone-registry recovery before any restored or rebuilt owner accepts
-   traffic; export cancellation; cache invalidation; generation-matched
+   expiry, including the activation-relative deadline for data made newly
+   ineligible by a shortened policy; retention of the active project policy
+   until tombstone activation and only then its removal; restore-independent
+   retention, tombstone, and API audit-intent registry recovery before any
+   restored or rebuilt owner accepts traffic; export cancellation; cache
+   invalidation; generation-matched
    `LifecycleMutationAcknowledgementV1` outcomes; durable audit intent before a
    required audited action and correlated outcome evidence after a crash;
    append-only audit rows with irreversibly destroyed project context; and
@@ -719,6 +754,7 @@ The owning implementation contracts must make these scenarios testable:
    API-only lifecycle persistence, rejection of stale outcomes after
    cancellation or another terminal transition, release of the originally held
    revision when cancellation advances the export revision, the API-to-Jobs
+   `ExportCancellationV1` and `ExportExecutionCancellationV1` terminal fences,
    `ExportExpiryScheduleV1` handoff carrying authoritative `completed_at`, Jobs-scheduled
    `completed_at + 7 days` expiry and the authoritative API `expired` transition,
    Query-issued URLs no longer than their remaining object lifetime and

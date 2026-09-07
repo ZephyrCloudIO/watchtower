@@ -103,8 +103,10 @@ The allowed protocol and data-flow direction is:
    authenticated internal interfaces for Sentry management reads and authorized
    export download-gateway issuance and `AuthorizationRevocationFenceV1` for
    immediate export-download revocation, and Processor's authenticated
-   `ExportSnapshotHoldInstallV1` interface at export creation, but never reads
-   another component's persistence directly.
+   `ExportSnapshotHoldInstallV1` interface at export creation. For a canceled
+   export, API also sends the revision-fenced `ExportCancellationV1` handoff to
+   Jobs before releasing the snapshot hold, but never reads another component's
+   persistence directly.
 4. Processor consumes Ingest handoff work and relevant API changes. It
    publishes canonical and derived changes, installs the export-scoped hold and
    returns the authoritative export watermark vector for API's versioned
@@ -116,16 +118,22 @@ The allowed protocol and data-flow direction is:
 5. Query consumes API changes and Processor changes into its own projections,
    indexes, and caches. It consumes Jobs-dispatched revision-fenced
    `ExportExecutionV1` commands carrying API-persisted Processor watermark
-   vectors,
+   vectors and Jobs-dispatched `ExportExecutionCancellationV1` terminal fences,
    publishes versioned export outcomes for API to record customer-visible
    lifecycle transitions, submits authorized `ProjectionRebuildV1` requests to
    Processor, and does not call another component for persistence fallback.
 6. Jobs receives durable requests, owns scheduling and retry state, and
    dispatches versioned commands to the component owning the affected data.
    Jobs owns baseline lifecycle-purge schedules even when no shortened policy is
-   active. On project creation, each applicable data owner sends an idempotent
-   active `LifecyclePurgeRegistrationV1` request for the default-policy
-   generation, so Jobs has a versioned registration for every baseline schedule.
+   active. It also owns export cancellation, lease fencing, and retry fencing:
+   an idempotent `ExportCancellationV1` from API durably records the terminal
+   export revision, cancels queued, leased, retry, and in-flight work, and
+   dispatches `ExportExecutionCancellationV1` to Query before acknowledging the
+   cancellation to API. During the API `project_create` barrier, each
+   applicable data owner sends an idempotent baseline
+   `LifecyclePurgeRegistrationV1` request for the default-policy generation,
+   so Jobs has a versioned registration for every baseline schedule before API
+   exposes the project.
    During a lifecycle prepare phase, Ingest, Processor, and Query send a
    versioned `LifecyclePurgeRegistrationV1` request to Jobs for the affected
    policy or project-deletion purge work. Jobs durably creates the paused
@@ -147,8 +155,11 @@ The allowed protocol and data-flow direction is:
    context, correlation, and idempotency data and is the only component that
    appends the contract-level audit event; components do not write API audit
    storage directly. A restore or replacement of a component's own database
-   requires an API-owned durable audit intent and acknowledgement before the
-   target store is replaced.
+   requires a durable audit intent before the target store is replaced. For an
+   API PostgreSQL restore or replacement, the intent is written first to the
+   restore-independent API audit-intent prefix and survives any API database
+   backup rollback; API records the resulting evidence in its audit boundary
+   after recovery.
 
 This direction contains no circular protocol or persistence dependency. API
 outages do not immediately stop valid Ingest admission or Query reads while
@@ -236,6 +247,18 @@ receives a direct API execution dispatch or infers an authoritative watermark
 from its local projection. Query fails the export without an artifact if its
 hold or any requested vector member cannot be materialized.
 
+When API records a canceled export, it sends an idempotent, revision-fenced
+`ExportCancellationV1` command to Jobs containing `export_id`, the held export
+revision, the terminal export revision, terminal outcome, authorized scope,
+correlation, and idempotency context. Jobs durably records the terminal fence,
+cancels queued, leased, retry, and in-flight execution state, and sends Query a
+revision-fenced `ExportExecutionCancellationV1` command containing the same
+export and terminal revision. Query durably records the terminal execution
+fence before acknowledging it and rejects any `ExportExecutionV1` command for
+that terminal export whose revision is stale or whose delivery occurs after
+the terminal fence. API does not release the held revision until Jobs and Query
+have acknowledged the cancellation fence.
+
 After API records any terminal `completed`, `failed`, or `canceled` export
 transition, it publishes an idempotent versioned
 `ExportSnapshotHoldReleaseV1` command to Processor and Query. The command
@@ -246,6 +269,9 @@ context. Each owner durably releases the hold keyed by
 a stale release cannot remove a hold for a newer revision. API retains and
 retries undelivered release commands until both owners confirm them, so
 cancellation or owner failure cannot strand an inferred hold indefinitely.
+Query installs the terminal execution fence before releasing its projection
+hold, so a delayed execution command cannot recreate a hold or artifact after
+the terminal transition.
 
 When API records a successful `completed` transition, it sends Jobs an
 idempotent versioned `ExportExpiryScheduleV1` request containing `export_id`,
@@ -280,13 +306,16 @@ S3 credentials or usable object-store grant, and the reference is not
 customer-readable, reusable by another component, or written to logs.
 
 The class-default raw-expiry path is a versioned `RawRetentionExpiryV1`
-command from Jobs to Ingest. It carries the scoped `watchtower_id`,
-`accepted_at`, effective class cutoff, correlation identifier, and idempotency
-key. Ingest validates the current retention and deletion fences, durably records
-the terminal `default_expired` fence, and retires the matching raw object,
-acceptance metadata, and outbox entry without waiting for Processor. A later
-`RawPayloadFetchV1` request or `RawHandoffDispositionV1` delivery for that
-handoff is rejected as stale and cannot publish or revive canonical work.
+command from Jobs to Ingest. It carries the authorized tenant and project
+scope, raw data class, effective class cutoff, `expiry_basis=class_default`,
+correlation identifier, and idempotency key; it is a project-scoped sweep and
+does not require Jobs to know individual `watchtower_id` values. Ingest
+enumerates its own acceptance state, durably records a terminal
+`default_expired` fence for each eligible handoff, and retires each matching
+raw object, acceptance metadata, and outbox entry without waiting for
+Processor. A later `RawPayloadFetchV1` request or `RawHandoffDispositionV1`
+delivery for a fenced handoff is rejected as stale and cannot publish or revive
+canonical work.
 
 The raw-handoff completion path is a versioned durable `RawHandoffDispositionV1`
 message from Processor to Ingest using the common asynchronous envelope. Its
@@ -318,16 +347,22 @@ Retention-policy and project-deletion barriers use a versioned unary
 `LifecycleMutationV1` Protobuf-over-HTTP request from API to each of Ingest,
 Processor, Query, and Jobs under `/internal/v1`. The request carries the
 mutation kind, `phase` (`prepare` or `activate`), authorized scope, monotonic
-mutation generation, correlation identifier, and idempotency key. During
-`prepare`, each data owner durably installs a non-destructive pending fence and
-sends Jobs a versioned unary `LifecyclePurgeRegistrationV1` request under
+mutation generation, the complete immutable proposed retention policy when the
+mutation is a retention change, the policy's per-class proposed cutoffs,
+policy digest, correlation identifier, and idempotency key. During `prepare`,
+each data owner durably installs a non-destructive pending fence from that
+policy and sends Jobs a versioned unary `LifecyclePurgeRegistrationV1` request under
 `/internal/v1` containing the owner, mutation kind, authorized scope,
 generation, `registration_phase=prepare`, affected data classes, correlation
 identifier, and idempotency key.
-For project creation, each applicable owner uses the same request with
-`registration_kind=baseline`, the active default-policy generation, and
-`registration_phase=active`; Jobs durably creates the active registration and
-returns its `purge_registration_id` before the owner acknowledges creation.
+For project creation, API uses the same request with
+`mutation_kind=project_create` and the project-creation generation. Each
+applicable owner prepares its project fence and baseline registration, then
+activates that registration through Jobs. API exposes the project only after
+all applicable owners return generation-matched active
+`LifecycleMutationAcknowledgementV1` responses; Jobs returns its
+`purge_registration_id` before the owner acknowledges the active creation
+barrier.
 During prepare, Jobs durably persists the registration in `paused` state and returns its
 `purge_registration_id`; the owner persists that ID and the paused confirmation
 before acknowledging the lifecycle prepare. Jobs handles its own local
@@ -337,9 +372,10 @@ generation, each owner sends the same registration ID with
 enables the schedule, and returns that state before the owner acknowledges
 `phase=active`. The correlated
 `LifecycleMutationAcknowledgementV1` carries the owner, mutation kind,
-generation, phase, `fence_installed`, `purge_registration_id`, and registration
-state. `purge_registration_id` is a canonical lowercase UUID v7 at this
-boundary and is stored as PostgreSQL `uuid` in Jobs state. API commits the
+generation, phase, `fence_installed`, `purge_registration_id`, registration
+state, and the acknowledged policy digest when applicable.
+`purge_registration_id` is a canonical lowercase UUID v7 at this boundary and
+is stored as PostgreSQL `uuid` in Jobs state. API commits the
 active registry generation only after all required `phase=prepared`
 acknowledgements match; only then may the activation handshake enable purge,
 anonymization, raw retirement, or other irreversible work. API returns
@@ -406,12 +442,15 @@ intent has a canonical lowercase UUID v7 `audit_intent_id`, stored as PostgreSQL
 `uuid` wherever it is held in repository-owned relational outbox or state, plus
 producer, action, target resource, actor or workload identity, tenant and
 project context when applicable, correlation identifier, and idempotency key.
-For a restoration or replacement of that component's own PostgreSQL state, the
-intent is instead durably recorded in API's independent audit boundary and API
-must acknowledge it before the target store is replaced. The component then
-publishes at-least-once `AuditEvidenceV1` that references the intent and records
-the eventual outcome; crash recovery must retry the evidence or API must record
-an explicit unknown outcome from the independent intent before considering the
+For a restoration or replacement of non-API component PostgreSQL state, the
+intent is durably recorded in API's audit boundary and API acknowledges it
+before the target store is replaced. API PostgreSQL restoration is the
+exception: its `AuditIntentV1` record is durably written to the
+restore-independent API audit-intent prefix before the target store is
+replaced, and API records the eventual `AuditEvidenceV1` outcome after
+recovery. Other components publish at-least-once `AuditEvidenceV1` that
+references the intent and records the eventual outcome; crash recovery retries
+the evidence or records an explicit unknown outcome before considering the
 action complete.
 Neither intent nor evidence contains raw payloads or secrets. A component may
 retain and retry its local outbox while API is unavailable; API remains the sole
@@ -500,9 +539,10 @@ become runtime acceptance criteria for the owning implementation issues:
    path back to Ingest, Query projection, and visible query results.
 2. Stop Processor delivery before and after Ingest acknowledgement; accepted
    data remains recoverable until a matching terminal disposition or the
-   Ingest-authoritative `RawRetentionExpiryV1` fence is durably recorded,
-   including `policy_rejected` and `default_expired`, and late Processor fetches
-   or dispositions are rejected; admission stops at the documented capacity
+   Ingest-authoritative project-scoped `RawRetentionExpiryV1` sweep durably
+   records `default_expired` fences for Ingest-enumerated state, including
+   `policy_rejected` and `default_expired`, and late Processor fetches or
+   dispositions are rejected; admission stops at the documented capacity
    boundary.
 3. Follow a native control command from Web to API through defense-in-depth
    authorization, authoritative persistence, and change publication.
@@ -510,11 +550,13 @@ become runtime acceptance criteria for the owning implementation issues:
    unary Protobuf HTTP to Query without direct Query persistence access.
 5. Perform a native or compatible query during API outage with a valid
    security projection, then cross its freshness boundary and fail closed.
-6. Create a project and verify each applicable owner registers an active
-   baseline schedule with Jobs. Redeliver a retention or deletion request and
-   verify each data owner uses `LifecyclePurgeRegistrationV1` to obtain a
-   durable paused Jobs registration before acknowledging prepare, sends the
-   matching registration ID for activation, and receives the enabled state
+6. Create a project through the generation-matched `project_create`
+   `LifecycleMutationV1` barrier and verify the project remains unavailable
+   until each applicable owner registers an active baseline schedule with Jobs
+   and returns an active acknowledgement. Redeliver a retention or deletion
+   request and verify each data owner uses `LifecyclePurgeRegistrationV1` to
+   obtain a durable paused Jobs registration before acknowledging prepare, sends
+   the matching registration ID for activation, and receives the enabled state
    before acknowledging active. Activation commits the barrier before purge or
    anonymization, and an unavailable owner leaves a durable `accepted_pending`
    mutation; verify canonical lowercase UUID v7 purge-registration IDs and
@@ -541,29 +583,34 @@ become runtime acceptance criteria for the owning implementation issues:
     preserves inputs through completion or fails without an artifact when any
     vector member cannot be materialized; verify terminal
     `ExportSnapshotHoldReleaseV1` delivery for completion, failure, and
-    cancellation, including cancellation releasing the originally held revision
-    after API advances the terminal revision.
+    cancellation, including the revision-fenced API-to-Jobs
+    `ExportCancellationV1` and Jobs-to-Query `ExportExecutionCancellationV1`
+    fences before cancellation releases the originally held revision after API
+    advances the terminal revision.
 14. Race export cancellation and terminal completion or failure, then verify
-    revision fencing prevents a stale outcome from changing API state or
-    making an invalid artifact issuable, partial failed or canceled objects are
+    Jobs cancels and fences queued, leased, retry, and in-flight execution,
+    Query rejects delayed post-terminal `ExportExecutionV1` commands, and
+    revision fencing prevents a stale outcome from changing API state or making
+    an invalid artifact issuable; partial failed or canceled objects are
     removed at terminal transition, API sends the authoritative `completed_at`
     through `ExportExpiryScheduleV1`, and Jobs advances a completed export to
     `expired` through the scheduled API handoff at `completed_at + 7 days`.
 15. Perform a required component break-glass or backup action while API is
     unavailable, verify the durable audit intent was committed before the
-    action with its relational `uuid` type, and for a component-store restore
-    verify API's independent intent acknowledgement precedes replacement;
-    retry correlated versioned audit evidence after a crash and verify API alone
-    appends the resulting audit event without direct storage writes.
+    action with its relational `uuid` type, and for an API PostgreSQL restore
+    verify the intent is durable in the restore-independent API audit-intent
+    prefix before replacement; retry correlated versioned audit evidence after
+    a crash and verify API alone appends the resulting audit event without
+    direct storage writes.
 16. Revoke export authorization after URL issuance and verify the synchronous
     revision fence blocks the next issuance and download despite stale
     asynchronous projection state; when Query is unavailable, API fails closed
     rather than acknowledging the revocation.
 17. Restore Ingest, Processor, Query, and Jobs independently and verify each
     obtains and persists current retention-policy and deletion-tombstone
-    snapshots before readiness; when replacing a component store, verify API's
-    independent audit intent survives a backup that predates the replaced
-    store.
+    snapshots before readiness; when replacing a component store, verify the
+    applicable audit intent survives a backup that predates the replaced store,
+    including the API audit-intent prefix for an API PostgreSQL restore.
 
 ## Deferred Decisions and Non-Goals
 
