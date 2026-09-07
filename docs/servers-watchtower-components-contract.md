@@ -29,6 +29,8 @@ listed in `docs/project-watchtower.md`.
   implementations, and persistence fallbacks are prohibited.
 - Cross-component access occurs only through versioned unary Protobuf HTTP,
   versioned durable messages, or consumer-owned projections.
+- An owner-mediated data retrieval interface does not grant another component
+  direct storage access; the owning component remains the only storage reader.
 - Compatibility DTOs exist only at external adapters. They never become
   canonical Watchtower domain or persistence models.
 - Browsers and external clients never consume internal messages or invoke
@@ -92,7 +94,9 @@ The allowed protocol and data-flow direction is:
 2. Ingest accepts telemetry and consumes API-published changes for local
    authorization-related projections. It publishes recoverable processing
    handoff work and consumes Processor's terminal `RawHandoffDispositionV1`
-   messages before retiring the corresponding raw state.
+   messages before retiring the corresponding raw state. Processor retrieves
+   referenced raw bytes only through Ingest's authenticated
+   `RawPayloadFetchV1` interface.
 3. API accepts control-plane, release, artifact, and Sentry management
    commands. It publishes versioned change events. API may call Query's
    authenticated internal interfaces for Sentry management reads and authorized
@@ -104,7 +108,7 @@ The allowed protocol and data-flow direction is:
    publishes canonical and derived changes, answers API's versioned
    export-watermark requests, accepts Query's authorized `ProjectionRebuildV1`
    requests, and publishes a terminal `RawHandoffDispositionV1` to Ingest for
-   every completed or policy-rejected raw handoff.
+   every completed, shortened-policy-rejected, or default-expired raw handoff.
 5. Query consumes API changes and Processor changes into its own projections,
    indexes, and caches. It consumes API-authorized export work carrying
    Processor's watermark, publishes versioned export outcomes for API to record
@@ -114,12 +118,12 @@ The allowed protocol and data-flow direction is:
 6. Jobs receives durable requests, owns scheduling and retry state, and
    dispatches versioned commands to the component owning the affected data.
    Data owners durably register retention and project-deletion purge work with
-   Jobs before acknowledging the corresponding policy or deletion. Ingest,
-   Processor, Query, and Jobs each obtain the current retention-policy and
-   deletion-tombstone snapshots through an authenticated
+   Jobs before returning a matching `LifecycleMutationAcknowledgementV1` to
+   API. Each of Ingest, Processor, Query, and Jobs obtains the current
+   retention-policy and deletion-tombstone snapshots through an authenticated
    `ControlRegistrySnapshotV1` request to API before readiness or after
-   restoration. The owner performs the idempotent side effect and publishes the
-   outcome.
+   restoration. The owner performs the idempotent side effect and publishes
+   the outcome.
 7. Ingest, Processor, Query, and Jobs submit required evidence for break-glass,
    restoration, key, replication, backup, and restore actions to API through a
    versioned durable audit-evidence message. API validates the producer,
@@ -217,15 +221,29 @@ versioned canonical or derived changes through its normal change path. The
 correlated response reports durable acceptance or a terminal safe error; Query
 never accesses Processor persistence directly.
 
+The raw payload retrieval path is a versioned unary `RawPayloadFetchV1`
+Protobuf-over-HTTP call under `/internal/v1` from Processor to Ingest. A raw
+handoff may carry an opaque, owner-issued `RawPayloadReferenceV1` containing
+only the scope, `watchtower_id`, object digest, size, and expiry needed for
+this handoff. Processor presents that reference with an idempotent bounded
+byte-range or chunk cursor request. Ingest authenticates the Processor
+workload, validates the reference against its acceptance record and current
+retention and deletion fences, reads its own S3 object, and returns a bounded
+chunk with the verified digest, size, and next cursor. Processor receives no
+S3 credentials or usable object-store grant, and the reference is not
+customer-readable, reusable by another component, or written to logs.
+
 The raw-handoff completion path is a versioned durable `RawHandoffDispositionV1`
 message from Processor to Ingest using the common asynchronous envelope. Its
 bounded payload contains the canonical lowercase UUID v7 `watchtower_id`, a
-terminal `disposition` of `completed` or `policy_rejected`, and the generation
-context for the result: canonical lowercase UUID v7 `processing_generation` is
-required for `completed`, while `policy_rejected` includes the
-`retention_policy_generation` and a bounded rejection reason. The Processor
-publishes the message through its durable outbox after recording the terminal
-result; transient processing failures publish no terminal disposition. Ingest
+terminal `disposition` of `completed`, `policy_rejected`, or `default_expired`,
+and the generation context for the result: canonical lowercase UUID v7
+`processing_generation` is required for `completed`, `policy_rejected` includes
+the `retention_policy_generation`, and `default_expired` includes a bounded
+rejection reason with `expiry_basis=class_default` and no policy generation.
+The Processor publishes the message through its durable outbox after recording
+the terminal result; transient processing failures publish no terminal
+disposition. Ingest
 transactionally persists the disposition and idempotency state before retiring
 the matching outbox entry and raw acceptance data. Redelivery of the same
 message is idempotent, and a conflicting disposition or generation is an
@@ -240,6 +258,20 @@ persists them before readiness and fails closed if the snapshot cannot be
 installed. Subsequent policy and deletion mutations use the same
 generation-aware durable handoffs, while this request repairs state after
 restoration or rebuild.
+
+Retention-policy and project-deletion barriers use a versioned unary
+`LifecycleMutationV1` Protobuf-over-HTTP request from API to each of Ingest,
+Processor, Query, and Jobs under `/internal/v1`. The request carries the
+mutation kind, authorized scope, monotonic mutation generation, correlation
+identifier, and idempotency key. Each owner returns a correlated
+`LifecycleMutationAcknowledgementV1` only after durably installing the matching
+fence and, when required, receiving durable purge registration from Jobs. The
+acknowledgement carries the owner, mutation kind and generation,
+`fence_installed`, and the durable purge-registration result and identifier.
+Jobs returns the registration acknowledgement for its own schedule and purge
+fence. API accepts the mutation only when every required owner reports the
+matching generation, an installed fence, and a successful purge registration;
+stale, conflicting, or incomplete acknowledgements fail closed.
 
 The authorization-revocation fence is a versioned unary Protobuf-over-HTTP call
 under `/internal/v1` from API to Query. API sends the affected actor, project or
@@ -283,6 +315,10 @@ Every asynchronous message uses a common versioned envelope containing:
 - W3C trace context;
 - an idempotency key; and
 - either a bounded payload or an authorized payload reference.
+
+An authorized payload reference is an owner-issued capability for one scoped
+handoff, not a storage credential or a permission to read another component's
+object store. Its only permitted use is the matching owner-mediated interface.
 
 Credentials and unrestricted customer payloads are prohibited. Delivery is at
 least once and consumers are idempotent. There is no global ordering guarantee
@@ -374,11 +410,13 @@ The following walkthroughs are required review cases for this contract and
 become runtime acceptance criteria for the owning implementation issues:
 
 1. Follow a Sentry SDK request through routing, Ingest, durable raw and
-   handoff records, Processor, its `RawHandoffDispositionV1` completion path
-   back to Ingest, Query projection, and visible query results.
+   handoff records, the authenticated `RawPayloadFetchV1` path when a bounded
+   payload is insufficient, Processor, its `RawHandoffDispositionV1` completion
+   path back to Ingest, Query projection, and visible query results.
 2. Stop Processor delivery before and after Ingest acknowledgement; accepted
    data remains recoverable until a matching terminal disposition is durably
-   recorded, and admission stops at the documented capacity boundary.
+   recorded, including `policy_rejected` and `default_expired`, and admission
+   stops at the documented capacity boundary.
 3. Follow a native control command from Web to API through defense-in-depth
    authorization, authoritative persistence, and change publication.
 4. Follow a Sentry management read through API compatibility translation and
@@ -386,10 +424,12 @@ become runtime acceptance criteria for the owning implementation issues:
 5. Perform a native or compatible query during API outage with a valid
    security projection, then cross its freshness boundary and fail closed.
 6. Redeliver a retention or deletion request and verify Jobs durably schedules
-   it before acknowledgement while the data owner performs one idempotent
-   effect without Jobs writing its store; when Query is unavailable, the
-   barriered API mutation fails closed while unrelated API-owned mutations retain
-   normal failure isolation.
+   it before each owner returns a generation-matched
+   `LifecycleMutationAcknowledgementV1` with an installed fence and durable
+   purge result, while the data owner performs one idempotent effect without
+   Jobs writing its store; when Query is unavailable, the barriered API
+   mutation fails closed while unrelated API-owned mutations retain normal
+   failure isolation.
 7. Reject forged tenant context, invalid workload identity, unauthorized
    broker access, and cross-tenant projection data.
 8. Exercise every canonical error mapping, deadline, cancellation, retryable

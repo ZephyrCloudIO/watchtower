@@ -92,7 +92,7 @@ canonical telemetry.
 | Data class | Writer and authority | Storage boundary | Lifecycle |
 | --- | --- | --- | --- |
 | Raw accepted records and attachments | Ingest; authoritative for raw acceptance | Encrypted immutable S3 objects plus Ingest PostgreSQL acceptance metadata and outbox state | Seven days from `accepted_at` by default; a project policy may shorten this cutoff but never extend it, and raw state may remain only until Processor durably confirms handoff completion within that cutoff; never customer-downloadable |
-| Normalized records | Processor; authoritative only as processing input | Processor-owned encrypted S3 replay-batch prefix, with separate class metadata | Retained only as needed for replay, no longer than 90 days |
+| Normalized records | Processor; authoritative only as processing input | Processor-owned encrypted S3 replay-batch prefix, with separate class metadata | Retained as needed for replay; a verified normalized representation is retained at least through the applicable raw-retention cutoff whenever raw may retire after successful handoff, and never longer than 90 days |
 | Enriched records | Processor; authoritative only as processing input | Processor-owned encrypted S3 replay-batch prefix, with separate class metadata | Retained only as needed for replay, no longer than 90 days |
 | Canonical telemetry | Processor; authoritative for the four signal histories | Four independent ClickHouse canonical table families | Immutable history for 90 days from `accepted_at` |
 | Canonical replay representations | Processor; non-authoritative, immutable replay copies of canonical changes | Processor-owned encrypted project-scoped S3 replay-batch prefix with separate class metadata | 90 days from each represented record's `accepted_at`; purged with its project |
@@ -102,7 +102,7 @@ canonical telemetry.
 | Query projections | Query; authoritative only for read projection state | Query-owned ClickHouse databases or schemas | Rebuildable canonical-signal projections are retained for 90 days; derived-aggregate projections use their authoritative aggregate's lifecycle and retention window; all are purged with the project |
 | Query cache | Query; never authoritative | Encrypted Query-owned cache | At most 15 minutes; immediately invalidated for retention, deletion, or authorization changes |
 | Export objects | Query; non-authoritative customer-download artifacts | Encrypted Query-owned project-scoped S3 export prefix | Seven days from API `completed_at` for successful artifacts; artifacts from any attempt that terminates without successful `completed`, including failed or canceled attempts, are removed or made inaccessible at terminal transition, and retention-fenced or deleted-project exports are removed or made inaccessible immediately |
-| Audit events | API for contract-level lifecycle and access audit authority | API-owned append-only PostgreSQL audit boundary | Detailed history follows #15; deleted projects retain only minimal anonymous evidence |
+| Audit events | API for contract-level lifecycle and access audit authority | API-owned append-only PostgreSQL audit boundary with erasable encrypted project-scoped context | Detailed history follows #15; deleted projects retain only minimal anonymous evidence |
 | Retention policy registry | API; authoritative for shortened-retention duration policies, their current-time effective cutoffs, and restore cleanup | API-owned encrypted immutable S3 control-registry prefix, independent of API PostgreSQL backups | The active policy persists until superseded and its effective cutoff is computed from that duration at enforcement time; superseded versioned policy records are retained for 13 months and the active policy is loaded before restored owners accept traffic |
 | Deletion tombstone registry | API; authoritative for deletion fencing and restore cleanup | API-owned encrypted immutable S3 control-registry prefix, independent of API PostgreSQL backups | Non-customer-readable keyed tombstones retained for 13 months; loaded before restored owners accept traffic |
 | Processing and operational state | The component performing the operation | Its own PostgreSQL database or explicitly owned state boundary | Owned and retained by that component; no cross-component writer |
@@ -162,8 +162,11 @@ its digest and size have been verified, and the acceptance metadata and
 transactional outbox commit. Orphaned or incomplete attempts are reconciled
 without being reported as successful acceptance. The raw object, acceptance
 metadata, and recoverable handoff remain until Processor durably confirms
-completion through the versioned `RawHandoffDispositionV1` message; Ingest
-redelivers and reconciles pending handoffs if the seven-day MSK window expires.
+completion through the versioned `RawHandoffDispositionV1` message. For a
+`completed` disposition, Processor commits the verified normalized replay
+representation before sending the disposition, so Ingest may retire raw state
+immediately without losing the reprocessing source. Ingest redelivers and
+reconciles pending handoffs if the seven-day MSK window expires.
 
 Canonical ClickHouse tables are partitioned monthly by `accepted_at` and
 ordered by:
@@ -193,9 +196,11 @@ eventually consistent.
 The existing versioned message envelope remains authoritative for message
 identity, producer, tenant/project context, event time, causation,
 correlation, W3C trace context, idempotency, and bounded payload or authorized
-payload reference. Message timestamps use the same UTC RFC 3339 nanosecond
-format as canonical timestamps. Delivery is at least once and consumers are
-idempotent.
+payload reference. Raw references are owner-issued, scoped to one handoff, and
+usable only through Ingest's authenticated `RawPayloadFetchV1` interface;
+Processor never reads Ingest object storage directly. Message timestamps use
+the same UTC RFC 3339 nanosecond format as canonical timestamps. Delivery is at
+least once and consumers are idempotent.
 
 MSK handoff and canonical-change topics retain data for seven days and use:
 
@@ -255,23 +260,27 @@ fences before readiness. Authorized project administrators may shorten a project
 retention policy but may not extend it through this contract. API assigns every
 project policy a strictly monotonic generation and records each versioned shortened
 duration policy in its restore-independent retention policy registry. Ingest,
-Processor, and Query each durably retain the highest installed generation, ignore
-lower-generation deliveries, and acknowledge installation only for the matching
-or an idempotent equal generation. Each owner computes the earlier of its
-class-default cutoff and project-policy cutoff from current time whenever
-enforcing admission, read, processing, replay, export, or rebuild behavior. API
-reports success only after each owner
-durably installs and enforces the policy. Until acknowledgement, the mutation
-fails closed. Before
+Processor, Query, and Jobs each durably retain the highest installed generation,
+ignore lower-generation deliveries, and return a matching
+`LifecycleMutationAcknowledgementV1` only after installing the fence and
+durably registering the required purge work with Jobs. Each owner computes the
+earlier of its class-default cutoff and project-policy cutoff from current time
+whenever enforcing admission, read, processing, replay, export, or rebuild
+behavior. API reports success only after every required acknowledgement confirms
+the matching generation, installed fence, and durable purge registration. Until
+acknowledgement, the mutation fails closed. Before
 its acknowledgement, Ingest stops admitting excess records and serving excess raw
 data, Processor durably fences queued, pending-handoff, and replayed work whose
 `accepted_at` falls outside the new limit, prevents canonical or derived
 publication, and recomputes or removes derived results with expired
 contributions, and Query denies excess reads, exports, and rebuilds. Processor
 returns a durable `RawHandoffDispositionV1` message with a terminal
-`policy_rejected` disposition for each rejected raw handoff; Ingest records that
-disposition as terminal, retires its outbox entry, and purges the corresponding
-raw object and acceptance metadata under the new policy. After installing its
+`policy_rejected` disposition for each handoff rejected by the shortened policy;
+for an unprocessed handoff that crosses the seven-day class default without a
+shortened policy, it returns `default_expired` with
+`expiry_basis=class_default` and no retention-policy generation. Ingest records
+either disposition as terminal, retires its outbox entry, and purges the
+corresponding raw object and acceptance metadata. After installing its
 fence, each owner submits a durable recurring
 active-store purge schedule to Jobs for as long as the shortened policy remains
 active. Jobs must durably persist that schedule before the owner acknowledges the
@@ -288,11 +297,12 @@ There is no cold archive.
 
 Project deletion is project-wide. API creates a versioned deletion generation
 and keyed project tombstone in its append-only restore-independent registry,
-then requires durable acknowledgement from Ingest, Processor, Query, and Jobs
-that each has installed its fence and that project purge work is durably
-registered with Jobs before accepting the deletion; it fails closed until all
-acknowledge. Each owner fences the project for that generation before
-acknowledgement: Ingest rejects collection and pending raw handoffs, Processor
+then requires a generation-matched `LifecycleMutationAcknowledgementV1` from
+Ingest, Processor, Query, and Jobs confirming each installed its fence and that
+project purge work is durably registered with Jobs before accepting the deletion;
+it fails closed until all acknowledge. Each owner fences the project for that
+generation before acknowledgement: Ingest rejects collection and pending raw
+handoffs, Processor
 rejects pending or replayed work and canonical or derived republishing, Query
 rejects reads, restoration, exports, and new projection rebuilds, and Jobs
 cancels and fences queued, retry, dead-letter, dispatchable, leased, and
@@ -308,16 +318,24 @@ a restored API database accepts traffic, API loads the current registry and
 reapplies every current tombstone to identify, fence, and purge deleted-project
 rows. Before accepting deletion, API irreversibly removes every retention-policy
 registry version for the project. API retains the non-customer-readable registry tombstone
-for 13 months. Only irreversible minimal evidence remains after project deletion:
-deletion timestamp, result, correlation ID, and the keyed tombstone, without
-tenant-identifying or customer-payload content.
+for 13 months. Audit rows remain append-only and are never updated or deleted:
+their actor or workload identity, tenant/project context, action, and target
+resource are encrypted under an erasable project-scoped context key, and
+deletion irreversibly destroys that key. Only irreversible minimal evidence
+remains available after project deletion: deletion timestamp, result,
+correlation ID, and the keyed tombstone, without tenant-identifying or
+customer-payload content.
 
 Reprocessing is bounded by project and `accepted_at` range. Each attempt records
 source data class, source and target schema or normalization versions,
 processor release, request or job identity, correlation ID, checksums, counts,
-and outcome. Raw data is the source for ranges within the project's applicable
-raw-retention window, which is seven days by default; after that, an eligible
-retained safe normalized replay batch is the source.
+and outcome. Raw data is the preferred source for ranges within the project's
+applicable raw-retention window, which is seven days by default, when raw state
+is still retained. If Ingest retired raw state after a completed handoff, the
+eligible verified normalized replay representation is a valid source even
+before that cutoff; after the cutoff, it is the source. A range without either
+an eligible raw source or a verified normalized replay representation is
+rejected rather than reprocessed from an unverified or unavailable source.
 
 A new result uses a new UUID v7 `processing_generation` and is a candidate until
 the complete requested range passes integrity validation. Processor records the
@@ -444,8 +462,9 @@ the same aggregate value.
 
 All service-to-service and storage transport uses TLS. At-rest encryption uses
 platform-managed KMS envelope encryption. Raw payloads are inaccessible to
-customers and Query; automated processing may access them only within the
-Ingest-to-Processor boundary. Approved, time-limited, audited operator
+customers and Query; automated processing may access them only through the
+authenticated owner-mediated Ingest-to-Processor boundary, and Processor never
+reads Ingest object storage directly. Approved, time-limited, audited operator
 break-glass access is the only exception, and operator guidance is required
 before implementation release.
 
@@ -484,6 +503,9 @@ Immutable audit events are required for break-glass access, exports, deletion,
 restoration attempts, reprocessing, retention changes, and key, replication,
 backup, or restore actions. API remains the contract-level audit writer;
 component logs and Jobs execution history do not replace the audit boundary.
+Project-scoped audit context is erasable encrypted context: deletion destroys
+its project key while preserving the append-only event rows and minimal
+anonymous deletion evidence.
 
 Threat-model review is required before accepting this contract and before each
 implementation release. Customer-facing retention, deletion, export, and
@@ -536,9 +558,11 @@ The owning implementation contracts must make these scenarios testable:
 3. Verify raw-object immutability, SHA-256 and size reconciliation, required
    MSK durability and seven-day default retention settings, shortened-policy
    enforcement without allowing a project duration to extend a shorter class
-   default, redelivery of unprocessed work after the MSK window expires, and
-   generation-aware reconciliation of each completed handoff to a promoted
-   canonical default or durable terminal disposition before raw retirement.
+   default, redelivery of unprocessed work after the MSK window expires, the
+   `default_expired` disposition for an unprocessed handoff beyond the class
+   default, and generation-aware reconciliation of each completed handoff to a
+   promoted canonical default or durable terminal disposition before raw
+   retirement.
 4. Rebuild eligible canonical and derived Query projections through an
    authorized, durably acknowledged Query-to-Processor `ProjectionRebuildV1`
    request and Processor republishing without direct Processor storage access;
@@ -562,8 +586,9 @@ The owning implementation contracts must make these scenarios testable:
    expiry, including deleted-project data; removal of every project
    retention-policy registry record; restore-independent retention and
    tombstone-registry recovery before any restored or rebuilt owner accepts
-   traffic; export cancellation; cache invalidation; and
-   minimal anonymous evidence.
+   traffic; export cancellation; cache invalidation; generation-matched
+   `LifecycleMutationAcknowledgementV1` outcomes; append-only audit rows with
+   irreversibly destroyed project context; and minimal anonymous evidence.
 6. Export permitted signals and verify Parquet output, manifest checksums, row
    counts, independently recomputable canonical digest tuples, generation-aware
    canonical-content and revision-aware derived reconciliation summaries,
@@ -585,7 +610,9 @@ The owning implementation contracts must make these scenarios testable:
    lifecycle anchors after later contributions, and rejection of lower or
    conflicting equal derived-aggregate revisions; reject a corrupted or truncated
    normalized or enriched processing-input replay batch before reprocessing or
-   canonical publication.
+   canonical publication; and successfully reprocess a record through its
+   verified normalized replay representation after raw state was retired before
+   the seven-day cutoff.
 8. Attempt cross-tenant access through PostgreSQL, ClickHouse, S3, MSK,
    projections, exports, and break-glass workflows; verify denial and required
    audit evidence.
