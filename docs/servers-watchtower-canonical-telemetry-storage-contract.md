@@ -303,24 +303,26 @@ separate class metadata, and verifies both before any replay or reprocessing
 use. A verification failure makes the batch unusable and cannot create,
 publish, or promote a canonical result.
 Replay batches use bounded one-hour UTC expiry buckets keyed by each item's
-effective lifecycle expiry. Batch metadata records the bucket and every
-item's exact effective expiry, so a batch may span exact expiry instants
-without losing per-item retention data. Canonical and derived replay objects
-are deleted at the earliest represented expiry; later-expiring non-authoritative
-copies may therefore be retired early, but no object can retain an expired
-item. No-row `CanonicalChangeSkipV1` sequence tombstones are not represented
+effective lifecycle expiry. Each batch contains one bucket, and its metadata
+records the bucket and every item's exact effective expiry, so a batch may span
+exact expiry instants without losing per-item retention data. Canonical and
+derived replay objects are deleted at the bucket boundary rather than at each
+item's exact expiry. This bounded physical-retention exception avoids copying
+every later-lived entry into a successor: an item may remain in its immutable
+non-authoritative object for less than one hour after its exact cutoff, but
+replay, reprocessing, and export paths must reject that item at the exact
+cutoff. No-row `CanonicalChangeSkipV1` sequence tombstones are not represented
 telemetry and remain in the canonical replay class through the full replay
-horizon of their reserved sequence. Before that deletion, Processor splits or
-rolls every still-eligible
-canonical replay entry and associated default-generation selection change into
-a successor and carries the source digest and provenance forward. If a
-normalized or enriched processing-input batch must remain available through a
-raw-retention cutoff, Processor uses the same rollover for its still-needed
-items before the earliest deletion deadline. For a successful handoff whose raw
-state may retire, the normalized item's effective cutoff is never earlier than
-the applicable raw-retention cutoff; a shortened normalized policy cannot
-delete the only eligible reprocessing source before that floor. No replay object
-containing a represented item is retained past that item's effective cutoff.
+horizon of their reserved sequence. Processor does not split or roll eligible
+entries or associated default-generation selection changes merely because one
+item in the bucket expires. If a normalized or enriched processing-input batch
+must remain available through a raw-retention cutoff, its exact per-item cutoff
+and the applicable raw-retention floor are enforced logically while bucket
+cleanup occurs at or after that floor. A shortened normalized policy cannot
+delete the only eligible reprocessing source before that floor. No represented
+telemetry item is accessible after its effective cutoff, and no replay object
+containing represented telemetry remains beyond its bucket boundary; no-row
+sequence tombstones follow the full-horizon rule above.
 Canonical replay batches are non-authoritative immutable copies, not a second
 canonical store; their separate metadata identifies the represented canonical
 versions for reconciliation and deletion. Derived aggregates are
@@ -495,19 +497,24 @@ and deletion-tombstone registry snapshots from API through the versioned
 `ControlRegistrySnapshotV1` handoff defined in the component contract, persists
 them before readiness, and enforces them. Each data owner reapplies its effective
 cutoff and fences excess data; Jobs restores the associated baseline, policy,
-and deletion scheduling and fences. Before a restored or rebuilt Processor or
-Query owner becomes ready, it also obtains its owner-scoped export-fence
-snapshot from the same handoff. The snapshot contains the current desired
-export holds and unresolved terminal fences for completed, failed, canceled,
-and expired exports, their export and held/terminal revisions, registry
-generation, and integrity digest. For completed exports it also contains the
+and deletion scheduling and fences. Before a restored or rebuilt Processor,
+Query, or Jobs owner becomes ready, it also obtains its owner-scoped export
+recovery snapshot from the same handoff. For Processor and Query, the snapshot
+contains the current desired export holds and every terminal fence for
+completed, failed, canceled, and expired exports. For Jobs, it contains every
+desired `ExportExpiryScheduleV1`, including its export revision, authoritative
+`completed_at`, expiry basis, and effective deadline, plus every terminal
+execution fence and its terminal revision. These entries include acknowledged
+terminal tombstones retained for the restorable-backup horizon, not only
+unresolved intents. All entries include their registry generation and integrity
+digest. For completed exports it also contains the
 restore-independent recovery copy of Query's materialization metadata:
 manifest content and digest, artifact object references and digests, complete
 watermark vectors, and `snapshot_generation`. This copy is recovery evidence,
 not a second Query authority.
 The owner persists the snapshot, reconciles its local inventory, installs every
-missing desired hold or terminal fence, and removes or releases only state
-authorized by the current snapshot. Query durably installs a terminal
+missing desired hold, schedule, or terminal fence, and removes or releases only
+state authorized by the current snapshot. Query durably installs a terminal
 execution fence before releasing its projection hold. If a completed artifact
 or its metadata is missing or conflicting, Query sends the authenticated
 `ExportRecoveryInvalidationV1` handoff defined in the component contract before
@@ -517,11 +524,13 @@ unavailable API keeps the restored owner unready and retryable. API's
 `ExportHoldInventoryV1` reconciliation after an API database restore remains in
 addition to this owner-store recovery path.
 Before a restored or rebuilt Jobs owner becomes ready, it reconciles its local
-baseline registrations against the active-project inventory returned by
-`ControlRegistrySnapshotV1`, recreating missing registrations idempotently for
-every applicable project and data class, including projects with the default
-policy. It then restores the associated policy and deletion scheduling and
-fences. There is no cold archive.
+baseline registrations, export-expiry schedules, and terminal execution fences
+against the owner-scoped inventory returned by `ControlRegistrySnapshotV1`,
+recreating missing registrations and schedules idempotently and installing
+terminal fences before re-enabling dispatch. This includes every applicable
+project and data class, including projects with the default policy. It then
+restores the associated policy and deletion scheduling and fences. There is no
+cold archive.
 
 Project deletion is project-wide and uses the same prepare/activate barrier. API
 records a versioned deletion generation and keyed project tombstone in a pending
@@ -999,7 +1008,8 @@ The owning implementation contracts must make these scenarios testable:
    verify that the canonical lowercase UUID v7 `rebuild_id` is persisted as
    PostgreSQL `uuid` in Processor's durable request and idempotency state, that
    canonical replay copies remain non-authoritative, use bounded expiry buckets
-   with exact per-item cutoffs and explicit deletion/rollover behavior,
+   with exact per-item cutoffs and explicit bucket-boundary deletion without
+   per-item rollover,
    reconcile to their represented canonical versions, and reject a
    changed non-key canonical field when its identity pair is unchanged; verify
    that each requested canonical partition receives a matching
@@ -1048,10 +1058,12 @@ The owning implementation contracts must make these scenarios testable:
    expiry-intent, and authorization-revocation-intent registry recovery before
    any restored or rebuilt owner accepts
    traffic; verify restored Processor and Query owners also reconcile their
-   owner-scoped export holds and completed, failed, canceled, and expired
-   terminal execution fences from the API registry snapshot before readiness,
-   including Jobs rebuilding a missing
-   default-policy baseline registration from the active-project inventory;
+   owner-scoped export holds and every completed, failed, canceled, and expired
+   terminal execution fence from the API registry snapshot before readiness,
+   while restored Jobs reconciles every owner-scoped export schedule and
+   terminal fence before readiness and prevents late execution redispatch,
+   including Jobs rebuilding a missing default-policy baseline registration
+   from the active-project inventory;
    shortened-retention activation must expire and revoke every still-downloadable
    completed export whose selected source or export-object cutoff crosses the new
    cutoff before the policy becomes active, and must reschedule artifacts whose

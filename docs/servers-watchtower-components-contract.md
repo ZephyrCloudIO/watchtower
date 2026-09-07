@@ -192,11 +192,14 @@ The allowed protocol and data-flow direction is:
    `ControlRegistrySnapshotV1` request to API before readiness or after
    restoration. Processor and Query also obtain their owner-scoped export-hold,
    terminal-fence, and completed-materialization recovery snapshot through that
-   request. Each owner persists the
-   snapshot before readiness, performs the idempotent side effect, and publishes
-   the outcome. Processor and Query remain unready until their local hold/fence
-   inventory matches the API registry generation and digest; Query installs a
-   terminal execution fence before releasing a projection hold.
+   request, while Jobs obtains its owner-scoped export-schedule and
+   terminal-fence recovery snapshot. Each owner persists the snapshot before
+   readiness, performs the idempotent side effect, and publishes the outcome.
+   Processor and Query remain unready until their local hold/fence inventory
+   matches the API registry generation and digest; Jobs remains unready until
+   its schedule and fence inventory matches as well. Query installs a terminal
+   execution fence before releasing a projection hold, and Jobs installs every
+   restored terminal fence before re-enabling export dispatch or scheduling.
 7. Ingest, Processor, Query, and Jobs submit required evidence for break-glass,
    restoration, key, replication, backup, and restore actions to API through a
    versioned durable audit-evidence message. API validates the producer,
@@ -379,11 +382,15 @@ horizon for backups that may contain non-terminal state. Before traffic is
 accepted, API applies each tombstone to the restored export state, preventing
 status regression or redispatch at a lower revision.
 When Processor or Query restores its own store, it instead receives the
-owner-scoped desired holds, unresolved terminal fences, and completed-export
-materialization recovery metadata in `ControlRegistrySnapshotV1`, persists
-that snapshot before readiness, and reconciles missing or stale local state
-against it. This owner-store recovery does not depend on an API database
-restore.
+owner-scoped desired holds, every terminal fence that can coexist with a
+restorable backup, and completed-export materialization recovery metadata in
+`ControlRegistrySnapshotV1`. When Jobs restores its own store, it receives the
+owner-scoped export-expiry schedules and every terminal execution fence that
+can coexist with a restorable backup. Each owner persists that snapshot before
+readiness and reconciles missing or stale local state against it; Jobs
+reinstalls missing schedules idempotently and installs terminal fences before
+re-enabling dispatch. This owner-store recovery does not depend on an API
+database restore.
 
 After the completion intent is durable, API sends Jobs an idempotent versioned
 `ExportCompletionV1` request containing `export_id`, the held and terminal
@@ -515,8 +522,14 @@ active project and applicable data class, including default-policy projects that
 have no shortened-retention policy row. API returns the versioned snapshots,
 inventory, and their highest generations; the requesting owner persists them
 before readiness and fails closed if the snapshot cannot be installed. The
-owner-scoped Query snapshot also includes completed-export materialization
-recovery metadata from the restore-independent completion intent: manifest
+owner-scoped Processor and Query snapshots include desired export holds and
+every terminal execution fence from the restore-independent completion intent.
+The owner-scoped Jobs snapshot includes each desired `ExportExpiryScheduleV1`
+with its export revision, authoritative `completed_at`, expiry basis, and
+effective deadline, plus every terminal execution fence and its terminal
+revision. These entries include acknowledged terminal tombstones retained for
+the restorable-backup horizon, not only unresolved intents. The Query snapshot
+also includes completed-export materialization recovery metadata: manifest
 content and digest, artifact object references and digests, complete watermark
 vectors, export and terminal revisions, and Query's `snapshot_generation`.
 Query rebuilds or verifies its local export metadata from that copy before
@@ -525,7 +538,8 @@ the authenticated `ExportRecoveryInvalidationV1` handoff to API before remaining
 unready for that completed export. API validates the matching completed
 revision, advances it through the existing revision-fenced terminal `expired`
 invalidation and hold-release path, and Query does not serve the artifact while
-the handoff is pending.
+the handoff is pending. Jobs reconciles its schedules and fences before
+re-enabling dispatch.
 Subsequent policy and deletion mutations use the same generation-aware durable
 handoffs, while this request repairs state after restoration or rebuild.
 
@@ -810,11 +824,11 @@ become runtime acceptance criteria for the owning implementation issues:
     Query rejects delayed post-terminal `ExportExecutionV1` commands, and
     revision fencing prevents a stale outcome from changing API state or making
     an invalid artifact issuable; partial failed or canceled objects are
-    removed at terminal transition, and Jobs advances a completed export to
-    `expired`
-    through the `ExportExpiryScheduleV1` handoff with an explicit expiry basis
-    at the earlier of the
-    seven-day default and export-object policy cutoff. A restored API replays an
+    removed at terminal transition. Jobs delivers `ExportExpiryV1` through the
+    `ExportExpiryScheduleV1` handoff with an explicit expiry basis at the
+    earlier of the seven-day default and export-object policy cutoff; API alone
+    advances a still-completed export to `expired` and publishes Query
+    invalidation. A restored API replays an
     unresolved completion handoff before resuming its final check and commit;
     it replays an unresolved expiry schedule only after completion succeeds. An
     export whose held source reaches its ordinary
@@ -858,18 +872,22 @@ become runtime acceptance criteria for the owning implementation issues:
     Processor and Query from backups predating an active export hold or
     completed, failed, canceled, or expired terminal execution fence and verify
     their owner-scoped hold/fence and completed-materialization snapshot
-    reconciliation completes before readiness, with Query rebuilding or
+    reconciliation completes before readiness, including every terminal
+    tombstone that can coexist with the backup, with Query rebuilding or
     verifying manifests, artifact references, vectors, and
-    `snapshot_generation` before serving a completed export; when verification
-    fails, Query retries `ExportRecoveryInvalidationV1` to API while remaining
-    unready and API performs the terminal invalidation before the artifact can
-    be served; Query installs the
-    terminal fence before releasing its projection hold; when Jobs' backup
-    predates an ordinary default-policy project creation, verify it recreates
-    the missing baseline registration idempotently from the inventory before
-    enabling schedules. When replacing a component store, verify the applicable
-    audit intent survives a backup that predates the replaced store, including
-    the API audit-intent prefix for an API PostgreSQL restore.
+    `snapshot_generation` before serving a completed export; restore Jobs from
+    a backup predating an acknowledged export schedule or terminal fence and
+    verify its owner-scoped schedule/fence snapshot recreates missing schedules,
+    installs every terminal fence before readiness, and prevents late execution
+    redispatch; when verification fails, Query retries
+    `ExportRecoveryInvalidationV1` to API while remaining unready and API
+    performs the terminal invalidation before the artifact can be served; Query
+    installs the terminal fence before releasing its projection hold; when
+    Jobs' backup predates an ordinary default-policy project creation, verify it
+    recreates the missing baseline registration idempotently from the inventory
+    before enabling schedules. When replacing a component store, verify the
+    applicable audit intent survives a backup that predates the replaced store,
+    including the API audit-intent prefix for an API PostgreSQL restore.
 
 ## Deferred Decisions and Non-Goals
 
