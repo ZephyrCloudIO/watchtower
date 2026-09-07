@@ -110,7 +110,7 @@ canonical telemetry.
 | Export objects | Query; non-authoritative customer-download artifacts | Encrypted Query-owned project-scoped S3 export prefix | The earlier of seven days from API `completed_at` and the active export-object policy cutoff computed from `completed_at` for successful artifacts; artifacts from any attempt that terminates without successful `completed`, including failed or canceled attempts, are removed or made inaccessible at terminal transition, and retention-fenced or deleted-project exports are removed or made inaccessible immediately |
 | Audit events | API for contract-level lifecycle and access audit authority | API-owned append-only PostgreSQL audit boundary with erasable encrypted project-scoped context, plus a restore-independent immutable audit journal | Detailed history follows #15; every journaled event is replayable after an API database restore, and deleted projects retain only minimal anonymous evidence |
 | API restore audit intents | API; authoritative for pre-restore intent evidence until API records the outcome in its audit boundary | API-owned encrypted immutable S3 audit-intent prefix independent of API PostgreSQL backups | Retained through restore completion and evidence recording, then follows the applicable audit-retention policy; never stored only in the API restore target |
-| API export hold registry | API; authoritative for restore-independent export hold, terminal-release, completion/expiry scheduling evidence, and recovery copies of completed materialization metadata | API-owned encrypted immutable S3 export-hold registry prefix independent of API PostgreSQL backups | Retained until every held revision and expiry schedule is terminally released or reconciled; completed-materialization recovery copies remain through the full accessible lifetime of their artifact and are not removable solely because they were reconciled or replayed; after artifact expiry or earlier durable invalidation/removal and terminal cleanup, a minimal terminal tombstone remains until no restorable API PostgreSQL backup can contain the pre-terminal state, then follows export and project-deletion cleanup |
+| API export hold registry | API; authoritative for restore-independent export hold, terminal-release, completion/expiry scheduling evidence, and recovery copies of completed materialization metadata | API-owned encrypted immutable S3 export-hold registry prefix independent of API PostgreSQL backups | Retained until every held revision and expiry schedule is terminally released or reconciled; completed-materialization recovery copies remain through the full accessible lifetime of their artifact and are not removable solely because they were reconciled or replayed; after artifact expiry or earlier durable invalidation/removal and terminal cleanup, a minimal terminal tombstone remains until no restorable API, Processor, Query, or Jobs backup can contain the pre-terminal state, then follows export and project-deletion cleanup |
 | Retention policy registry | API; authoritative for shortened-retention duration policies, their current-time effective cutoffs, and restore cleanup | API-owned encrypted immutable S3 control-registry prefix, independent of API PostgreSQL backups | The active policy persists until superseded and its effective cutoff is computed from that duration at enforcement time; superseded versioned policy records are retained for 13 months and the active policy is loaded before restored owners accept traffic |
 | Deletion tombstone registry | API; authoritative for deletion fencing and restore cleanup | API-owned encrypted immutable S3 control-registry prefix, independent of API PostgreSQL backups | Non-customer-readable keyed tombstones retained for 13 months; loaded before restored owners accept traffic |
 | Authorization revocation intents and tombstones | API; authoritative for pre-commit Query fencing and restore recovery of an authorization revocation | API-owned encrypted immutable S3 control-registry prefix, independent of API PostgreSQL backups | Unresolved intents remain until the Query fence acknowledgement and authoritative revocation commit are reconciled; resolved minimal revocation tombstones remain until no restorable API or Query backup can predate the revocation, then follow the authorization and audit lifecycle owned by #15; they contain no customer payload |
@@ -520,19 +520,22 @@ contains the current desired export holds and every terminal fence for
 completed, failed, canceled, and expired exports. For Jobs, it contains every
 desired `ExportExpiryScheduleV1`, each desired non-terminal `ExportExecutionV1`
 request with its export revision, held revision, authorized scope, range,
-selected signals, bounded watermark vectors, selection-snapshot descriptor, and
-execution state, plus every
+selected signals, the canonical partition-sequence vector, derived revision
+snapshot descriptor, selection-snapshot descriptor, and execution state, plus
+every
 terminal execution fence and its terminal revision. These entries include
-acknowledged terminal tombstones retained for the restorable-backup horizon,
-resolved authorization-revocation tombstones through the same horizon, and
-non-terminal execution requests, not only unresolved intents. All entries
+acknowledged terminal tombstones retained until no restorable API, Processor,
+Query, or Jobs backup can predate the corresponding terminal transition,
+resolved authorization-revocation tombstones through their applicable owner
+horizon, and non-terminal execution requests, not only unresolved intents. All
+entries
 include their registry generation and integrity digest. For completed exports it
 also contains the
 restore-independent recovery copy of Query's materialization metadata:
 manifest content and digest, artifact object references and digests, complete
-bounded watermark vectors, selection-snapshot descriptors and digests, and
-`snapshot_generation`. This copy is recovery evidence, not a second Query
-authority.
+canonical partition-sequence vectors, derived revision snapshot descriptors and
+digests, selection-snapshot descriptors and digests, and `snapshot_generation`.
+This copy is recovery evidence, not a second Query authority.
 The owner persists the snapshot, reconciles its local inventory, installs every
 missing desired hold, schedule, non-terminal execution request, or terminal
 fence, and removes or releases only state authorized by the current snapshot.
@@ -649,24 +652,40 @@ authenticated, versioned `ExportSnapshotHoldInstallV1` request containing
 `export_id` and `export_revision`, authorized tenant and project scope,
 `accepted_at` range, selected signals, and whether derived results are selected.
 Processor atomically installs the export-scoped hold and returns a correlated,
-versioned response with bounded watermark vectors and an immutable
-`SelectionSnapshotDescriptorV1` for per-record default-generation selections.
+versioned response with the bounded canonical partition-sequence vector, an
+immutable `SelectionSnapshotDescriptorV1` for per-record default-generation
+selections, and an immutable `DerivedRevisionSnapshotDescriptorV1` when derived
+results are selected.
 The canonical vector is keyed by every requested Processor change partition and
 contains that partition's monotonic sequence. The selection descriptor contains
 the immutable snapshot identity, request scope, fixed-size page parameters, entry
 count, page count, and a final selection digest; it does not inline one entry
 or an unbounded page-digest list for every canonical record. Processor holds promotions affecting those
 records until the export hold is released, so the selected generation cannot
-change after the descriptor is captured. The derived
-vector is keyed by every requested fully qualified aggregate key and contains
-that aggregate's `authoritative_revision`; an aggregate with no eligible state
-has an explicit empty revision entry. Entries from different partitions,
-records, or aggregates are never compared as one global order, and missing or
-conflicting descriptor coverage is invalid. API persists the bounded vectors,
-descriptor, descriptor digest, and earliest effective expiry among all held
+change after the descriptor is captured. The derived revision descriptor
+contains the immutable snapshot identity, request scope, fixed-size page
+parameters, entry count, page count, and final digest; it never inlines one
+entry or an unbounded page-digest list for every aggregate. Its pages contain
+the requested fully qualified aggregate keys and their `authoritative_revision`
+values, including explicit empty revision entries, in a deterministic order.
+Entries from different partitions, records, or aggregates are never compared as
+one global order, and missing or conflicting descriptor or page coverage is
+invalid. API persists the canonical partition-sequence vector, the selection
+descriptor and digest, and, when present, the derived revision descriptor and
+digest, plus the earliest effective expiry among all held
 canonical rows, selection entries, and derived contributions, and sends that
 bounded snapshot evidence only in the durable scheduling request to Jobs. The
-hold-install response has an explicit optional source-expiry value: it
+Query retrieves the derived revision entries through the authenticated,
+versioned `ExportDerivedRevisionSnapshotPageV1` handoff from Query to
+Processor. Each request carries the export ID and revision, descriptor ID, and
+a bounded page cursor; each response carries a bounded set of aggregate keys
+and authoritative revisions, the page digest, the next cursor, and the final
+descriptor digest when complete. Query verifies descriptor scope, cursor order,
+page digests, entry count, and final digest before materializing any derived
+row. A missing, repeated, conflicting, or unauthorized page fails the export
+without an artifact. API and Jobs persist and forward only the descriptor and
+its integrity evidence. The hold-install response has an explicit optional
+source-expiry value: it
 is absent when the requested snapshot has no eligible canonical rows, selection
 entries, or derived contributions. API records a present source-expiry deadline
 in the hold registry and uses the versioned `ExportExpiryScheduleV1` handoff
@@ -689,8 +708,9 @@ hold-release path. Jobs
 durably owns the
 export schedule, lease, retry, and cancellation state, then dispatches a
 revision-fenced `ExportExecutionV1` command to Query carrying the
-API-persisted bounded vectors, selection-snapshot descriptor and digest,
-authorized scope, range, selected signals, and `export_revision`. Query does not
+API-persisted canonical partition-sequence vector, derived revision snapshot
+descriptor and digest, selection-snapshot descriptor and digest, authorized
+scope, range, selected signals, and `export_revision`. Query does not
 execute an export from a direct API dispatch
 or infer an authoritative watermark from its local projection.
 
@@ -716,9 +736,10 @@ failed terminal fence continues to reject stale or post-terminal
 Before Query may materialize an export, Processor's
 `ExportSnapshotHoldInstallV1` response and the Jobs-to-Query
 `ExportExecutionV1` command durably establish export-scoped holds for the
-requested inputs and exact bounded watermark vectors. Each hold is keyed by
-`export_id` and `export_revision`, covers every selected canonical partition,
-selection-snapshot page entry, or derived aggregate and the Query projection, and remains until
+requested inputs and the exact canonical partition-sequence vector plus derived
+revision snapshot descriptor. Each hold is keyed by `export_id` and
+`export_revision`, covers every selected canonical partition, selection-snapshot
+page entry, or derived aggregate and the Query projection, and remains until
 the export reaches a terminal state or its earliest held-source effective
 cutoff. The source-expiry schedule must revision-fenced-cancel a non-terminal
 export by that cutoff; a hold is never permitted to retain an expired source.
@@ -735,8 +756,9 @@ in Query's owned PostgreSQL export-metadata boundary. If a hold cannot be
 installed or any vector member can no
 longer be materialized, Query emits a terminal `failed` outcome and no partial
 artifact; it never silently omits records present at request creation. After
-all requested vectors and selection pages are complete, Query emits a versioned export outcome
-containing `export_id`, `export_revision`, outcome, manifest, bounded vectors,
+all requested vectors and snapshot pages are complete, Query emits a versioned
+export outcome containing `export_id`, `export_revision`, outcome, manifest, the
+canonical partition-sequence vector, derived revision snapshot digest,
 selection-snapshot digest, and
 `snapshot_generation`; API alone records the resulting lifecycle transition and
 publishes the terminal `ExportSnapshotHoldReleaseV1` command to Processor and
@@ -753,8 +775,9 @@ the restore-independent hold registry. A cancellation intent precedes
 intent append and records that value, the export revision, effective
 export-object expiry deadline, desired `ExportExpiryScheduleV1` handoff, and a
 recovery copy of Query's materialization metadata: manifest content and digest,
-artifact object references and digests, complete bounded watermark vectors,
-selection-snapshot descriptor and digest, and `snapshot_generation`. The same
+artifact object references and digests, the canonical partition-sequence vector,
+derived revision snapshot descriptor and digest, selection-snapshot descriptor
+and digest, and `snapshot_generation`. The same
 `completed_at` is carried in
 `ExportCompletionV1`, written to API state only if the final source and
 export-object expiry checks succeed, and used for the export-object expiry
@@ -771,15 +794,18 @@ replays the idempotent `ExportCompletionV1` handoff to Jobs and resumes the same
 final expiry-and-fence check and commit-or-cleanup sequence; it does not replace
 completion with an expiry schedule. A hold or expiry schedule cannot be treated
 as orphaned merely because it is absent from the restored PostgreSQL backup.
-Terminal tombstones remain in the restore-independent registry through the
-restore horizon for backups that may contain non-terminal state. Before traffic
-is accepted, API applies each tombstone to the restored export state, preventing
-status regression or redispatch at a lower revision. Query
+Terminal tombstones remain in the restore-independent registry until no
+restorable API, Processor, Query, or Jobs backup can predate the corresponding
+terminal transition. Before traffic is accepted, API applies each tombstone to
+the restored export state, and each consuming owner applies its owner-scoped
+terminal fence, preventing status regression, redispatch, or recreation of a
+released hold at a lower revision. Query
 installs or verifies the terminal execution fence before
 releasing its projection hold, so a delayed execution command cannot recreate a
 hold or artifact after the terminal transition. The manifest records the
-complete bounded vectors, selection-snapshot descriptor digest, and Query
-`snapshot_generation`. Exports never include raw data, caches,
+canonical partition-sequence vector, derived revision snapshot digest,
+selection-snapshot descriptor digest, and Query `snapshot_generation`. Exports
+never include raw data, caches,
 or audit records.
 
 An export contains Parquet data and a JSON manifest with the schema version,
@@ -790,8 +816,8 @@ processing-generation, canonical-content-digest, and correlation-ID digests
 where those fields are represented. For derived rows, it records an ordered
 digest of aggregate keys,
 authoritative derived revisions, selected aggregate state, and deterministic
-selected-canonical-source-set digests at the corresponding derived watermark
-vector entries. For canonical rows, the manifest additionally records the
+selected-canonical-source-set digests at the corresponding derived revision
+snapshot page entries. For canonical rows, the manifest additionally records the
 deterministic digest of the authoritative default-generation selection
 materialized from the selection-snapshot descriptor; every exported canonical
 row must match that selection and its captured `selection_revision`. Query's
@@ -939,8 +965,8 @@ ordered content-aware digests; and Query projections and canonical exports
 compare the authoritative default-generation selection and canonical content
 digests at matching canonical vector entries. Derived projections and exports
 compare the selected aggregate state, aggregate revisions, and retention-windowed
-source set at matching per-aggregate derived vector entries; no scalar revision
-is used to claim cross-aggregate completion.
+source set at matching per-aggregate derived revision snapshot page entries; no
+scalar revision is used to claim cross-aggregate completion.
 Correlation-ID digests are compared only for represented records in the same
 dimension. A mismatch is not silently repaired or treated as successful
 completion.
@@ -949,6 +975,11 @@ Immutable audit events are required for break-glass access, exports, deletion,
 restoration attempts, reprocessing, retention changes, and key, replication,
 backup, or restore actions. API remains the contract-level audit writer;
 component logs and Jobs execution history do not replace the audit boundary.
+Before a non-API component begins an audited side effect, it must obtain API's
+durable acknowledgement of the versioned `AuditIntentV1`. API unavailability
+therefore fails closed for new audited side effects; after the acknowledgement,
+the component may retry outcome evidence without making its local outbox the
+authoritative audit record.
 Before committing an audit event in its PostgreSQL boundary, API durably
 appends the same immutable event, its audit sequence, and its integrity digest
 to the restore-independent encrypted S3 audit journal. The journal entry is a
@@ -1104,18 +1135,21 @@ The owning implementation contracts must make these scenarios testable:
    deadline moves earlier;
    export cancellation; cache
    invalidation; generation-matched
-   `LifecycleMutationAcknowledgementV1` outcomes; durable audit intent before a
-   required audited action and correlated outcome evidence after a crash;
+   `LifecycleMutationAcknowledgementV1` outcomes; API-acknowledged durable audit
+   intent before a required audited action, fail-closed behavior while API is
+   unavailable, and correlated outcome or explicit unknown evidence after a
+   crash;
    append-only audit rows with irreversibly destroyed project context; and
    minimal anonymous evidence.
 6. Export permitted signals and verify Parquet output, manifest checksums, row
    counts, independently recomputable canonical digest tuples, generation-aware
    canonical-content and per-aggregate revision-aware derived reconciliation
    summaries, default-generation selection, API-to-Processor correlated
-   `ExportSnapshotHoldInstallV1` request/response with complete canonical
-   partition-sequence and derived watermark vectors plus a bounded immutable
-   selection-snapshot descriptor, paginated selection pages with per-page and
-   final digests, promotion fencing for held selections, API-to-Jobs scheduling,
+   `ExportSnapshotHoldInstallV1` request/response with the canonical
+   partition-sequence vector plus bounded derived-revision and immutable
+   selection-snapshot descriptors, paginated derived-revision and selection
+   pages with per-page and final digests, promotion fencing for held selections,
+   API-to-Jobs scheduling,
    the durable completion/expiry intent and complete recovery copy before
    `ExportCompletionV1`, `completed_at` reuse from that intent through API and
    Jobs, final optional-source and export-object-expiry plus retention-fence
@@ -1150,8 +1184,9 @@ The owning implementation contracts must make these scenarios testable:
    fenced by a shortened retention policy, terminal cancellation and release
    intents persisted in the restore-independent hold registry before command
    dispatch, replay of unresolved hold and expiry intents after an API backup
-   restore, retention of terminal tombstones through the restorable-backup
-   horizon, rescheduling when the export-object cutoff shortens, and
+   restore, retention of terminal tombstones through the latest restorable
+   backup horizon across API, Processor, Query, and Jobs, rescheduling when the
+   export-object cutoff shortens, and
    invalidation when that cutoff has passed,
    Query-owned PostgreSQL export metadata, restore reconciliation of completed
    manifests, artifact references, vectors, and `snapshot_generation`, and

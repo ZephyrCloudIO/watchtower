@@ -122,8 +122,9 @@ The allowed protocol and data-flow direction is:
    but never reads another component's persistence directly.
 4. Processor consumes Ingest handoff work and relevant API changes. It
    publishes canonical and derived changes, installs the export-scoped hold and
-   returns the authoritative bounded export watermark vectors, immutable
-   selection-snapshot descriptor, and earliest held-source
+   returns the authoritative canonical partition-sequence vector, immutable
+   selection-snapshot descriptor, derived revision snapshot descriptor, and
+   earliest held-source
    expiry for API's versioned
    `ExportSnapshotHoldInstallV1` request, accepts Query's authorized
    `ProjectionRebuildV1` requests, emits a matching per-partition
@@ -210,19 +211,22 @@ The allowed protocol and data-flow direction is:
    readiness. Query installs a terminal execution fence before releasing a
    projection hold, and Jobs installs every restored terminal fence before
    re-enabling export dispatch or scheduling.
-7. Ingest, Processor, Query, and Jobs submit required evidence for break-glass,
-   restoration, key, replication, backup, and restore actions to API through a
-   versioned durable audit-evidence message. API validates the producer,
-   context, correlation, and idempotency data and is the only component that
-   appends the contract-level audit event; components do not write API audit
-   storage directly. API appends each audit event to its restore-independent
-   immutable S3 audit journal before committing the PostgreSQL audit row. The
-   journal entry is a durable event intent and replay boundary, not a second
-   audit writer. API acknowledges the event only after both boundaries are
-   durable, and after an API PostgreSQL restore replays journal entries missing
-   from the restored boundary before accepting traffic. A restore or replacement of a component's own database
-   requires a durable audit intent before the target store is replaced. For an
-   API PostgreSQL restore or replacement, the intent is written first to the
+7. Before Ingest, Processor, Query, or Jobs begins a break-glass, restoration,
+   key, replication, backup, restore, or other audited side effect, it sends a
+   versioned `AuditIntentV1` to API and waits for a durable acknowledgement.
+   API validates the producer, context, correlation, and idempotency data,
+   appends the intent to its restore-independent immutable S3 audit journal
+   before committing the PostgreSQL audit row, and acknowledges only after both
+   boundaries are durable. A new audited side effect fails closed while API is
+   unavailable; valid ordinary Ingest admission and Query reads retain their
+   existing outage behavior. After the acknowledgement, the component may
+   retain and retry local `AuditEvidenceV1` delivery, but API remains the sole
+   component that appends the contract-level audit event. If a component loses
+   its local evidence during recovery, API retains the pre-action intent and
+   records an explicit unknown outcome before considering the action complete.
+   A restore or replacement of a component's own database therefore requires
+   the API acknowledgement before the target store is replaced. For an API
+   PostgreSQL restore or replacement, the intent is written first to the
    restore-independent API audit-intent prefix and survives any API database
    backup rollback; API records the resulting evidence in its audit boundary
    after recovery.
@@ -301,21 +305,26 @@ API to Processor. API sends the canonical lowercase UUID v7 `export_id` (stored
 as PostgreSQL `uuid` in API state) and `export_revision`, authorized tenant and
 project scope, `accepted_at` range, selected signals, derived-selection flag,
 correlation identifier, and idempotency key. Processor atomically captures the
-complete authoritative canonical and derived watermark vectors, creates an
+complete authoritative canonical partition-sequence vector and creates an
 immutable `SelectionSnapshotDescriptorV1` for per-record default-generation
-selections, computes the optional earliest effective expiry among all held
-canonical rows, selection entries, and derived contributions, and installs the
-export-scoped hold before returning a correlated versioned response. The
-selection descriptor contains only bounded metadata: snapshot identity, request
-scope, fixed-size page parameters, entry count, page count, and final selection
-digest; it never inlines one entry or an unbounded page-digest list for every
-record. The source-expiry value is absent
+selections plus a `DerivedRevisionSnapshotDescriptorV1` when derived results
+are selected. It computes the optional earliest effective expiry among all
+held canonical rows, selection entries, and derived contributions, and
+installs the export-scoped hold before returning a correlated versioned
+response. The selection descriptor contains only bounded metadata: snapshot
+identity, request scope, fixed-size page parameters, entry count, page count,
+and final selection digest; it never inlines one entry or an unbounded
+page-digest list for every record. The derived revision descriptor uses the
+same bounded metadata shape and never inlines aggregate entries or an
+unbounded page-digest list. The source-expiry value is absent
 when the requested snapshot has no eligible canonical rows, selection entries,
-or derived contributions. API persists the bounded vectors, descriptor,
-descriptor digest, and present source-expiry deadline only in the durable
-scheduling request sent to Jobs; Jobs owns the lease, retry, source-expiry, and
-cancellation state and dispatches a revision-fenced `ExportExecutionV1` command
-to Query carrying that bounded snapshot evidence, the
+or derived contributions. API persists the canonical partition-sequence
+vector, the selection descriptor and digest, and, when present, the derived
+revision descriptor and digest, plus the present source-expiry deadline only in
+the durable scheduling request sent to Jobs; Jobs owns the
+lease, retry, source-expiry, and cancellation state and dispatches a
+revision-fenced `ExportExecutionV1` command to Query carrying that bounded
+snapshot evidence, the
 authorized scope, range, selected signals, and `export_revision`. Query treats
 that command as its explicit hold-install handoff, durably installing the
 matching projection hold before reading or writing an artifact. Query never
@@ -334,6 +343,18 @@ digest before materializing any canonical row. A missing, repeated, conflicting,
 or unauthorized page fails the export without an artifact. Processor remains
 the only reader of its selection state, and API and Jobs persist and forward
 only the bounded descriptor and its integrity evidence.
+
+Query obtains derived revision pages through the authenticated versioned unary
+`ExportDerivedRevisionSnapshotPageV1` Protobuf-over-HTTP interface from Query to
+Processor. Each request carries the export ID and revision, derived descriptor
+ID, and bounded page cursor; each response carries a bounded set of fully
+qualified aggregate keys and `authoritative_revision` values, including
+explicit empty revision entries, the page digest, next cursor, and final
+descriptor digest when complete. Query verifies descriptor scope, cursor order,
+page digests, entry count, and final digest before materializing any derived
+row. A missing, repeated, conflicting, or unauthorized page fails the export
+without an artifact. API and Jobs persist and forward only the descriptor and
+its integrity evidence.
 
 Jobs schedules a present source-expiry deadline from the hold-install response
 using `ExportExpiryScheduleV1` with `expiry_basis=source_retention`; no
@@ -554,16 +575,19 @@ every terminal execution fence from the restore-independent completion intent.
 The owner-scoped Jobs snapshot includes each desired `ExportExpiryScheduleV1`
 with its export revision, authoritative `completed_at`, expiry basis, and
 effective deadline, each desired non-terminal `ExportExecutionV1` request with
-its held revision, bounded watermark vectors, selection-snapshot descriptor, and
-execution state, plus every terminal execution
-fence and its terminal revision. These entries include acknowledged terminal
-tombstones retained for the restorable-backup horizon, resolved authorization-
-revocation tombstones through the same horizon, and non-terminal execution
-requests, not only unresolved intents. The Query snapshot
+its held revision, canonical partition-sequence vector, derived revision
+snapshot descriptor, selection-snapshot descriptor, and execution state, plus
+every terminal execution fence and its terminal revision. These entries include
+acknowledged terminal tombstones retained until no restorable API, Processor,
+Query, or Jobs backup can predate the corresponding terminal transition,
+resolved authorization-revocation tombstones through their applicable owner
+horizon, and non-terminal execution requests, not only unresolved intents. The
+Query snapshot
 also includes completed-export materialization recovery metadata: manifest
-content and digest, artifact object references and digests, complete bounded
-watermark vectors, selection-snapshot descriptors and digests, export and
-terminal revisions, and Query's `snapshot_generation`.
+content and digest, artifact object references and digests, canonical
+partition-sequence vectors, derived revision snapshot descriptors and digests,
+selection-snapshot descriptors and digests, export and terminal revisions, and
+Query's `snapshot_generation`.
 Query rebuilds or verifies its local export metadata from that copy before
 readiness. If the artifact or metadata is missing or conflicting, Query sends
 the authenticated `ExportRecoveryInvalidationV1` handoff to API before remaining
@@ -690,31 +714,34 @@ Processor, persisted with the durable outbox and replay metadata, published in
 the canonical change, and applied contiguously by Query. Partition sequences
 are never compared as one global order.
 
-Before a component begins a break-glass or other audited side effect, it
-durably commits an `AuditIntentV1` record in its own transactional outbox. The
+Before a component begins a break-glass, restoration, key, replication, backup,
+restore, or other audited side effect, it sends a versioned `AuditIntentV1` to
+API and waits for a durable acknowledgement. The
 intent has a canonical lowercase UUID v7 `audit_intent_id`, stored as PostgreSQL
 `uuid` wherever it is held in repository-owned relational outbox or state, plus
 producer, action, target resource, actor or workload identity, tenant and
 project context when applicable, correlation identifier, and idempotency key.
-For a restoration or replacement of non-API component PostgreSQL state, the
-intent is durably recorded in API's audit boundary and API acknowledges it
-before the target store is replaced. API PostgreSQL restoration is the
-exception: its `AuditIntentV1` record is durably written to the
-restore-independent API audit-intent prefix before the target store is
-replaced, and API records the eventual `AuditEvidenceV1` outcome after
-recovery. Other components publish at-least-once `AuditEvidenceV1` that
-references the intent and records the eventual outcome; crash recovery retries
-the evidence or records an explicit unknown outcome before considering the
-action complete.
-Neither intent nor evidence contains raw payloads or secrets. A component may
-retain and retry its local outbox while API is unavailable; API remains the sole
-audit writer and correlates the intent with its immutable audit event. API
-records each audit event in the restore-independent immutable audit journal
-before committing the PostgreSQL audit row and acknowledges only after both
-boundaries are durable. After restoring API
-PostgreSQL, API replays journal entries missing from the restored audit
-boundary before accepting traffic. Component logs and Jobs execution history
-are not audit records.
+API validates the producer, context, correlation, and idempotency data, appends
+the intent to its restore-independent immutable S3 audit journal before
+committing the PostgreSQL audit row, and acknowledges only after both
+boundaries are durable. A new audited side effect fails closed while API is
+unavailable. For a restoration or replacement of non-API component PostgreSQL
+state, the API acknowledgement is required before the target store is
+replaced. API PostgreSQL restoration is the exception: its `AuditIntentV1`
+record is durably written to the restore-independent API audit-intent prefix
+before the target store is replaced, and API records the eventual
+`AuditEvidenceV1` outcome after recovery. Other components publish at-least-once
+`AuditEvidenceV1` that references the intent and records the eventual outcome;
+crash recovery retries the evidence or API records an explicit unknown outcome
+for an intent whose local evidence was lost before considering the action
+complete.
+Neither intent nor evidence contains raw payloads or secrets. After API
+acknowledges an intent, a component may retain and retry its local evidence
+outbox while API is unavailable; API remains the sole audit writer and
+correlates the evidence with its immutable audit event. After restoring API
+PostgreSQL, API replays journal entries missing from the restored audit boundary
+before accepting traffic. Component logs and Jobs execution history are not
+audit records.
 
 ## Security and Configuration
 
@@ -839,9 +866,10 @@ become runtime acceptance criteria for the owning implementation issues:
 12. Review every ownership and failure entry for an unowned path, shared
     writer, circular dependency, or undocumented fallback.
 13. Create an export while Processor is publishing, verify the correlated
-    API-to-Processor `ExportSnapshotHoldInstallV1` request/response, bounded
-    watermark vectors and immutable selection-snapshot descriptor, authenticated
-    paginated selection pages with complete digest validation, API-to-Jobs scheduling, Jobs-to-Query
+    API-to-Processor `ExportSnapshotHoldInstallV1` request/response, canonical
+    partition-sequence vector, bounded derived-revision and immutable
+    selection-snapshot descriptors, authenticated paginated derived-revision
+    and selection pages with complete digest validation, API-to-Jobs scheduling, Jobs-to-Query
     `ExportExecutionV1` hold installation, and an export snapshot hold that
     preserves inputs through completion or fails without an artifact when any
     vector member or selection page cannot be materialized; verify terminal
@@ -893,15 +921,17 @@ become runtime acceptance criteria for the owning implementation issues:
     copy while the artifact remains accessible even after reconciliation, and
     sends `ExportRecoveryInvalidationV1` before leaving Query unready when a
     restored artifact or metadata is missing or conflicting.
-15. Perform a required component break-glass or backup action while API is
-    unavailable, verify the durable audit intent was committed before the
-    action with its relational `uuid` type, and for an API PostgreSQL restore
+15. Attempt a required component break-glass or backup action while API is
+    unavailable and verify the action fails before its side effect; with API
+    available, verify the API-durable `AuditIntentV1` acknowledgement precedes
+    the action and preserves its relational `uuid` type. Restore the component
+    from a backup predating its local evidence outbox and verify the API intent
+    remains, API records an explicit unknown outcome when evidence is lost, and
+    API alone appends the resulting audit event. For an API PostgreSQL restore,
     verify the intent is durable in the restore-independent API audit-intent
-    prefix before replacement; verify API journals each audit event before
+    prefix before replacement, and verify API journals each audit event before
     committing the PostgreSQL audit row and acknowledges only after both
-    boundaries are durable; retry correlated versioned audit evidence after
-    a crash and verify API alone appends the resulting audit event without
-    direct storage writes.
+    boundaries are durable.
 16. Revoke authorization after a native or compatible Query read, cache entry,
     or export URL exists and verify the restore-independent pre-commit intent is
     durable, Query's synchronous revision fence is installed before the
@@ -909,7 +939,7 @@ become runtime acceptance criteria for the owning implementation issues:
     admission, read, cache lookup/use, issuance, and download despite stale
     asynchronous projection state; recover after each boundary and verify an
     unresolved intent retries the fence and commit, a resolved minimal tombstone
-    remains through the restorable-backup horizon and is reapplied before API or
+    remains through the applicable restorable-backup horizon and is reapplied before API or
     Query readiness, while Query unavailability leaves API durably fail-closed
     rather than acknowledging the revocation.
 17. Restore Ingest, Processor, Query, and Jobs independently and verify each
@@ -919,10 +949,11 @@ become runtime acceptance criteria for the owning implementation issues:
     Processor and Query from backups predating an active export hold or
     completed, failed, canceled, or expired terminal execution fence and verify
     their owner-scoped hold/fence and completed-materialization snapshot
-    reconciliation completes before readiness, including every terminal
-    tombstone that can coexist with the backup, with Query rebuilding or
-    verifying manifests, artifact references, bounded vectors, selection-snapshot
-    pages and digests, and
+    reconciliation completes before readiness, including terminal tombstones
+    retained through the latest restorable backup horizon across API, Processor,
+    Query, and Jobs, with Query rebuilding or verifying manifests, artifact
+    references, the canonical vector, derived revision descriptor,
+    selection-snapshot pages, and their digests, and
     `snapshot_generation` before serving a completed export; restore Jobs from
     a backup predating an acknowledged export schedule, non-terminal execution
     request, or terminal fence and verify its owner-scoped schedule, execution,
@@ -935,8 +966,9 @@ become runtime acceptance criteria for the owning implementation issues:
     Jobs' backup predates an ordinary default-policy project creation, verify it
     recreates the missing baseline registration idempotently from the inventory
     before enabling schedules. When replacing a component store, verify the
-    applicable audit intent survives a backup that predates the replaced store,
-    including the API audit-intent prefix for an API PostgreSQL restore.
+    API-acknowledged audit intent survives a backup that predates the replaced
+    store, including the API audit-intent prefix for an API PostgreSQL restore,
+    and a lost local evidence outbox produces an explicit unknown outcome.
 
 ## Deferred Decisions and Non-Goals
 
