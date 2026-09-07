@@ -202,6 +202,22 @@ failure.
 Query stores the highest contiguous applied sequence and its digest for each
 logical partition. It rejects a gap or a conflicting equal sequence and
 replays missing sequences through the normal Processor-owned change path.
+`ProjectionRebuildV1` is the only path that may initialize a lost Query
+checkpoint. Before republishing eligible canonical changes for each requested
+partition, Processor emits a versioned `ProjectionRebuildBaselineV1` marker
+through the normal authenticated rebuild path. The marker carries the
+`rebuild_id`, partition identity, active retention cutoff, the authorized
+rebuild scope, `baseline_sequence` equal to the sequence immediately before
+the first retained change, the first retained sequence or an explicit empty
+partition, and an integrity digest over those values. Query verifies that the
+marker matches the rebuild request and current fences, stages the requested
+partition from that baseline, and atomically records the baseline as its
+highest contiguous applied sequence and marker digest before accepting
+`baseline_sequence + 1`.
+An empty retained window still records its baseline. A missing, conflicting,
+or stale marker fails the rebuild safely; it cannot reset a live partition or
+be used outside its matching rebuild. Normal live changes continue to reject
+gaps.
 Export watermark vectors use these exact partition identities and sequences;
 the vector is complete only when every requested partition is materialized
 through its requested sequence. No sequence is compared across partitions.
@@ -351,15 +367,19 @@ records and serving excess raw data, Processor durably fences queued,
 pending-handoff, and replayed work whose `accepted_at` falls outside the new
 limit, prevents canonical or derived publication, and recomputes or removes
 derived results with expired contributions, and Query denies excess reads,
-exports, and rebuilds. Before API commits an activated shortened policy, it
-identifies every non-terminal export whose requested range or selected source
-would cross the new cutoff, advances that export to `canceled` with a new
-`export_revision`, and sends the existing revision-fenced
-`ExportCancellationV1` path with `cancellation_reason=retention_policy`.
-Jobs cancels and fences its execution state, Query installs the matching
-terminal execution fence, and API does not complete policy activation or
-release the held revisions until Jobs and Query acknowledge those fences and
-the normal hold-release command is durably accepted. Processor returns a durable
+exports, and rebuilds. Before API marks a shortened policy active, it identifies
+every export whose requested range or selected source would cross the new
+cutoff. Affected non-terminal exports advance to `canceled` with a new
+`export_revision` and use the existing revision-fenced `ExportCancellationV1`
+path with `cancellation_reason=retention_policy`. An affected successful
+`completed` export whose artifact is still within its seven-day download
+lifetime instead advances to `expired` with a new `export_revision`; API
+publishes the existing Query artifact invalidation and waits for Query to make
+the artifact inaccessible before policy activation completes. Jobs cancels and
+fences non-terminal execution state, Query installs the matching terminal
+execution fence or artifact invalidation, and API does not complete policy
+activation or release any held revision until the required acknowledgements
+and normal hold-release command are durably accepted. Processor returns a durable
 `RawHandoffDispositionV1`
 message with a terminal
 `policy_rejected` disposition for each handoff rejected by the shortened policy;
@@ -486,7 +506,8 @@ project-scoped S3 export prefix. Before requesting a hold, API durably records
 an export-hold intent in its restore-independent `API export hold registry`.
 The registry is append-only, keyed by `export_id` and held
 `export_revision`, and records the authorized scope, requested range, selected
-signals, and every hold, cancellation, and release acknowledgement. At export
+signals, every hold, cancellation, and release intent, and the corresponding
+owner acknowledgements. At export
 creation, API sends Processor an
 authenticated, versioned `ExportSnapshotHoldInstallV1` request containing
 `export_id` and `export_revision`, authorized tenant and project scope,
@@ -542,12 +563,19 @@ Query. The release contains both the `held_export_revision` used to key the
 installed hold and the current terminal `export_revision`, so cancellation can
 advance the API revision without losing the old hold key. The release is
 idempotent and revision-fenced, and remains durably retryable until both owners
-confirm it. API appends the terminal release acknowledgements to the
-restore-independent hold registry. After an API database restore, API loads
-that registry before accepting traffic, reconciles the owner hold inventories,
-and retries the matching install, cancellation, or release command for every
-unresolved registry entry. A hold cannot be treated as orphaned merely because
-it is absent from the restored PostgreSQL backup. Query installs or verifies the terminal execution fence before
+confirm it. Before API persists a terminal lifecycle transition or dispatches
+its corresponding cleanup command, it appends an immutable terminal intent to
+the restore-independent hold registry. A cancellation intent precedes
+`ExportCancellationV1`; a release intent precedes
+`ExportSnapshotHoldReleaseV1`. Each intent records the desired action, held and
+terminal revisions, terminal outcome or cancellation reason, authorized scope,
+correlation identifier, and idempotency key. API appends the owner
+acknowledgements only after the corresponding durable responses. After an API
+database restore, API loads that registry before accepting traffic, treats each
+unresolved terminal intent as the desired state, reconciles the owner hold
+inventories, and retries the matching install, cancellation, or release command.
+A hold cannot be treated as orphaned merely because it is absent from the
+restored PostgreSQL backup. Query installs or verifies the terminal execution fence before
 releasing its projection hold, so a delayed execution command cannot recreate a
 hold or artifact after the terminal transition. The manifest records the complete
 vectors and Query `snapshot_generation`. Exports never include raw data, caches,
@@ -781,7 +809,11 @@ The owning implementation contracts must make these scenarios testable:
    PostgreSQL `uuid` in Processor's durable request and idempotency state, that
    canonical replay copies remain non-authoritative, have retention-homogeneous
    expiry, reconcile to their represented canonical versions, and reject a
-   changed non-key canonical field when its identity pair is unchanged.
+   changed non-key canonical field when its identity pair is unchanged; verify
+   that each requested canonical partition receives a matching
+   `ProjectionRebuildBaselineV1` marker before its first retained sequence,
+   accepts a first sequence greater than one without a false gap, and fails
+   safely when the marker is missing or mismatched.
 5. Create a project through the generation-matched `project_create`
    `LifecycleMutationV1` barrier and verify it remains unavailable until every
    applicable owner has an active baseline Jobs registration and matching
@@ -813,6 +845,9 @@ The owning implementation contracts must make these scenarios testable:
    until tombstone activation and only then its removal; restore-independent
    retention, tombstone, API audit-intent, API audit-journal, and export-hold
    registry recovery before any restored or rebuilt owner accepts traffic;
+   shortened-retention activation must expire and revoke every still-downloadable
+   completed export whose selected source crosses the new cutoff before the
+   policy becomes active;
    export cancellation; cache
    invalidation; generation-matched
    `LifecycleMutationAcknowledgementV1` outcomes; durable audit intent before a
@@ -836,6 +871,10 @@ The owning implementation contracts must make these scenarios testable:
    `ExportCancellationV1` and `ExportExecutionCancellationV1` terminal fences,
    `ExportExpiryScheduleV1` handoff carrying authoritative `completed_at`, Jobs-scheduled
    `completed_at + 7 days` expiry and the authoritative API `expired` transition,
+   early `expired` transitions and Query invalidation for completed artifacts
+   fenced by a shortened retention policy, terminal cancellation and release
+   intents persisted in the restore-independent hold registry before command
+   dispatch, and replay of unresolved intents after an API backup restore,
    Query-owned PostgreSQL export metadata, restore reconciliation of Processor
    and Query hold inventories, Query-issued URLs no longer than their remaining object lifetime and
    seven-day object expiry anchored at `completed_at`, immediate cleanup of
