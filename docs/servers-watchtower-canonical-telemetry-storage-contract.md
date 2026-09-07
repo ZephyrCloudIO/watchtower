@@ -110,7 +110,7 @@ canonical telemetry.
 | Export objects | Query; non-authoritative customer-download artifacts | Encrypted Query-owned project-scoped S3 export prefix | The earlier of seven days from API `completed_at` and the active export-object policy cutoff computed from `completed_at` for successful artifacts; artifacts from any attempt that terminates without successful `completed`, including failed or canceled attempts, are removed or made inaccessible at terminal transition, and retention-fenced or deleted-project exports are removed or made inaccessible immediately |
 | Audit events | API for contract-level lifecycle and access audit authority | API-owned append-only PostgreSQL audit boundary with erasable encrypted project-scoped context, plus a restore-independent immutable audit journal | Detailed history follows #15; every journaled event is replayable after an API database restore, and deleted projects retain only minimal anonymous evidence |
 | API restore audit intents | API; authoritative for pre-restore intent evidence until API records the outcome in its audit boundary | API-owned encrypted immutable S3 audit-intent prefix independent of API PostgreSQL backups | Retained through restore completion and evidence recording, then follows the applicable audit-retention policy; never stored only in the API restore target |
-| API export hold registry | API; authoritative for restore-independent export hold, terminal-release, and completion/expiry scheduling evidence | API-owned encrypted immutable S3 export-hold registry prefix independent of API PostgreSQL backups | Retained until every held revision and expiry schedule is terminally released, reconciled, or replayed, then follows export and project-deletion cleanup |
+| API export hold registry | API; authoritative for restore-independent export hold, terminal-release, and completion/expiry scheduling evidence | API-owned encrypted immutable S3 export-hold registry prefix independent of API PostgreSQL backups | Retained until every held revision and expiry schedule is terminally released, reconciled, or replayed; after terminal cleanup, a minimal terminal tombstone remains until no restorable API PostgreSQL backup can contain the pre-terminal state, then follows export and project-deletion cleanup |
 | Retention policy registry | API; authoritative for shortened-retention duration policies, their current-time effective cutoffs, and restore cleanup | API-owned encrypted immutable S3 control-registry prefix, independent of API PostgreSQL backups | The active policy persists until superseded and its effective cutoff is computed from that duration at enforcement time; superseded versioned policy records are retained for 13 months and the active policy is loaded before restored owners accept traffic |
 | Deletion tombstone registry | API; authoritative for deletion fencing and restore cleanup | API-owned encrypted immutable S3 control-registry prefix, independent of API PostgreSQL backups | Non-customer-readable keyed tombstones retained for 13 months; loaded before restored owners accept traffic |
 | Processing and operational state | The component performing the operation | Its own PostgreSQL database or explicitly owned state boundary | Owned and retained by that component; no cross-component writer |
@@ -226,9 +226,14 @@ requested rebuild target, Processor emits either the canonical change or a
 versioned authenticated `ProjectionRebuildSkipV1` record covering a contiguous
 range excluded by the requested range or retention state. Each skip record is
 bound to the rebuild, partition, active fences, exclusion basis, and integrity
-digest. Query verifies complete contiguous coverage, advances its checkpoint
-over both changes and skip ranges, and writes only eligible requested rows;
-missing, stale, conflicting, or unauthorized coverage fails the rebuild safely.
+digest. A rebuild that initializes or advances a partition's global checkpoint
+must cover the entire currently eligible retained window; a narrower subrange
+request is rejected for checkpoint recovery and leaves the checkpoint
+unchanged. An unexpired row omitted by a narrower request is not a valid skip.
+Query verifies complete contiguous coverage, advances its checkpoint over
+changes and retention-excluded skip ranges, and writes every eligible row in
+the covered window; missing, stale, conflicting, or unauthorized coverage
+fails the rebuild safely.
 An empty retained window still records its baseline. A missing, conflicting,
 or stale marker fails the rebuild safely; it cannot reset a live partition or
 be used outside its matching rebuild. Normal live changes continue to reject
@@ -283,11 +288,13 @@ item's exact effective expiry, so a batch may span exact expiry instants
 without losing per-item retention data. Canonical and derived replay objects
 are deleted at the earliest represented expiry; later-expiring non-authoritative
 copies may therefore be retired early, but no object can retain an expired
-item. If a normalized or enriched processing-input batch must remain available
-through a raw-retention cutoff, Processor splits or rolls the still-needed
-items into a successor before the earliest deletion deadline and carries the
-source digest and provenance forward. No replay object is retained past any
-represented item's effective cutoff.
+item. Before that deletion, Processor splits or rolls every still-eligible
+canonical replay entry and associated default-generation selection change into
+a successor and carries the source digest and provenance forward. If a
+normalized or enriched processing-input batch must remain available through a
+raw-retention cutoff, Processor uses the same rollover for its still-needed
+items before the earliest deletion deadline. No replay object is retained past
+any represented item's effective cutoff.
 Canonical replay batches are non-authoritative immutable copies, not a second
 canonical store; their separate metadata identifies the represented canonical
 versions for reconciliation and deletion. Derived aggregates are
@@ -454,8 +461,9 @@ cutoff and fences excess data; Jobs restores the associated baseline, policy,
 and deletion scheduling and fences. Before a restored or rebuilt Processor or
 Query owner becomes ready, it also obtains its owner-scoped export-fence
 snapshot from the same handoff. The snapshot contains the current desired
-export holds and unresolved terminal cancellation or failure fences, their
-export and held/terminal revisions, registry generation, and integrity digest.
+export holds and unresolved terminal fences for completed, failed, canceled,
+and expired exports, their export and held/terminal revisions, registry
+generation, and integrity digest.
 The owner persists the snapshot, reconciles its local inventory, installs every
 missing desired hold or terminal fence, and removes or releases only state
 authorized by the current snapshot. Query durably installs a terminal
@@ -573,16 +581,23 @@ vector is keyed by every requested fully qualified aggregate key and contains
 that aggregate's `authoritative_revision`; an aggregate with no eligible state
 has an explicit empty revision entry. Entries from different partitions,
 records, or aggregates are never compared as one global order, and a response
-missing any requested entry is invalid. API persists the exact vectors and sends
-them only in the durable scheduling request to Jobs. Jobs durably owns the
+missing any requested entry is invalid. API persists the exact vectors and the
+earliest effective expiry among all held canonical rows, selection entries, and
+derived contributions, and sends them only in the durable scheduling request to
+Jobs. API records that source-expiry deadline in the hold registry and uses the
+versioned `ExportExpiryScheduleV1` handoff with `expiry_basis=source_retention`;
+Jobs schedules an idempotent `ExportExpiryV1` delivery for the deadline. For a
+non-terminal export, API treats that delivery as source-retention expiry,
+appends a cancellation intent, advances the export revision, and follows the
+existing revision-fenced cancellation and hold-release path. Jobs durably owns the
 export schedule, lease, retry, and cancellation state, then dispatches a
 revision-fenced `ExportExecutionV1` command to Query carrying the
 API-persisted vectors, authorized scope, range, selected signals, and
 `export_revision`. Query does not execute an export from a direct API dispatch
 or infer an authoritative watermark from its local projection.
 
-When API records cancellation, including cancellation caused by an activated
-shortened retention policy, it sends the revision-fenced
+When API records cancellation, including cancellation caused by ordinary source
+expiry or an activated shortened retention policy, it sends the revision-fenced
 `ExportCancellationV1` command to Jobs with the held and terminal export
 revisions and the cancellation reason. Jobs durably cancels and fences queued, leased, retry, and in-flight
 execution state, then sends Query a matching
@@ -606,7 +621,10 @@ Before Query may materialize an export, Processor's
 requested inputs and exact watermark vectors. Each hold is keyed by `export_id`
 and `export_revision`, covers every selected canonical partition, selection
 vector entry, or derived aggregate and the Query projection, and remains until
-the export reaches a terminal state. Processor and Query report their held
+the export reaches a terminal state or its earliest held-source effective
+cutoff. The source-expiry schedule must revision-fenced-cancel a non-terminal
+export by that cutoff; a hold is never permitted to retain an expired source.
+Processor and Query report their held
 `(export_id,
 export_revision)` inventory through the authenticated versioned
 `ExportHoldInventoryV1` reconciliation interface. Query records
@@ -635,14 +653,19 @@ the restore-independent hold registry. A cancellation intent precedes
 transition, it appends a completion/expiry intent containing the authoritative
 `completed_at`, export revision, effective export-object expiry deadline, and
 desired `ExportExpiryScheduleV1` handoff. Each intent records the desired action,
-held and terminal revisions, terminal outcome or cancellation reason, authorized
-scope, correlation identifier, and idempotency key. API appends the owner
+held and terminal revisions, terminal outcome or cancellation reason, source-
+expiry deadline and basis when present, authorized scope, correlation
+identifier, and idempotency key. API appends the owner
 acknowledgements only after the corresponding durable responses. After an API
 database restore, API loads that registry before accepting traffic, treats each
 unresolved terminal intent as the desired state, reconciles the owner hold
 inventories, and retries the matching install, cancellation, release, or
 expiry-schedule command. A hold or expiry schedule cannot be treated as
-orphaned merely because it is absent from the restored PostgreSQL backup. Query
+orphaned merely because it is absent from the restored PostgreSQL backup.
+Terminal tombstones remain in the restore-independent registry through the
+restore horizon for backups that may contain non-terminal state. Before traffic
+is accepted, API applies each tombstone to the restored export state, preventing
+status regression or redispatch at a lower revision. Query
 installs or verifies the terminal execution fence before
 releasing its projection hold, so a delayed execution command cannot recreate a
 hold or artifact after the terminal transition. The manifest records the complete
@@ -678,8 +701,9 @@ work, so a late completion cannot restore a canceled export and a late failure
 cannot overwrite a successful one. Query stops or invalidates the associated
 artifact when cancellation is fenced. When API persists a successful
 `completed` transition, it sends Jobs an idempotent `ExportExpiryScheduleV1`
-request containing the export ID, current export revision, and authoritative
-`completed_at` and the effective export-object expiry deadline. The deadline is
+request with `expiry_basis=export_object` containing the export ID, current
+export revision, authoritative `completed_at`, and the effective export-object
+expiry deadline. The deadline is
 the earlier of `completed_at + 7 days` and the active export-object policy
 cutoff, using `completed_at` as the export-object lifecycle anchor. Jobs
 persists that timestamp and schedules the idempotent `ExportExpiryV1` handoff
@@ -893,9 +917,11 @@ The owning implementation contracts must make these scenarios testable:
    that each requested canonical partition receives a matching
    `ProjectionRebuildBaselineV1` marker before its first retained sequence,
    accepts a first sequence greater than one without a false gap, emits
-   contiguous authenticated `ProjectionRebuildSkipV1` coverage for excluded or
-   expired interleaved sequences, advances Query's checkpoint without projecting
-   skipped rows, and fails safely when coverage is missing, stale, or mismatched.
+   contiguous authenticated `ProjectionRebuildSkipV1` coverage only for
+   retention-excluded interleaved sequences, writes every eligible row before
+   advancing the global checkpoint, leaves that checkpoint unchanged for an
+   incomplete subrange request, and fails safely when coverage is missing,
+   stale, or mismatched.
 5. Create a project through the generation-matched `project_create`
    `LifecycleMutationV1` barrier and verify it remains unavailable until every
    applicable owner has an active baseline Jobs registration and matching
@@ -931,8 +957,9 @@ The owning implementation contracts must make these scenarios testable:
    retention, tombstone, API audit-intent, API audit-journal, and export-hold/
    expiry-intent registry recovery before any restored or rebuilt owner accepts
    traffic; verify restored Processor and Query owners also reconcile their
-   owner-scoped export holds and terminal execution fences from the API
-   registry snapshot before readiness, including Jobs rebuilding a missing
+   owner-scoped export holds and completed, failed, canceled, and expired
+   terminal execution fences from the API registry snapshot before readiness,
+   including Jobs rebuilding a missing
    default-policy baseline registration from the active-project inventory;
    shortened-retention activation must expire and revoke every still-downloadable
    completed export whose selected source or export-object cutoff crosses the new
@@ -961,15 +988,18 @@ The owning implementation contracts must make these scenarios testable:
    revision when cancellation advances the export revision, the API-to-Jobs
    `ExportCancellationV1`, `ExportFailureV1`, and
    `ExportExecutionCancellationV1` terminal fences,
-   `ExportExpiryScheduleV1` handoff carrying authoritative `completed_at`, the
-   restore-independent completion/expiry intent, Jobs-scheduled expiry at the
+   `ExportExpiryScheduleV1` handoff carrying an explicit expiry basis,
+   authoritative `completed_at` for completed artifacts, the
+   restore-independent completion/expiry intent, source-expiry cancellation at
+   the earliest held-source cutoff, Jobs-scheduled artifact expiry at the
    earlier of `completed_at + 7 days` and the export-object policy cutoff, and
    the authoritative API `expired` transition,
    early `expired` transitions and Query invalidation for completed artifacts
    fenced by a shortened retention policy, terminal cancellation and release
    intents persisted in the restore-independent hold registry before command
    dispatch, replay of unresolved hold and expiry intents after an API backup
-   restore, rescheduling when the export-object cutoff shortens, and
+   restore, retention of terminal tombstones through the restorable-backup
+   horizon, rescheduling when the export-object cutoff shortens, and
    invalidation when that cutoff has passed,
    Query-owned PostgreSQL export metadata, owner-startup reconciliation of
    Processor and Query hold/fence inventories before readiness, Query-issued
