@@ -62,7 +62,7 @@ They have no public business routes.
 | Component | Authoritative state, owned projection, or cache |
 | --- | --- |
 | Ingest | Raw accepted records, recoverable processing handoff/outbox, and local projections of API-published security or control changes. |
-| API | Control-plane state, artifact authority, versioned change events describing those authoritative changes, the append-only contract-level audit event boundary, and restore-independent audit journal and export-hold/expiry registry state. |
+| API | Control-plane state, artifact authority, versioned change events describing those authoritative changes, the append-only contract-level audit event boundary, and restore-independent audit, export-hold/expiry, and authorization-revocation registry state. |
 | Processor | Canonical telemetry, processing state, and derived domain aggregates. |
 | Query | Query-owned read projections, search and analytical indexes, PostgreSQL export metadata including `snapshot_generation`, caches, and provider query orchestration state. |
 | Jobs | Durable scheduling requests, leases, retry state, dead-letter state, and execution history. |
@@ -129,9 +129,12 @@ The allowed protocol and data-flow direction is:
    each rebuild stream, and emits contiguous change or authenticated skip
    coverage for every subsequent sequence in that stream. A retention-expired
    staged live write uses an idempotent no-row `CanonicalChangeSkipV1` marker
-   for its reserved sequence, so live consumers also receive contiguous
-   coverage and persists each live skip marker in the retained canonical replay
-   class so it remains available through the replay horizon. It publishes a
+   for its reserved sequence only when no authoritative ClickHouse row exists;
+   if the row was committed before publication failed, Processor reconciles and
+   publishes the row instead. Live consumers therefore receive contiguous
+   coverage, and Processor persists each live skip marker in the retained
+   canonical replay class so it remains available through the replay horizon.
+   It publishes a
    terminal
    `RawHandoffDispositionV1` to Ingest for every completed,
    shortened-policy-rejected, or default-expired raw handoff when it remains
@@ -179,10 +182,11 @@ The allowed protocol and data-flow direction is:
    registration and returns its `purge_registration_id` and paused state; the
    owner persists that result with its pending fence before returning a matching
    `phase=prepared` `LifecycleMutationAcknowledgementV1`. Jobs records its own
-   scheduling registration in the same transaction. After API commits
-   activation, each owner sends the matching registration ID back to Jobs for
+   scheduling registration in the same transaction. While the generation is
+   non-active, each owner sends the matching registration ID back to Jobs for
    activation; Jobs returns the enabled state before the owner acknowledges
-   `phase=active`. Owners use the matching registration ID for activation or
+   `phase=active`. API commits activation only after every required active
+   acknowledgement, and owners use the matching registration ID for activation or
    idempotent cleanup. Each of Ingest, Processor, Query, and Jobs obtains the current
    retention-policy and deletion-tombstone snapshots through an authenticated
    `ControlRegistrySnapshotV1` request to API before readiness or after
@@ -356,15 +360,19 @@ vectors, and `snapshot_generation`. The recovery copy remains in the registry
 until the associated artifact expires or is durably invalidated and removed;
 reconciliation or replay alone does not permit cleanup. The same
 `completed_at` is carried in
-`ExportCompletionV1`, written to API state only if the final source-expiry
-check succeeds, and used for the export-object expiry schedule. Processor and
+`ExportCompletionV1`, written to API state only if the final source and
+export-object expiry checks succeed, and used for the export-object expiry
+schedule. Processor and
 Query provide an authenticated versioned
 `ExportHoldInventoryV1` reconciliation
 response containing each held `export_id`, held revision, and registry digest;
 they do not expose their storage. API loads its registry before accepting
 traffic after an API database restore, reconciles both inventories, and retries
-the matching hold install, cancellation, release, or expiry-schedule command for
-every unresolved intent. A hold or expiry schedule is not orphaned merely
+the matching completion, hold install, cancellation, release, or expiry-schedule
+command for every unresolved intent. For an unresolved completion intent, API
+replays the idempotent `ExportCompletionV1` handoff to Jobs and resumes the same
+final expiry-and-fence check and commit-or-cleanup sequence; it does not replace
+completion with an expiry schedule. A hold or expiry schedule is not orphaned merely
 because it is absent from the restored API PostgreSQL backup. Terminal export
 tombstones remain in the restore-independent registry through the restore
 horizon for backups that may contain non-terminal state. Before traffic is
@@ -382,12 +390,13 @@ After the completion intent is durable, API sends Jobs an idempotent versioned
 `export_revision` values, authorized scope, the intent's `completed_at`,
 correlation, and idempotency context. Jobs durably marks the corresponding
 execution terminal, fences queued, leased, retry, and in-flight work, and
-acknowledges the completion. API then atomically rechecks that the current time
-is before the persisted source-expiry deadline and that no newer retention,
-deletion, cancellation, or authorization fence applies immediately before
-committing `completed`. A failed check does not expose the artifact and follows
-the revision-fenced source-expiry cancellation, artifact cleanup, and
-hold-release path. Only after the check succeeds does API commit the
+acknowledges the completion. API then atomically rechecks that the optional
+source-expiry deadline and the persisted export-object expiry deadline have not
+passed, and that no newer retention, deletion, cancellation, or authorization
+fence applies immediately before committing `completed`. A failed check does not
+expose the artifact and follows the corresponding revision-fenced expiry
+cancellation, artifact cleanup, and hold-release path. Only after the check
+succeeds does API commit the
 customer-visible transition and send Jobs an idempotent versioned
 `ExportExpiryScheduleV1` request with
 `expiry_basis=export_object` containing `export_id`, the current
@@ -543,31 +552,34 @@ barrier.
 During prepare, Jobs durably persists the registration in `paused` state and returns its
 `purge_registration_id`; the owner persists that ID and the paused confirmation
 before acknowledging the lifecycle prepare. Jobs handles its own local
-registration in the same durable operation. After API commits the active
-generation, each owner sends the same registration ID with
+registration in the same durable operation. While the generation remains
+non-active, each owner sends the same registration ID with
 `registration_phase=activate`; Jobs transitions the registration to `active`,
 enables the schedule, and returns that state before the owner acknowledges
-`phase=active`. The correlated
+`phase=active`. API commits the active generation only after every required
+active acknowledgement matches; owners and Jobs may perform irreversible work
+only after both the active-registration acknowledgement and that API commit.
+The correlated
 `LifecycleMutationAcknowledgementV1` carries the owner, mutation kind,
 generation, phase, `fence_installed`, `purge_registration_id`, registration
 state, and the acknowledged policy digest when applicable.
 `purge_registration_id` is a canonical lowercase UUID v7 at this boundary and
-is stored as PostgreSQL `uuid` in Jobs state. API commits the
-active registry generation only after all required `phase=prepared`
-acknowledgements match; only then may the activation handshake enable purge,
-anonymization, raw retirement, or other irreversible work. API returns
-`accepted_pending` while either phase is incomplete and reports success only
-after all required active acknowledgements match. Stale, conflicting, or
-incomplete acknowledgements fail closed, and no purge or anonymization caused
-by the pending mutation may run from a pending registration. Previously active
-baseline and retention-policy schedules continue to enforce their own effective
-cutoffs during a stalled prepare.
+is stored as PostgreSQL `uuid` in Jobs state. API returns `accepted_pending`
+while either phase is incomplete and reports success only after all required
+active acknowledgements match and the active generation is committed. Stale,
+conflicting, or incomplete acknowledgements fail closed, and no purge or
+anonymization caused by the pending mutation may run from a pending registration.
+Previously active baseline and retention-policy schedules continue to enforce
+their own effective cutoffs during a stalled prepare or activation.
 
 The authorization-revocation fence is a versioned unary Protobuf-over-HTTP call
-under `/internal/v1` from API to Query. API sends the affected actor, project or
-export scope, the monotonic authorization revision, correlation identifier, and
-idempotency key before acknowledging the revocation. Query durably persists the
-highest fence and acknowledges it; every affected native and compatible Query
+under `/internal/v1` from API to Query. API first appends a durable pre-commit
+revocation intent to its restore-independent authorization-revocation registry,
+then sends the affected actor, project or export scope, the monotonic
+authorization revision, correlation identifier, and idempotency key. Query
+durably persists the highest fence and acknowledges it; only then may API commit
+the authoritative revocation or acknowledge it. API reloads unresolved intents
+before accepting traffic after recovery and retries the fence and commit. Every affected native and compatible Query
 admission, read, provider/index, cache lookup, cache use, gateway issuance, and
 download request must reject authorization at or below that fence until the
 matching security projection revision is installed, even when the asynchronous
@@ -746,10 +758,12 @@ become runtime acceptance criteria for the owning implementation issues:
    until each applicable owner registers an active baseline schedule with Jobs
    and returns an active acknowledgement. Redeliver a retention or deletion
    request and verify each data owner uses `LifecyclePurgeRegistrationV1` to
-   obtain a durable paused Jobs registration before acknowledging prepare, sends
-   the matching registration ID for activation, and receives the enabled state
-   before acknowledging active. Activation commits the barrier before purge or
-   anonymization, and an unavailable owner leaves a durable `accepted_pending`
+   obtain a durable paused Jobs registration before acknowledging prepare, keeps
+   the generation non-active while sending the matching registration ID for
+   activation, and receives the enabled state before acknowledging active. API
+   commits the active barrier only after every activation acknowledgement, and
+   purge or anonymization cannot run before that commit; an unavailable owner
+   leaves a durable `accepted_pending`
    mutation; verify canonical lowercase UUID v7 purge-registration IDs and
    baseline default-lifecycle schedules, while previously active baseline and
    retention-policy schedules continue during a stalled deletion prepare and
@@ -788,7 +802,8 @@ become runtime acceptance criteria for the owning implementation issues:
 14. Race export cancellation and terminal completion or failure, then verify
     the completion/expiry intent and recovery copy are durable before
     `ExportCompletionV1`, its `completed_at` is reused through API and Jobs,
-    and the final source-expiry and retention-fence check occurs immediately
+    and the final optional-source, export-object-expiry, and retention-fence
+    check occurs immediately
     before API commits `completed`; Jobs then terminalizes execution before API
     exposes completion or schedules object expiry, and cancels and fences queued,
     leased, retry, and in-flight execution,
@@ -800,12 +815,16 @@ become runtime acceptance criteria for the owning implementation issues:
     through the `ExportExpiryScheduleV1` handoff with an explicit expiry basis
     at the earlier of the
     seven-day default and export-object policy cutoff. A restored API replays an
-    unresolved schedule. An export whose held source reaches its ordinary
+    unresolved completion handoff before resuming its final check and commit;
+    it replays an unresolved expiry schedule only after completion succeeds. An
+    export whose held source reaches its ordinary
     effective cutoff before completion is revision-fenced-canceled and its
     hold is released only after the Jobs and Query fences are acknowledged;
     completion at or after the persisted source deadline is rejected regardless
-    of delivery order. An empty export has no source deadline or source-retention
-    schedule but still receives ordinary completed-object expiry. Shortened-
+    of delivery order. Completion after the export-object deadline is rejected
+    and cleaned up. An empty export has no source deadline or source-retention
+    schedule or source-deadline check but still receives ordinary
+    completed-object expiry. Shortened-
     retention activation expires and invalidates an otherwise downloadable
     completed artifact whose selected source crosses the new cutoff before the
     mutation becomes active, reschedules existing artifacts whose export-object
@@ -826,10 +845,13 @@ become runtime acceptance criteria for the owning implementation issues:
     a crash and verify API alone appends the resulting audit event without
     direct storage writes.
 16. Revoke authorization after a native or compatible Query read, cache entry,
-    or export URL exists and verify the synchronous revision fence blocks every
-    affected admission, read, cache lookup/use, issuance, and download despite
-    stale asynchronous projection state; when Query is unavailable, API fails
-    closed rather than acknowledging the revocation.
+    or export URL exists and verify the restore-independent pre-commit intent is
+    durable, Query's synchronous revision fence is installed before the
+    authoritative revocation commit, and the fence blocks every affected
+    admission, read, cache lookup/use, issuance, and download despite stale
+    asynchronous projection state; recover after each boundary and verify an
+    unresolved intent retries the fence and commit, while Query unavailability
+    leaves API durably fail-closed rather than acknowledging the revocation.
 17. Restore Ingest, Processor, Query, and Jobs independently and verify each
     obtains and persists current retention-policy, deletion-tombstone, and
     active-project baseline-registration snapshots before readiness; restore

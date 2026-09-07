@@ -113,6 +113,7 @@ canonical telemetry.
 | API export hold registry | API; authoritative for restore-independent export hold, terminal-release, completion/expiry scheduling evidence, and recovery copies of completed materialization metadata | API-owned encrypted immutable S3 export-hold registry prefix independent of API PostgreSQL backups | Retained until every held revision and expiry schedule is terminally released or reconciled; completed-materialization recovery copies remain through the full accessible lifetime of their artifact and are not removable solely because they were reconciled or replayed; after artifact expiry or earlier durable invalidation/removal and terminal cleanup, a minimal terminal tombstone remains until no restorable API PostgreSQL backup can contain the pre-terminal state, then follows export and project-deletion cleanup |
 | Retention policy registry | API; authoritative for shortened-retention duration policies, their current-time effective cutoffs, and restore cleanup | API-owned encrypted immutable S3 control-registry prefix, independent of API PostgreSQL backups | The active policy persists until superseded and its effective cutoff is computed from that duration at enforcement time; superseded versioned policy records are retained for 13 months and the active policy is loaded before restored owners accept traffic |
 | Deletion tombstone registry | API; authoritative for deletion fencing and restore cleanup | API-owned encrypted immutable S3 control-registry prefix, independent of API PostgreSQL backups | Non-customer-readable keyed tombstones retained for 13 months; loaded before restored owners accept traffic |
+| Authorization revocation intents | API; authoritative only for pre-commit Query fencing and recovery of an authorization revocation until the API control-plane commit is reconciled | API-owned encrypted immutable S3 control-registry prefix, independent of API PostgreSQL backups | Retained until the Query fence acknowledgement and authoritative revocation commit are both reconciled, then follows the authorization and audit lifecycle owned by #15; it contains no customer payload |
 | Processing and operational state | The component performing the operation | Its own PostgreSQL database or explicitly owned state boundary | Owned and retained by that component; no cross-component writer |
 
 Jobs owns scheduling, leases, execution history, and other job operational
@@ -199,14 +200,19 @@ canonical-content digest, and a durable outbox intent in one Processor-local
 PostgreSQL transaction. A reconciler then idempotently commits the staged row
 to ClickHouse using the partition and sequence identity. After verifying the
 same digest, it marks the staging record `clickhouse_committed`; only that
-state is eligible for durable outbox publication. If the current-cutoff check
-fails before the row can be committed or published, the reconciler instead
-marks the staged write retention-expired and publishes an idempotent,
-no-row `CanonicalChangeSkipV1` marker for the reserved sequence through the
-same canonical-change path. The marker carries the partition, sequence,
-retention cutoff, expiry basis, marker integrity digest, and idempotency context;
-Query applies it as
-contiguous coverage without creating a row. Processor persists each live skip as
+state is eligible for durable outbox publication. Processor performs the
+current-cutoff check before committing the row. If that check fails before
+commit, the reconciler marks the staged write retention-expired and, after
+proving that no authoritative row exists, publishes an idempotent no-row
+`CanonicalChangeSkipV1` marker for the reserved sequence through the same
+canonical-change path. If ClickHouse committed the row before a cutoff or
+publication failure, recovery verifies its digest, retains the row, marks the
+staging record `clickhouse_committed`, and publishes the actual canonical
+change; it never publishes a skip while the row exists. A skip after a
+reconciliation attempt is valid only after the row is durably removed and its
+absence is verified. The marker carries the partition, sequence, retention
+cutoff, expiry basis, marker integrity digest, and idempotency context; Query
+applies it as contiguous coverage without creating a row. Processor persists each live skip as
 an immutable no-row sequence tombstone in the retained canonical replay class.
 The tombstone remains replayable through the full 90-day horizon from the
 reserved sequence's source `accepted_at`, even after that source expires or MSK
@@ -406,20 +412,21 @@ operation. Every durable purge registration has a `purge_registration_id` that
 is a canonical lowercase UUID v7 at component boundaries and a PostgreSQL
 `uuid` in Jobs state.
 
-After every required prepared acknowledgement arrives, API atomically commits
-the matching active policy or tombstone generation and sends the activate phase.
-Each owner then resends `LifecyclePurgeRegistrationV1` with
+After every required prepared acknowledgement arrives, API keeps the matching
+policy or tombstone generation non-active and sends the activate phase. Each
+owner then resends `LifecyclePurgeRegistrationV1` with
 `registration_phase=activate` and the generation-matched
 `purge_registration_id`. Jobs transitions that paused registration to
 `active`, enables the schedule, and returns the matching active state; Jobs
-performs the same transition for its local registration. Only after that
-acknowledgement may an owner report `phase=active` or perform irreversible
-retention or deletion work. API reports successful mutation only after every
-required active acknowledgement confirms the matching generation, installed
-fence, and enabled purge registration. If preparation or activation is
-incomplete, the durable mutation remains `accepted_pending` and is retried;
-API does not return a failed outcome after a destructive effect could have
-started. A pending or active mutation still fails closed for dependent API
+performs the same transition for its local registration. API commits the active
+policy or tombstone generation only after every required active acknowledgement
+confirms the matching generation, installed fence, and enabled purge
+registration. Owners and Jobs may perform irreversible retention or deletion
+work only after both that active-registration acknowledgement and the API
+active-generation commit. If preparation or activation is incomplete, the
+generation remains non-active, the durable mutation remains `accepted_pending`,
+and activation is retried; previously active schedules continue enforcing their
+own cutoffs. A pending or active mutation still fails closed for dependent API
 operations until the required owner acknowledgements exist.
 
 After activation, each owner computes the earlier of its class-default cutoff
@@ -525,11 +532,12 @@ work and republishing, Query rejects new reads, restoration, exports, and
 projection rebuilds, and Jobs fences new non-purge work. A pending deletion
 registration does not dispatch deletion-specific purge or anonymization during
 prepare; previously active baseline and retention-policy schedules continue to
-enforce their own effective cutoffs. After API commits the active tombstone,
-Jobs enables the versioned project-purge schedule and dispatches it; Ingest,
-Processor, Query, and Jobs return `phase=active` acknowledgements after the
-active fence and purge registration are installed. API fails closed until the
-complete active barrier exists. Jobs cancels and fences queued, retry,
+enforce their own effective cutoffs. While the tombstone remains non-active,
+each owner and Jobs activates its prepared purge registration and returns a
+generation-matched `phase=active` acknowledgement. API commits the active
+tombstone only after every required active acknowledgement; only then does Jobs
+enable the versioned project-purge schedule and dispatch it. API fails closed
+until the complete active barrier exists. Jobs cancels and fences queued, retry,
 dead-letter, dispatchable, leased, and in-flight non-purge project work,
 dispatches idempotent owner-specific purge or anonymization commands, retries
 them until completion, and rejects late non-purge execution outcomes so they
@@ -636,9 +644,12 @@ revision-fenced cancellation and hold-release path. API also rejects a successfu
 Query completion outcome received at or after the persisted source-expiry
 deadline, regardless of delivery order or whether the delayed expiry message has
 arrived. After Jobs acknowledges `ExportCompletionV1`, API performs an atomic
-current-time check of that deadline and all active retention and deletion fences
-immediately before committing `completed`; a failed check uses the same
-source-expiry cancellation and fencing path and never exposes the artifact. Jobs
+current-time check that the optional source-expiry deadline has not passed, that
+the persisted export-object expiry deadline has not passed, and that no newer
+retention, deletion, cancellation, or authorization fence applies immediately
+before committing `completed`; a failed check does not expose the artifact and
+uses the corresponding revision-fenced expiry cancellation, cleanup, and
+hold-release path. Jobs
 durably owns the
 export schedule, lease, retry, and cancellation state, then dispatches a
 revision-fenced `ExportExecutionV1` command to Query carrying the
@@ -706,17 +717,21 @@ export-object expiry deadline, desired `ExportExpiryScheduleV1` handoff, and a
 recovery copy of Query's materialization metadata: manifest content and digest,
 artifact object references and digests, complete watermark vectors, and
 `snapshot_generation`. The same `completed_at` is carried in
-`ExportCompletionV1`, written to API state only if the final source-expiry
-check succeeds, and used for the export-object expiry schedule. Each intent records the desired action, held and terminal
+`ExportCompletionV1`, written to API state only if the final source and
+export-object expiry checks succeed, and used for the export-object expiry
+schedule. Each intent records the desired action, held and terminal
 revisions, terminal outcome or cancellation reason, source-expiry deadline and
 basis when present, authorized scope, correlation identifier, and idempotency
 key. API appends the owner
 acknowledgements only after the corresponding durable responses. After an API
 database restore, API loads that registry before accepting traffic, treats each
 unresolved terminal intent as the desired state, reconciles the owner hold
-inventories, and retries the matching install, cancellation, release, or
-expiry-schedule command. A hold or expiry schedule cannot be treated as
-orphaned merely because it is absent from the restored PostgreSQL backup.
+inventories, and retries the matching completion, install, cancellation,
+release, or expiry-schedule command. For an unresolved completion intent, API
+replays the idempotent `ExportCompletionV1` handoff to Jobs and resumes the same
+final expiry-and-fence check and commit-or-cleanup sequence; it does not replace
+completion with an expiry schedule. A hold or expiry schedule cannot be treated
+as orphaned merely because it is absent from the restored PostgreSQL backup.
 Terminal tombstones remain in the restore-independent registry through the
 restore horizon for backups that may contain non-terminal state. Before traffic
 is accepted, API applies each tombstone to the restored export state, preventing
@@ -783,11 +798,14 @@ interface with the authorized actor, action, project, export context, and capped
 lifetime. Query independently validates the caller, current authorization
 projection, export ownership, and lifecycle state before issuing the opaque
 gateway URL and again for every download request; the URL expiry never exceeds
-object expiry. For immediate revocation, API and Query use a synchronous
-revision-fenced handoff: every issued URL carries the API authorization
-revision, and API waits for Query to durably install an
-`AuthorizationRevocationFenceV1` revision before acknowledging an actor,
-project, or export revocation. Query rejects every affected native and
+object expiry. For immediate revocation, API first appends a durable pre-commit
+revocation intent to its restore-independent authorization-revocation registry,
+then uses a synchronous revision-fenced handoff: every issued URL carries the
+API authorization revision, and API waits for Query to durably install an
+`AuthorizationRevocationFenceV1` revision before committing the authoritative
+revocation or acknowledging an actor, project, or export revocation. API loads
+unresolved revocation intents before accepting traffic after recovery and
+retries the fence and authoritative commit. Query rejects every affected native and
 compatible admission, read, provider/index, cache lookup, cache use, issuance,
 or download whose authorization revision is at or below the installed fence
 until the matching security projection revision is installed, regardless of
@@ -955,9 +973,11 @@ The owning implementation contracts must make these scenarios testable:
 2. Fail S3, PostgreSQL, ClickHouse, and MSK operations before and after local
    commits; verify no false successful acceptance and idempotent recovery,
    including Processor canonical staging before and after ClickHouse commit and
-   outbox publication, with no duplicate or conflicting sequence, and verify an
-   expired staged write publishes and durably retains an idempotent
-   `CanonicalChangeSkipV1` marker through the full canonical replay horizon, so
+   outbox publication, with no duplicate or conflicting sequence; verify a row
+   committed before a cutoff or publication failure is reconciled and published
+   as a row rather than a skip, while an absent row alone may produce the
+   idempotent `CanonicalChangeSkipV1` marker through the full canonical replay
+   horizon, so
    a Query outage longer than the seven-day MSK window cannot leave an
    available-watermark gap blocking later changes.
 3. Verify raw-object immutability, SHA-256 and size reconciliation, required
@@ -999,9 +1019,10 @@ The owning implementation contracts must make these scenarios testable:
    `LifecyclePurgeRegistrationV1` handoff and cannot return a prepare
    acknowledgement until its matching paused Jobs registration is durable,
    require each owner to activate that registration with Jobs before returning
-   `phase=active`, install only non-destructive pending fences, activation
-   commits the barrier before any purge or anonymization, and an unavailable
-   owner leaves the mutation durably `accepted_pending` rather than failing
+   `phase=active`, keep the generation non-active until every activation
+   acknowledgement matches, install only non-destructive pending fences, commit
+   the active barrier only after all registrations are active and before any
+   purge or anonymization, and an unavailable owner leaves the mutation durably `accepted_pending` rather than failing
    after destructive work starts; while deletion remains `accepted_pending`,
    verify previously active baseline and retention-policy schedules continue
    enforcing their effective cutoffs while deletion-specific purge remains
@@ -1023,8 +1044,9 @@ The owning implementation contracts must make these scenarios testable:
    expiry, including the activation-relative deadline for data made newly
    ineligible by a shortened policy; retention of the active project policy
    until tombstone activation and only then its removal; restore-independent
-   retention, tombstone, API audit-intent, API audit-journal, and export-hold/
-   expiry-intent registry recovery before any restored or rebuilt owner accepts
+   retention, tombstone, API audit-intent, API audit-journal, export-hold/
+   expiry-intent, and authorization-revocation-intent registry recovery before
+   any restored or rebuilt owner accepts
    traffic; verify restored Processor and Query owners also reconcile their
    owner-scoped export holds and completed, failed, canceled, and expired
    terminal execution fences from the API registry snapshot before readiness,
@@ -1049,7 +1071,8 @@ The owning implementation contracts must make these scenarios testable:
    vectors, promotion fencing for held selections, API-to-Jobs scheduling,
    the durable completion/expiry intent and complete recovery copy before
    `ExportCompletionV1`, `completed_at` reuse from that intent through API and
-   Jobs, final source-expiry and retention-fence checking immediately before
+   Jobs, final optional-source and export-object-expiry plus retention-fence
+   checking immediately before
    the API completion commit, and `ExportCompletionV1` terminalization of Jobs
    execution before API exposes completion or schedules object expiry,
    Jobs-to-Query
@@ -1065,9 +1088,13 @@ The owning implementation contracts must make these scenarios testable:
    `ExportExpiryScheduleV1` handoff carrying an explicit expiry basis,
    absent source-expiry for an empty export with no source-retention schedule,
    authoritative `completed_at` for completed artifacts, the
-   restore-independent completion/expiry intent, source-expiry cancellation at
+   restore-independent completion/expiry intent, replay of an unresolved
+   completion handoff before expiry scheduling after API restore, source-expiry
+   cancellation at
    the earliest held-source cutoff, rejection of completion outcomes at or
-   after that persisted source deadline regardless of delivery order,
+   after that persisted source deadline regardless of delivery order, rejection
+   and cleanup when the export-object deadline has passed, and successful
+   completion of an empty export without a source-retention check,
    Jobs-scheduled artifact expiry at the
    earlier of `completed_at + 7 days` and the export-object policy cutoff, and
    the authoritative API `expired` transition,
@@ -1087,7 +1114,9 @@ The owning implementation contracts must make these scenarios testable:
    Query-issued
    URLs no longer than their remaining object lifetime and
    object expiry anchored at `completed_at`, immediate cleanup of failed or
-   canceled partial objects, revision-fenced authorization revocation across
+   canceled partial objects, a restore-independent pre-commit authorization-
+   revocation intent and Query fence before authoritative commit, recovery of
+   an unresolved intent, revision-fenced authorization revocation across
    native/compatible reads and caches as well as downloads, authorization
    recheck, rate limits, and oversized-request
    `resource_exhausted` behavior.
