@@ -152,7 +152,7 @@ access to another component's storage are prohibited.
 | Ingest | Encrypted immutable raw S3 objects, PostgreSQL acceptance metadata, and the transactional processing outbox. |
 | Processor | The four immutable canonical ClickHouse histories, encrypted project-scoped non-authoritative replay batches, PostgreSQL processing state, and mutable derived aggregates. |
 | Query | Independently owned ClickHouse read projections, Query-owned PostgreSQL export metadata, encrypted non-authoritative cache, and encrypted project-scoped S3 export prefix. |
-| API | Authoritative control-plane and audit state in its own PostgreSQL boundary, plus encrypted immutable S3 control-registry prefixes for restore-independent retention policies, deletion tombstones, API restore audit intents, and export holds. |
+| API | Authoritative control-plane and audit state in its own PostgreSQL boundary, plus encrypted immutable S3 control-registry prefixes for restore-independent retention policies, deletion tombstones, API restore audit intents, the API audit journal, and export holds. |
 | Jobs | Scheduling, leases, retries, dead-letter state, execution history, and orchestration state in its own PostgreSQL boundary. |
 | Web | No server-authoritative storage. |
 
@@ -190,16 +190,22 @@ logical canonical-change partition for each `(tenant_id, project_id,
 signal_family)` tuple, where `signal_family` is one of
 `error_occurrences`, `metric_points`, `log_records`, or `spans`. Processor is
 the sole authority for a partition's strictly increasing unsigned 64-bit
-`canonical_change_sequence`. It allocates the sequence, the canonical change
-record, and the durable canonical-change outbox entry in one Processor-local
-transaction; a retry reuses the same partition and sequence rather than
-allocating another one. The sequence and the canonical-content digest are
-stored with the canonical replay metadata and published in every versioned
-Processor-to-Query canonical-change message. A committed sequence has no
-unpublished gap: recovery replays the durable outbox or retained replay batch
-before reporting that partition's watermark as available. A conflicting
-payload or digest for an existing `(partition, sequence)` is an integrity
-failure.
+`canonical_change_sequence`. Because the authoritative row is in ClickHouse
+and the coordination state is Processor-owned PostgreSQL, the row and outbox
+are not committed in one physical transaction. Processor first reserves the
+sequence and persists an immutable canonical-write staging record, its
+canonical-content digest, and a durable outbox intent in one Processor-local
+PostgreSQL transaction. A reconciler then idempotently commits the staged row
+to ClickHouse using the partition and sequence identity. After verifying the
+same digest, it marks the staging record `clickhouse_committed`; only that
+state is eligible for durable outbox publication. A retry reuses the same
+partition and sequence rather than allocating another one. Recovery
+reconciles staged, ClickHouse-committed, and published states, including a
+ClickHouse row that exists before its PostgreSQL status is recorded. A
+sequence has no available watermark until its authoritative ClickHouse row
+and publication are both durably confirmed. A conflicting payload or digest
+for an existing `(partition, sequence)` is an integrity failure; there is no
+distributed transaction or best-effort publication.
 
 Query stores the highest contiguous applied sequence and its digest for each
 logical partition. It rejects a gap or a conflicting equal sequence and
@@ -271,9 +277,17 @@ Processor records the immutable object's SHA-256 digest and byte size in its
 separate class metadata, and verifies both before any replay or reprocessing
 use. A verification failure makes the batch unusable and cannot create,
 publish, or promote a canonical result.
-Each immutable replay batch is retention-homogeneous: every represented item
-has the same effective lifecycle expiry, and Processor does not place items
-with different expiry deadlines in one object.
+Replay batches use bounded one-hour UTC expiry buckets keyed by each item's
+effective lifecycle expiry. Batch metadata records the bucket and every
+item's exact effective expiry, so a batch may span exact expiry instants
+without losing per-item retention data. Canonical and derived replay objects
+are deleted at the earliest represented expiry; later-expiring non-authoritative
+copies may therefore be retired early, but no object can retain an expired
+item. If a normalized or enriched processing-input batch must remain available
+through a raw-retention cutoff, Processor splits or rolls the still-needed
+items into a successor before the earliest deletion deadline and carries the
+source digest and provenance forward. No replay object is retained past any
+represented item's effective cutoff.
 Canonical replay batches are non-authoritative immutable copies, not a second
 canonical store; their separate metadata identifies the represented canonical
 versions for reconciliation and deletion. Derived aggregates are
@@ -437,7 +451,18 @@ and deletion-tombstone registry snapshots from API through the versioned
 `ControlRegistrySnapshotV1` handoff defined in the component contract, persists
 them before readiness, and enforces them. Each data owner reapplies its effective
 cutoff and fences excess data; Jobs restores the associated baseline, policy,
-and deletion scheduling and fences.
+and deletion scheduling and fences. Before a restored or rebuilt Processor or
+Query owner becomes ready, it also obtains its owner-scoped export-fence
+snapshot from the same handoff. The snapshot contains the current desired
+export holds and unresolved terminal cancellation or failure fences, their
+export and held/terminal revisions, registry generation, and integrity digest.
+The owner persists the snapshot, reconciles its local inventory, installs every
+missing desired hold or terminal fence, and removes or releases only state
+authorized by the current snapshot. Query durably installs a terminal
+execution fence before releasing its projection hold. A snapshot mismatch,
+missing owner acknowledgement, or unavailable API keeps the restored owner
+unready and retryable. API's `ExportHoldInventoryV1` reconciliation after an
+API database restore remains in addition to this owner-store recovery path.
 Before a restored or rebuilt Jobs owner becomes ready, it reconciles its local
 baseline registrations against the active-project inventory returned by
 `ControlRegistrySnapshotV1`, recreating missing registrations idempotently for
@@ -840,7 +865,10 @@ The owning implementation contracts must make these scenarios testable:
    equal; normalize signed zero to `+0.0`; normalize equivalent timestamp
    spellings to the exact nine-digit UTC `Z` representation before digesting.
 2. Fail S3, PostgreSQL, ClickHouse, and MSK operations before and after local
-   commits; verify no false successful acceptance and idempotent recovery.
+   commits; verify no false successful acceptance and idempotent recovery,
+   including Processor canonical staging before and after ClickHouse commit and
+   outbox publication, with no duplicate or conflicting sequence and no
+   available watermark gap.
 3. Verify raw-object immutability, SHA-256 and size reconciliation, required
    MSK durability and seven-day default retention settings, shortened-policy
    enforcement without allowing a project duration to extend a shorter class
@@ -858,8 +886,9 @@ The owning implementation contracts must make these scenarios testable:
    request and Processor republishing without direct Processor storage access;
    verify that the canonical lowercase UUID v7 `rebuild_id` is persisted as
    PostgreSQL `uuid` in Processor's durable request and idempotency state, that
-   canonical replay copies remain non-authoritative, have retention-homogeneous
-   expiry, reconcile to their represented canonical versions, and reject a
+   canonical replay copies remain non-authoritative, use bounded expiry buckets
+   with exact per-item cutoffs and explicit deletion/rollover behavior,
+   reconcile to their represented canonical versions, and reject a
    changed non-key canonical field when its identity pair is unchanged; verify
    that each requested canonical partition receives a matching
    `ProjectionRebuildBaselineV1` marker before its first retained sequence,
@@ -900,10 +929,11 @@ The owning implementation contracts must make these scenarios testable:
    ineligible by a shortened policy; retention of the active project policy
    until tombstone activation and only then its removal; restore-independent
    retention, tombstone, API audit-intent, API audit-journal, and export-hold/
-   expiry-intent
-   registry recovery before any restored or rebuilt owner accepts traffic,
-   including Jobs rebuilding a missing default-policy baseline registration from
-   the active-project inventory;
+   expiry-intent registry recovery before any restored or rebuilt owner accepts
+   traffic; verify restored Processor and Query owners also reconcile their
+   owner-scoped export holds and terminal execution fences from the API
+   registry snapshot before readiness, including Jobs rebuilding a missing
+   default-policy baseline registration from the active-project inventory;
    shortened-retention activation must expire and revoke every still-downloadable
    completed export whose selected source or export-object cutoff crosses the new
    cutoff before the policy becomes active, and must reschedule artifacts whose
@@ -941,8 +971,9 @@ The owning implementation contracts must make these scenarios testable:
    dispatch, replay of unresolved hold and expiry intents after an API backup
    restore, rescheduling when the export-object cutoff shortens, and
    invalidation when that cutoff has passed,
-   Query-owned PostgreSQL export metadata, restore reconciliation of Processor
-   and Query hold inventories, Query-issued URLs no longer than their remaining object lifetime and
+   Query-owned PostgreSQL export metadata, owner-startup reconciliation of
+   Processor and Query hold/fence inventories before readiness, Query-issued
+   URLs no longer than their remaining object lifetime and
    object expiry anchored at `completed_at`, immediate cleanup of failed or
    canceled partial objects, revision-fenced authorization revocation across
    native/compatible reads and caches as well as downloads, authorization

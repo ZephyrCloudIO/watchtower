@@ -167,8 +167,12 @@ The allowed protocol and data-flow direction is:
    idempotent cleanup. Each of Ingest, Processor, Query, and Jobs obtains the current
    retention-policy and deletion-tombstone snapshots through an authenticated
    `ControlRegistrySnapshotV1` request to API before readiness or after
-   restoration. The owner performs the idempotent side effect and publishes
-   the outcome.
+   restoration. Processor and Query also obtain their owner-scoped export-hold
+   and terminal-fence snapshot through that request. Each owner persists the
+   snapshot before readiness, performs the idempotent side effect, and publishes
+   the outcome. Processor and Query remain unready until their local hold/fence
+   inventory matches the API registry generation and digest; Query installs a
+   terminal execution fence before releasing a projection hold.
 7. Ingest, Processor, Query, and Jobs submit required evidence for break-glass,
    restoration, key, replication, backup, and restore actions to API through a
    versioned durable audit-evidence message. API validates the producer,
@@ -312,6 +316,11 @@ traffic after an API database restore, reconciles both inventories, and retries
 the matching hold install, cancellation, release, or expiry-schedule command for
 every unresolved intent. A hold or expiry schedule is not orphaned merely
 because it is absent from the restored API PostgreSQL backup.
+When Processor or Query restores its own store, it instead receives the
+owner-scoped desired holds and unresolved terminal fences in
+`ControlRegistrySnapshotV1`, persists that snapshot before readiness, and
+reconciles missing or stale local state against it. This owner-store recovery
+does not depend on an API database restore.
 
 When API records a successful `completed` transition, it sends Jobs an
 idempotent versioned `ExportExpiryScheduleV1` request containing `export_id`,
@@ -706,12 +715,16 @@ become runtime acceptance criteria for the owning implementation issues:
     closed rather than acknowledging the revocation.
 17. Restore Ingest, Processor, Query, and Jobs independently and verify each
     obtains and persists current retention-policy, deletion-tombstone, and
-    active-project baseline-registration snapshots before readiness; when Jobs'
-    backup predates an ordinary default-policy project creation, verify it
-    recreates the missing baseline registration idempotently from the inventory
-    before enabling schedules. When replacing a component store, verify the
-    applicable audit intent survives a backup that predates the replaced store,
-    including the API audit-intent prefix for an API PostgreSQL restore.
+    active-project baseline-registration snapshots before readiness; restore
+    Processor and Query from backups predating an active export hold or
+    terminal execution fence and verify their owner-scoped hold/fence snapshot
+    reconciliation completes before readiness, with Query installing the
+    terminal fence before releasing its projection hold; when Jobs' backup
+    predates an ordinary default-policy project creation, verify it recreates
+    the missing baseline registration idempotently from the inventory before
+    enabling schedules. When replacing a component store, verify the applicable
+    audit intent survives a backup that predates the replaced store, including
+    the API audit-intent prefix for an API PostgreSQL restore.
 
 ## Deferred Decisions and Non-Goals
 
