@@ -128,18 +128,26 @@ The allowed protocol and data-flow direction is:
    expiry for API's versioned
    `ExportSnapshotHoldInstallV1` request, accepts Query's authorized
    `ProjectionRebuildV1` requests, captures a fixed available,
-   published-contiguous target watermark for each requested partition, emits a
-   matching `ProjectionRebuildBaselineV1` marker before the first retained
-   sequence or at that watermark for an empty rebuild, and emits contiguous
-   change or authenticated skip coverage through each fixed target. Query marks
-   the rebuild complete at those targets; sequences published afterward remain
-   on the normal live-change path. A retention-expired
+   published-contiguous target watermark for each requested partition and, when
+   derived data is selected, an immutable bounded derived key/revision target
+   descriptor of every eligible aggregate key and its `authoritative_revision`
+   at request acceptance. It emits a matching
+   `ProjectionRebuildBaselineV1` marker before the first retained sequence or
+   at that watermark for an empty rebuild, and emits contiguous change or
+   authenticated skip coverage through each fixed target plus digest-verified
+   coverage for every derived descriptor entry. Query marks the rebuild complete
+   only after all canonical targets and the complete derived target descriptor
+   are covered; sequences published afterward remain on the normal live-change
+   path. A retention-expired
    staged live write uses an idempotent no-row `CanonicalChangeSkipV1` marker
    for its reserved sequence only when no authoritative ClickHouse row exists;
-   if the row was committed before publication failed, Processor reconciles and
-   publishes the row instead. Live consumers therefore receive contiguous
-   coverage, and Processor persists each live skip marker in the retained
-   canonical replay class so it remains available through the replay horizon.
+   if the row was committed while still within its cutoff and publication then
+   failed, Processor reconciles and publishes the row; if the cutoff arrives
+   after commit but before publication, recovery removes the row, verifies its
+   absence, and publishes the skip. Live consumers therefore receive
+   contiguous coverage, and Processor persists each live skip marker in the
+   retained canonical replay class so it remains available through the replay
+   horizon.
    It publishes a
    terminal
    `RawHandoffDispositionV1` to Ingest for every completed,
@@ -175,7 +183,10 @@ The allowed protocol and data-flow direction is:
    idempotent `ExportCancellationV1` from API durably records the terminal
    export revision, cancels queued, leased, retry, and in-flight work, and
    dispatches `ExportExecutionCancellationV1` to Query before acknowledging the
-   cancellation to API. During retention preparation, generation-matched
+   cancellation to API. An idempotent `ExportFailureV1` from API durably
+   terminalizes the corresponding execution, fences queued, leased, retry, and
+   in-flight work, and is acknowledged before API releases the held revision.
+   During retention preparation, generation-matched
    export fences are reversible and Jobs performs no terminal cancellation,
    hold release, or artifact invalidation until API commits the active
    generation. The post-commit cancellation fences, hold releases, and
@@ -340,8 +351,9 @@ hold. The source-expiry value is absent
 when the requested snapshot has no eligible canonical rows, selection entries,
 or derived contributions. API persists the canonical partition-sequence
 vector, the selection descriptor and digest, and, when present, the derived
-revision descriptor and digest, plus the present source-expiry deadline only in
-the durable scheduling request sent to Jobs; Jobs owns the
+revision descriptor and digest, plus the present source-expiry deadline in the
+restore-independent hold registry and the durable scheduling request sent to
+Jobs; Jobs owns the
 lease, retry, source-expiry, and cancellation state and dispatches a
 revision-fenced `ExportExecutionV1` command to Query carrying that bounded
 snapshot evidence, the
@@ -401,8 +413,18 @@ that terminal export whose revision is stale or whose delivery occurs after
 the terminal fence. API does not release the held revision until Jobs and Query
 have acknowledged the cancellation fence.
 
+When Query emits a terminal `failed` outcome, API appends the failure intent to
+the restore-independent hold registry and sends a revision-fenced
+`ExportFailureV1` command to Jobs containing the held and terminal export
+revisions, failure reason, authorized scope, correlation, and idempotency
+context. Jobs durably fences queued, leased, retry, and in-flight execution
+state and acknowledges terminalization before API releases the held revision.
+Query's failed terminal fence continues to reject stale or post-terminal
+`ExportExecutionV1` commands.
+
 After API records any terminal `completed`, `failed`, or `canceled` export
-transition, it publishes an idempotent versioned
+transition and the required terminalization fences have been acknowledged, it
+publishes an idempotent versioned
 `ExportSnapshotHoldReleaseV1` command to Processor and Query. The command
 contains `held_export_revision` for the hold being released, the current
 terminal `export_revision`, terminal outcome, correlation, and idempotency
@@ -415,11 +437,12 @@ Query installs the terminal execution fence before releasing its projection
 hold, so a delayed execution command cannot recreate a hold or artifact after
 the terminal transition.
 
-API records an export-hold intent before installing a Processor or Query hold
-in its restore-independent encrypted S3 export-hold registry. Before API
+API records an export-hold intent, including the present source-expiry deadline,
+before installing a Processor or Query hold in its restore-independent encrypted
+S3 export-hold registry. Before API
 persists any terminal export transition or dispatches its cleanup command, it
-also appends the matching cancellation or release intent to that registry;
-the intent precedes `ExportCancellationV1` or
+also appends the matching cancellation, failure, or release intent to that
+registry; the intent precedes `ExportCancellationV1`, `ExportFailureV1`, or
 `ExportSnapshotHoldReleaseV1` dispatch. Before sending `ExportCompletionV1`, API
 sets `completed_at` to the canonical UTC timestamp of the durable
 completion/expiry intent append and records that value, the export revision,
@@ -438,7 +461,8 @@ Query provide an authenticated versioned
 response containing each held `export_id`, held revision, and registry digest;
 they do not expose their storage. API loads its registry before accepting
 traffic after an API database restore, reconciles both inventories, and retries
-the matching completion, hold install, cancellation, release, or expiry-schedule
+the matching completion, hold install, cancellation, failure, release, or
+expiry-schedule
 command for every unresolved intent. For an unresolved completion intent, API
 replays the idempotent `ExportCompletionV1` handoff to Jobs and resumes the same
 final expiry-and-fence check and commit-or-cleanup sequence; it does not replace
@@ -513,9 +537,13 @@ fences, durably records the request and its idempotency state with `rebuild_id`
 stored as PostgreSQL `uuid` before acknowledging it. At durable request
 acceptance, Processor captures the current available, published-contiguous
 watermark as an immutable `target_sequence` for every requested canonical
-partition. Before republishing eligible versioned canonical or derived changes
-through its normal change path, Processor emits a matching
-`ProjectionRebuildBaselineV1` marker for each requested canonical partition.
+partition. When derived data is selected, it also captures an immutable bounded
+derived key/revision target descriptor of every eligible aggregate key and its
+`authoritative_revision` at acceptance, with bounded authenticated pages and a
+final descriptor digest. Before republishing eligible versioned
+canonical or derived changes through its normal change path, Processor emits a
+matching `ProjectionRebuildBaselineV1` marker for each requested canonical
+partition.
 The marker establishes the first retained sequence (or an explicit empty
 partition), carries the fixed target sequence, and is accepted only for its
 matching rebuild and active fences. For every sequence after the baseline
@@ -527,12 +555,14 @@ digest. A rebuild that initializes or advances a partition's global checkpoint
 must cover the entire currently eligible retained window; a narrower subrange
 request is rejected for checkpoint recovery and leaves the checkpoint
 unchanged. An unexpired row omitted by a narrower request is not a valid skip.
-Query verifies complete contiguous coverage, advances its checkpoint over
-changes and retention-excluded skip ranges, and writes every eligible row in
-the covered window; missing, stale, conflicting, or unauthorized coverage
-fails the rebuild safely. Query marks the rebuild complete only after coverage
-reaches the authenticated target sequence for every requested partition;
-sequences published after those targets remain on the normal live-change path.
+Query verifies complete contiguous canonical coverage and complete
+digest-verified coverage of every derived target descriptor page, advances its
+checkpoint over changes and retention-excluded skip ranges, and writes every
+eligible row in the covered window; missing, stale, conflicting, unauthorized,
+or incomplete derived coverage fails the rebuild safely. Query marks the rebuild
+complete only after coverage reaches the authenticated target sequence for every
+requested partition and every derived descriptor entry is covered; sequences
+published after those targets remain on the normal live-change path.
 The correlated response reports durable acceptance or a terminal safe error;
 Query never accesses Processor persistence directly.
 
@@ -927,12 +957,15 @@ become runtime acceptance criteria for the owning implementation issues:
     advances the terminal revision; verify that a rebuild whose first retained
     canonical sequence is greater than one installs the matching
     `ProjectionRebuildBaselineV1` marker before applying changes, captures and
-    authenticates a fixed available target watermark for each partition, emits
-    coverage through each target before declaring completion, and emits
+    authenticates a fixed available target watermark for each partition and an
+    immutable bounded derived key/revision target descriptor of every eligible
+    aggregate key and `authoritative_revision` when selected,
+    verifies complete digest-checked coverage through every canonical and
+    derived target before declaring completion, and emits
     contiguous `ProjectionRebuildSkipV1` coverage only for retention-excluded
     sequences, writes every eligible row before advancing the global checkpoint,
     leaves that checkpoint unchanged for an incomplete subrange request, and
-    fails safely when coverage is missing or mismatched.
+    fails safely when coverage is missing, incomplete, or mismatched.
 14. Race export cancellation and terminal completion or failure, then verify
     the completion/expiry intent and recovery copy are durable before
     `ExportCompletionV1`, its `completed_at` is reused through API and Jobs,
@@ -940,7 +973,9 @@ become runtime acceptance criteria for the owning implementation issues:
     check occurs immediately
     before API commits `completed`; Jobs then terminalizes execution before API
     exposes completion or schedules object expiry, and cancels and fences queued,
-    leased, retry, and in-flight execution,
+    leased, retry, and in-flight execution, and for a Query failure verifies the
+    restore-independent failure intent, `ExportFailureV1` dispatch, and Jobs
+    terminal-fence acknowledgement before hold release,
     Query rejects delayed post-terminal `ExportExecutionV1` commands, and
     revision fencing prevents a stale outcome from changing API state or making
     an invalid artifact issuable; partial failed or canceled objects are
@@ -964,9 +999,9 @@ become runtime acceptance criteria for the owning implementation issues:
     mutation commits; post-commit processing expires and invalidates those
     artifacts, reschedules existing artifacts whose export-object cutoff moves
     earlier, and invalidates artifacts whose new cutoff has already passed;
-    the restore-independent hold registry records
-    cancellation and release intents before dispatch and replays unresolved
-    intents after API restore, retains the completed-materialization recovery
+    the restore-independent hold registry records source deadlines and
+    cancellation, failure, and release intents before dispatch and replays
+    unresolved intents after API restore, retains the completed-materialization recovery
     copy while the artifact remains accessible even after reconciliation, and
     sends `ExportRecoveryInvalidationV1` before leaving Query unready when a
     restored artifact or metadata is missing or conflicting.

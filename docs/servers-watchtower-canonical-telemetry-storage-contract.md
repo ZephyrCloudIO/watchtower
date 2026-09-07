@@ -205,12 +205,16 @@ current-cutoff check before committing the row. If that check fails before
 commit, the reconciler marks the staged write retention-expired and, after
 proving that no authoritative row exists, publishes an idempotent no-row
 `CanonicalChangeSkipV1` marker for the reserved sequence through the same
-canonical-change path. If ClickHouse committed the row before a cutoff or
-publication failure, recovery verifies its digest, retains the row, marks the
-staging record `clickhouse_committed`, and publishes the actual canonical
-change; it never publishes a skip while the row exists. A skip after a
-reconciliation attempt is valid only after the row is durably removed and its
-absence is verified. The marker carries the partition, sequence, retention
+canonical-change path. If ClickHouse committed the row while it was still
+within its cutoff and publication then failed, recovery verifies its digest,
+retains the row, marks the staging record `clickhouse_committed`, and publishes
+the actual canonical change. If the current cutoff arrives after ClickHouse
+commits the row but before publication, recovery marks the staging record
+retention-expired, removes the authoritative row, verifies its absence, and
+publishes the idempotent no-row `CanonicalChangeSkipV1` marker. It never
+publishes a skip while the row exists or publishes an expired row. A skip after
+a reconciliation attempt is valid only after the row is durably removed and
+its absence is verified. The marker carries the partition, sequence, retention
 cutoff, expiry basis, marker integrity digest, and idempotency context; Query
 applies it as contiguous coverage without creating a row. Processor persists each live skip as
 an immutable no-row sequence tombstone in the retained canonical replay class.
@@ -992,8 +996,10 @@ ordered content-aware digests; and Query projections and canonical exports
 compare the authoritative default-generation selection and canonical content
 digests at matching canonical vector entries. Derived projections and exports
 compare the selected aggregate state, aggregate revisions, and retention-windowed
-source set at matching per-aggregate derived revision snapshot page entries; no
-scalar revision is used to claim cross-aggregate completion.
+source set at matching per-aggregate derived revision snapshot page entries;
+projection rebuild completion additionally requires the immutable accepted
+derived key/revision target descriptor and complete digest-verified coverage;
+no scalar revision is used to claim cross-aggregate completion.
 Correlation-ID digests are compared only for represented records in the same
 dimension. A mismatch is not silently repaired or treated as successful
 completion.
@@ -1073,10 +1079,11 @@ The owning implementation contracts must make these scenarios testable:
    commits; verify no false successful acceptance and idempotent recovery,
    including Processor canonical staging before and after ClickHouse commit and
    outbox publication, with no duplicate or conflicting sequence; verify a row
-   committed before a cutoff or publication failure is reconciled and published
-   as a row rather than a skip, while an absent row alone may produce the
-   idempotent `CanonicalChangeSkipV1` marker through the full canonical replay
-   horizon, so
+   committed while still within its cutoff but delayed by publication is
+   reconciled and published as a row, while a cutoff reached after ClickHouse
+   commit but before publication removes the row, verifies its absence, and
+   publishes the idempotent `CanonicalChangeSkipV1` marker. An absent row alone
+   may produce that marker through the full canonical replay horizon, so
    a Query outage longer than the seven-day MSK window cannot leave an
    available-watermark gap blocking later changes.
 3. Verify raw-object immutability, SHA-256 and size reconciliation, required
@@ -1105,14 +1112,19 @@ The owning implementation contracts must make these scenarios testable:
    that each requested canonical partition receives a matching
    `ProjectionRebuildBaselineV1` marker before its first retained sequence,
    captures an authenticated fixed available `target_sequence` for every
-   requested partition, and accepts a first sequence greater than one without
+   requested partition and an immutable bounded derived key/revision target
+   descriptor of every eligible aggregate key and `authoritative_revision` at
+   acceptance when derived data is selected, and accepts a first
+   sequence greater than one without
    a false gap; emits and validates
    contiguous authenticated `ProjectionRebuildSkipV1` coverage only for
    retention-excluded interleaved sequences, live `CanonicalChangeSkipV1`
    coverage for an expired staged sequence, writes every eligible row before
    advancing the global checkpoint, declares completion only through each fixed
-   target, leaves that checkpoint unchanged for an incomplete subrange request,
-   and fails safely when coverage is missing, stale, or mismatched. When all
+   target and after complete digest-verified coverage of every derived
+   descriptor entry, leaves that checkpoint unchanged for an incomplete
+   subrange request, and fails safely when coverage is missing, stale,
+   incomplete, or mismatched. When all
    retained rows have expired while a later sequence is reserved but not yet
    published, verify the empty baseline uses the highest published-contiguous
    watermark rather than the reserved sequence and accepts that later
