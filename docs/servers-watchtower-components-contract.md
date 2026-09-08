@@ -184,12 +184,14 @@ retrieves bounded authenticated selection pages, derived
    retained canonical replay class so it remains available through the replay
    horizon.
    Before Processor becomes ready after restoring its processing store, it
-   digest-verifies and replays every retained derived replay batch, reconstructs
-   authoritative aggregate state and selected source sets, and reconciles each
-   per-project/per-aggregate revision high-water mark. Missing, truncated, or
-   conflicting batch evidence leaves Processor unready; it accepts no new
-   derived aggregate work and allocates no revision until reconciliation is
-   committed.
+   digest-verifies and replays retained canonical and derived replay evidence,
+   reconstructs each canonical partition's sequence high-water mark and
+   published-contiguous watermark from surviving ClickHouse rows, replay
+   changes, and no-row tombstones, and reconciles restored staging, outbox,
+   publication-confirmation, aggregate, and selected-source state. Missing,
+   truncated, or conflicting evidence leaves Processor unready; it accepts no
+   new canonical sequence reservation or derived aggregate work and allocates
+   no revision until reconciliation is committed.
    It publishes a
    terminal
    `RawHandoffDispositionV1` to Ingest for every completed,
@@ -231,8 +233,9 @@ retrieves bounded authenticated selection pages, derived
    `ExportSnapshotSourceExpiryFenceV1` directly to Processor, so owner-side
    fencing and source-snapshot cleanup do not wait for API recovery. Query
    retries or applies the same deadline before readiness after its own outage;
-   Processor fences and deletes or makes inaccessible the matching captured
-   snapshot state and rejects delayed retrieval or replay.
+   Processor's persisted local deadline fence performs the same cleanup even
+   when Jobs is unavailable, while the direct command remains an idempotent
+   reconciliation path.
    For a completed export-object deadline, Jobs dispatches an idempotent
    `ExportArtifactExpiryFenceV1` directly to Query. Query persists that
    deadline with the materialization metadata and deletes or makes inaccessible
@@ -262,14 +265,16 @@ retrieves bounded authenticated selection pages, derived
    versioned `LifecyclePurgeRegistrationV1` request to Jobs for the affected
    policy or project-deletion purge work. Jobs durably creates the paused
    registration and returns its `purge_registration_id` and paused state; the
-   owner persists that result with its pending fence before returning a matching
+   owner persists that result with its pending fence and actively enforces the
+   proposed non-destructive cutoff before returning a matching
    `phase=prepared` `LifecycleMutationAcknowledgementV1`. Jobs records its own
    scheduling registration in the same transaction. While the generation is
    non-active, each owner, including API's local participant, sends the matching
    registration ID back to Jobs for
    activation; Jobs returns an armed, non-dispatchable state before the owner
    acknowledges `phase=active`. API commits activation only after every required
-   armed acknowledgement. API then emits a durable post-commit enable signal;
+   armed acknowledgement confirms that the matching pending fence is installed
+   and actively enforced. API then emits a durable post-commit enable signal;
    owners resend the matching registration with `registration_phase=enable`,
    and Jobs verifies the committed generation before enabling dispatch. Each of
    Ingest, Processor, Query, and Jobs obtains the current retention-policy,
@@ -400,9 +405,10 @@ complete authoritative canonical partition-sequence vector and creates an
 immutable `SelectionSnapshotDescriptorV1` for per-record default-generation
 selections plus a `DerivedRevisionSnapshotDescriptorV1` when derived results
 are selected. It computes the optional earliest effective expiry among all
-held canonical rows, selection entries, and derived contributions, and
-installs the export-scoped hold before returning a correlated versioned
-response. The selection descriptor contains only bounded metadata: snapshot
+held canonical rows, selection entries, and derived contributions, persists it
+with the export-scoped hold, and establishes the local deadline fence before
+returning a correlated versioned response. The selection descriptor contains
+only bounded metadata: snapshot
 identity, request scope, fixed-size page parameters, entry count, page count,
 and final selection digest; it never inlines one entry or an unbounded
 page-digest list for every record. The derived revision descriptor uses the
@@ -421,7 +427,10 @@ contributions are removed, and higher revisions may publish to Query during the
 hold. Export materialization reads the captured snapshot state, so live
 revisions cannot change the descriptor pages; this snapshot does not extend the
 earliest effective source-retention cutoff or bypass the existing source-expiry
-cancellation and release path. The source-expiry value is absent
+cancellation and release path. When present, Processor's local deadline fence
+makes the captured canonical, selection, derived-state, and source-set
+snapshots inaccessible and rejects delayed retrieval or replay at or after
+the cutoff, independently of Jobs and API. The source-expiry value is absent
 when the requested snapshot has no eligible canonical rows, selection entries,
 or derived contributions. API persists the canonical partition-sequence
 vector, the selection descriptor and digest, and, when present, the derived
@@ -898,8 +907,9 @@ mutation kind, `phase` (`prepare` or `activate`), authorized scope, monotonic
 mutation generation, the complete immutable proposed retention policy when the
 mutation is a retention change, the policy's per-class proposed cutoffs,
 policy digest, correlation identifier, and idempotency key. During `prepare`,
-each data owner durably installs a non-destructive pending fence from that
-policy and sends Jobs a versioned unary `LifecyclePurgeRegistrationV1` request under
+each data owner durably installs and actively enforces a non-destructive
+pending fence from that policy and sends Jobs a versioned unary
+`LifecyclePurgeRegistrationV1` request under
 `/internal/v1` containing the owner, mutation kind, authorized scope,
 generation, `registration_phase=prepare`, affected data classes, correlation
 identifier, and idempotency key. During `prepare`, API records its own
@@ -940,8 +950,9 @@ perform irreversible work only after both the active-generation commit and
 matching enablement.
 The correlated
 `LifecycleMutationAcknowledgementV1` carries the owner, mutation kind,
-generation, phase, `fence_installed`, `purge_registration_id`, registration
-state, and the acknowledged policy digest when applicable.
+generation, phase, `fence_installed` (true only after the applicable
+non-destructive cutoff is actively enforced), `purge_registration_id`,
+registration state, and the acknowledged policy digest when applicable.
 `purge_registration_id` is a canonical lowercase UUID v7 at this boundary and
 is stored as PostgreSQL `uuid` in Jobs state. API returns `accepted_pending`
 while prepare, activation, or post-commit enablement is incomplete and reports
@@ -950,7 +961,8 @@ generation is committed, and enablement is acknowledged. Stale,
 conflicting, or incomplete acknowledgements fail closed, and no purge or
 anonymization caused by the pending mutation may run from a pending registration.
 Previously active baseline and retention-policy schedules continue to enforce
-their own effective cutoffs during a stalled prepare or activation. API does
+their own non-conflicting effective cutoffs during a stalled prepare or
+activation, and cannot bypass an enforced pending fence. API does
 not report project deletion complete until its purge acknowledgement joins the
 Ingest, Processor, Query, and Jobs acknowledgements. The API registration and
 minimal deletion tombstone remain restore-independent and retryable if API
@@ -1250,7 +1262,11 @@ become runtime acceptance criteria for the owning implementation issues:
     durable source-expiry deadline and Jobs-to-Query fence, removes partial
     artifacts, and rejects delayed execution before later API cancellation
     reconciliation. Completion after the export-object deadline is rejected
-    and cleaned up. An empty export has no source deadline or source-retention
+    and cleaned up. When Jobs is unavailable at the source deadline, verify
+    Processor's persisted hold deadline locally fences and removes captured
+    source snapshots and rejects delayed retrieval or replay before later
+    Jobs/API reconciliation.
+    An empty export has no source deadline or source-retention
     schedule or source-deadline check but still receives ordinary
     completed-object expiry. Shortened-retention preparation installs reversible
     fences for otherwise downloadable completed artifacts whose selected source
