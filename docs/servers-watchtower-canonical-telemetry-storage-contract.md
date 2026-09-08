@@ -101,6 +101,7 @@ canonical telemetry.
 | Enriched records | Processor; authoritative only as processing input | Processor-owned encrypted S3 replay-batch prefix, with separate class metadata | Retained only as needed for replay, no longer than 90 days |
 | Canonical telemetry | Processor; authoritative for the four signal histories | Four independent ClickHouse canonical table families | Immutable history for 90 days from `accepted_at` |
 | Canonical replay representations | Processor; non-authoritative, immutable replay copies of canonical changes and no-row sequence tombstones | Processor-owned encrypted project-scoped S3 replay-batch prefix with separate class metadata | Canonical changes are retained for 90 days from each represented record's `accepted_at`; no-row `CanonicalChangeSkipV1` tombstones are retained through the source-anchored horizon and while a replayable successor sequence could depend on their coverage, or until an authenticated gap-repair baseline is established; purged with their project |
+| Canonical sequence/publication baselines | Processor; authoritative restore-independent allocation and publication baseline for each logical canonical partition | Processor-owned encrypted immutable sequence-baseline ledger independent of Processor PostgreSQL backups | Each baseline records the highest reserved sequence, published-contiguous watermark, and integrity/publication digest; it remains until no restorable Processor or Query backup can predate it, then is purged with the project |
 | Default-generation selections | Processor; authoritative mapping of each `watchtower_id` to its promoted `processing_generation` | Processor-owned PostgreSQL selection state with `processing_generation` stored as `uuid`, plus monotonically revisioned selection changes and project-scoped rebuild cursors/buffers in Processor canonical replay batches | Retained while its canonical record is eligible; rebuild targets, post-target buffers, and cutover metadata remain until the rebuild completes or fails terminally, then follow the replay horizon; rebuilt from retained selection changes and validated against canonical history before Processor republishes it to Query after recovery |
 | Derived aggregates | Processor; authoritative for mutable derived results | Processor-owned PostgreSQL schemas and encrypted project-scoped derived replay batches | Retention-windowed to thirteen UTC calendar months after `accepted_at` by default or the shortened project policy; expired contributions are removed before they can remain represented in the aggregate, replay batches, or Query projections |
 | Compatibility-only representations | The sole owning adapter for each protocol interface; authoritative only for that boundary | Request-scoped memory or an adapter-owned boundary defined by #16 or its signal contract | No canonical retention; never a shared persistence model |
@@ -110,7 +111,7 @@ canonical telemetry.
 | Export objects | Query; non-authoritative customer-download artifacts | Encrypted Query-owned project-scoped S3 export prefix | The earlier of seven days from API `completed_at` and the active export-object policy cutoff computed from `completed_at` for successful artifacts; artifacts from any attempt that terminates without successful `completed`, including failed or canceled attempts, are removed or made inaccessible at terminal transition, and Query's owner-side expiry fence removes or makes each successful artifact inaccessible at its exact cutoff even when API lifecycle reconciliation is delayed |
 | Audit events | API for contract-level lifecycle and access audit authority | API-owned append-only PostgreSQL audit boundary with erasable encrypted project-scoped context, plus a restore-independent immutable audit journal | Detailed history follows #15; every journaled event is replayable after an API database restore, and deleted projects retain only minimal anonymous evidence |
 | API restore audit intents | API; authoritative for pre-restore intent evidence until API records the outcome in its audit boundary | API-owned encrypted immutable S3 audit-intent prefix independent of API PostgreSQL backups | Retained through restore completion and evidence recording, then follows the applicable audit-retention policy; never stored only in the API restore target |
-| API export hold registry | API; authoritative for restore-independent export hold, terminal-release, completion/expiry scheduling evidence, immutable captured snapshot payloads for non-terminal held revisions, and recovery copies of completed materialization metadata | API-owned encrypted immutable S3 export-hold registry prefix independent of API PostgreSQL backups | Retained until every held revision and expiry schedule is terminally released or reconciled; source-dependent selection pages, derived revision pages, and source-set chunks carry their exact source-expiry deadline and are deleted or made irreversibly inaccessible by an independent storage-retention fence at that deadline even if API lifecycle reconciliation is unavailable; completed-materialization recovery copies remain through the full accessible lifetime of their artifact and are not removable solely because they were reconciled or replayed; after artifact expiry or earlier durable invalidation/removal and terminal cleanup, a minimal terminal tombstone remains until no restorable API, Processor, Query, or Jobs backup can contain the pre-terminal state, then follows export and project-deletion cleanup |
+| API export hold registry | API; authoritative for restore-independent export hold, terminal-release, completion/expiry scheduling evidence, immutable captured snapshot payloads for non-terminal held revisions, completed-export source-eligibility evidence, and recovery copies of completed materialization metadata | API-owned encrypted immutable S3 export-hold registry prefix independent of API PostgreSQL backups | Retained until every held revision and expiry schedule is terminally released or reconciled; source-dependent selection pages, derived revision pages, and source-set chunks carry their exact source-expiry deadline and are deleted or made irreversibly inaccessible by an independent storage-retention fence at that deadline even if API lifecycle reconciliation is unavailable; completed-materialization recovery copies and metadata-only source-eligibility inventories remain through the full accessible lifetime of their artifact and are not removable solely because they were reconciled or replayed; after artifact expiry or earlier durable invalidation/removal and terminal cleanup, a minimal terminal tombstone remains until no restorable API, Processor, Query, or Jobs backup can contain the pre-terminal state, then follows export and project-deletion cleanup |
 | Retention policy registry | API; authoritative for shortened-retention duration policies, their current-time effective cutoffs, and restore cleanup | API-owned encrypted immutable S3 control-registry prefix, independent of API PostgreSQL backups | The active policy persists until superseded and its effective cutoff is computed from that duration at enforcement time; superseded versioned policy records are retained for 13 months and the active policy is loaded before restored owners accept traffic |
 | Deletion tombstone registry | API; authoritative for deletion fencing and restore cleanup | API-owned encrypted immutable S3 control-registry prefix, independent of API PostgreSQL backups | Non-customer-readable keyed tombstones retained for 13 months; loaded before restored owners accept traffic |
 | Authorization revocation intents and tombstones | API; authoritative for pre-commit Query fencing and restore recovery of an authorization revocation | API-owned encrypted immutable S3 control-registry prefix, independent of API PostgreSQL backups | Unresolved intents remain until the Query fence acknowledgement and authoritative revocation commit are reconciled; resolved minimal revocation tombstones remain until no restorable API or Query backup can predate the revocation, then follow the authorization and audit lifecycle owned by #15; they contain no customer payload |
@@ -236,16 +237,27 @@ conflicting payload, marker, or digest for an existing `(partition, sequence)`
 is an integrity failure; there is no distributed transaction or best-effort
 publication.
 
-After restoring its processing store, Processor digest-verifies the retained
-canonical replay evidence and reconciles each logical partition's canonical
-sequence high-water mark and publication state before becoming ready or
-allocating a new sequence. The reconciliation compares surviving ClickHouse
-rows, retained canonical replay changes, and immutable no-row sequence
-tombstones with the restored staging, outbox, and publication-confirmation
-state, reconstructs the highest evidenced sequence and published-contiguous
-watermark, and commits the result before accepting reservations. Missing,
-truncated, or conflicting evidence leaves Processor unready and prevents new
-canonical reservations until recovery is complete.
+Processor advances an authenticated, idempotent restore-independent sequence
+baseline for each logical partition as part of reservation and publication
+reconciliation. The baseline records the highest reserved sequence, the
+published-contiguous watermark, and the digest covering the publication state;
+it is a monotonic allocation floor rather than telemetry or replay storage.
+Sequence allocation cannot move below the baseline, and a reserved sequence
+that later becomes retention-expired still uses the existing no-row skip path.
+The baseline remains independent of Processor's PostgreSQL backups for as long
+as an older processing backup can be restored.
+
+After restoring its processing store, Processor first loads and digest-verifies
+the restore-independent sequence baseline, then reconciles each logical
+partition's canonical sequence high-water mark and publication state before
+becoming ready or allocating a new sequence. The baseline is the hard lower
+bound for allocation and publication state: a restored local store may be
+advanced to that baseline, but it may never lower or reuse it. Reconciliation
+also compares surviving ClickHouse rows, retained canonical replay changes,
+and immutable no-row sequence tombstones with the restored staging, outbox, and
+publication-confirmation state. Missing, truncated, or conflicting baseline
+or telemetry evidence leaves Processor unready and prevents new canonical
+reservations until recovery is complete.
 
 Query stores the highest contiguous applied sequence and its digest for each
 logical partition. It rejects a gap or a conflicting equal sequence and
@@ -977,7 +989,14 @@ deadline. For every non-terminal held revision,
 the registry also retains the immutable bounded selection pages, derived
 revision pages, and source-set chunks with their descriptor, cursor, page/chunk,
 and final digests; Processor receives these owner-scoped payload pages through
-`ControlRegistrySnapshotV1` and persists them before readiness. The same
+`ControlRegistrySnapshotV1` and persists them before readiness. Before releasing
+a successfully completed hold, API materializes a compact
+metadata-only source-eligibility inventory from the captured pages and chunks.
+It retains each selected source's membership, data class, lifecycle anchor or
+effective cutoff, and integrity digest through the associated artifact's
+accessible lifetime. This inventory is evidence for later policy evaluation,
+not a source-retention hold or a copy of telemetry payload.
+The same
 `completed_at` is carried in
 `ExportCompletionV1`, written to API state only if the final source and
 export-object expiry checks succeed, and used for the export-object expiry
@@ -1280,7 +1299,10 @@ The owning implementation contracts must make these scenarios testable:
    ClickHouse rows, replay changes, and skip tombstones survive; require
    digest-verified sequence and publication-state reconciliation before
    readiness or any new reservation, and leave Processor unready for missing,
-   truncated, or conflicting evidence.
+   truncated, or conflicting evidence. Repeat after those lifecycle-bounded
+   rows and replay changes expire; verify the restore-independent partition
+   baseline prevents sequence reuse, advances the restored local floor, and
+   remains retained through the restorable-backup horizon.
 3. Verify raw-object immutability, SHA-256 and size reconciliation, required
    MSK durability and seven-day default retention settings, shortened-policy
    enforcement without allowing a project duration to extend a shorter class
@@ -1397,13 +1419,16 @@ The owning implementation contracts must make these scenarios testable:
    retention, tombstone, API audit-intent, API audit-journal, export-hold/
    expiry-intent, and unresolved plus resolved authorization-revocation-tombstone
    registry recovery before any restored or rebuilt owner accepts
-   traffic; verify restored Processor digest-verifies and replays retained
-   derived replay batches, reconstructs authoritative aggregate state and
+   traffic; verify restored Processor loads and digest-verifies the
+   restore-independent canonical sequence/publication baselines, then replays
+   retained derived replay batches, reconstructs authoritative aggregate state
+   and
    selected source sets, and reconciles per-aggregate revision high-water marks
    before accepting new derived work; verify it also reconciles immutable
    selection and derived snapshot payload pages and source-set chunks for every
    non-terminal
-   held export, while Query reconciles its owner-scoped export holds and every
+   held export and completed-export source-eligibility inventory, while Query
+   reconciles its owner-scoped export holds and every
    completed, failed, canceled, and expired
    terminal execution fence from the immutable paginated API registry snapshot
    before readiness, including page and final digest validation and the atomic
@@ -1441,7 +1466,8 @@ The owning implementation contracts must make these scenarios testable:
    captured revision, live selection promotions while immutable captured
    selection pages remain export evidence, API-to-Jobs scheduling of source
    expiry before recovery-page copying,
-   the durable completion/expiry intent and complete recovery copy before
+   the durable completion/expiry intent, complete recovery copy, and compact
+   metadata-only source-eligibility inventory before
    `ExportCompletionV1`, `completed_at` reuse from that intent through API and
    Jobs, final optional-source and export-object-expiry plus retention-fence
    checking immediately before
