@@ -101,7 +101,7 @@ canonical telemetry.
 | Enriched records | Processor; authoritative only as processing input | Processor-owned encrypted S3 replay-batch prefix, with separate class metadata | Retained only as needed for replay, no longer than 90 days |
 | Canonical telemetry | Processor; authoritative for the four signal histories | Four independent ClickHouse canonical table families | Immutable history for 90 days from `accepted_at` |
 | Canonical replay representations | Processor; non-authoritative, immutable replay copies of canonical changes and no-row sequence tombstones | Processor-owned encrypted project-scoped S3 replay-batch prefix with separate class metadata | Canonical changes are retained for 90 days from each represented record's `accepted_at`; no-row `CanonicalChangeSkipV1` tombstones are retained through the source-anchored horizon and while a replayable successor sequence could depend on their coverage, or until an authenticated gap-repair baseline is established; purged with their project |
-| Default-generation selections | Processor; authoritative mapping of each `watchtower_id` to its promoted `processing_generation` | Processor-owned PostgreSQL selection state with `processing_generation` stored as `uuid`, plus monotonically revisioned selection changes in Processor canonical replay batches | Retained while its canonical record is eligible; rebuilt from retained selection changes and validated against canonical history before Processor republishes it to Query after recovery |
+| Default-generation selections | Processor; authoritative mapping of each `watchtower_id` to its promoted `processing_generation` | Processor-owned PostgreSQL selection state with `processing_generation` stored as `uuid`, plus monotonically revisioned selection changes and project-scoped rebuild cursors/buffers in Processor canonical replay batches | Retained while its canonical record is eligible; rebuild targets, post-target buffers, and cutover metadata remain until the rebuild completes or fails terminally, then follow the replay horizon; rebuilt from retained selection changes and validated against canonical history before Processor republishes it to Query after recovery |
 | Derived aggregates | Processor; authoritative for mutable derived results | Processor-owned PostgreSQL schemas and encrypted project-scoped derived replay batches | Retention-windowed to thirteen UTC calendar months after `accepted_at` by default or the shortened project policy; expired contributions are removed before they can remain represented in the aggregate, replay batches, or Query projections |
 | Compatibility-only representations | The sole owning adapter for each protocol interface; authoritative only for that boundary | Request-scoped memory or an adapter-owned boundary defined by #16 or its signal contract | No canonical retention; never a shared persistence model |
 | Query projections | Query; authoritative only for read projection state | Query-owned ClickHouse databases or schemas | Rebuildable canonical-signal projections are retained for 90 days; derived-aggregate projections use their authoritative aggregate's lifecycle and retention window; all are purged with the project |
@@ -256,8 +256,17 @@ the published-contiguous watermark `N` for an explicit empty partition. It
 also carries the first retained sequence for a non-empty window or an
 explicit empty-partition value, a fixed per-partition `target_sequence` equal
 to the available watermark captured when Processor durably accepts the rebuild
-request, and an integrity digest over those values. When derived data is
-selected, Processor also captures a monotonically ordered durable
+request, and an integrity digest over those values. When canonical data is
+selected, Processor captures an immutable bounded
+`SelectionRebuildTargetDescriptorV1` containing the rebuild scope, snapshot
+identity, fixed page parameters, entry and page counts, final digest, and the
+current contiguous project-scoped `selection_change_sequence` target. Its
+authenticated pages contain each eligible `(watchtower_id,
+processing_generation, selection_revision)` mapping. Processor retains every
+later selection
+change for the authorized rebuild scope in a rebuild-scoped durable buffer or
+replay stream. When derived data is selected, Processor also captures a
+monotonically ordered durable
 `derived_change_sequence` target for the selected scope and retains every
 later derived change, including newly created aggregates, in a rebuild-scoped
 durable buffer or replay stream. The empty-partition value
@@ -278,17 +287,21 @@ digest. A rebuild that initializes or advances a partition's global checkpoint
 must cover the entire currently eligible retained window; a narrower subrange
 request is rejected for checkpoint recovery and leaves the checkpoint
 unchanged. An unexpired row omitted by a narrower request is not a valid skip.
-Query verifies complete contiguous coverage, advances its checkpoint over
-changes and retention-excluded skip ranges, and writes every eligible row in
-the covered window; missing, stale, conflicting, or unauthorized coverage
-fails the rebuild safely. Processor seals the derived buffer with an
-authenticated `ProjectionRebuildDerivedCutoverV1` marker carrying a later
-`derived_cutover_sequence` and the descriptor/fence digest. Query marks the
-rebuild complete only after it has verified contiguous coverage through the
+Query verifies complete contiguous coverage, complete digest-verified coverage
+of every selection target page, and complete digest-verified coverage of every
+derived target descriptor page, advances its checkpoint over changes and
+retention-excluded skip ranges, and writes every eligible row and target
+selection in the covered window; missing, stale, conflicting, or unauthorized
+coverage fails the rebuild safely. Processor seals the selection buffer with an
+authenticated `ProjectionRebuildSelectionCutoverV1` marker carrying a later
+`selection_cutover_sequence` and the target/fence digest, and seals the derived
+buffer with an authenticated `ProjectionRebuildDerivedCutoverV1` marker carrying
+a later `derived_cutover_sequence` and the descriptor/fence digest. Query marks
+the rebuild complete only after it has verified contiguous coverage through the
 authenticated `target_sequence` for every requested partition, applied every
-buffered derived change through that cutover, and atomically recorded the
-derived cursor and cutover fence; sequences published after that fixed target
-remain on the normal live-change path. An empty retained window records the
+buffered selection and derived change through their cutovers, and atomically
+recorded the selection and derived cursors and cutover fences; sequences
+published after those fixed cursors remain on the normal live-change path. An empty retained window records the
 published-contiguous watermark `N` as its baseline, allowing Query to accept
 the next live sequence without resetting the partition. A missing, conflicting,
 or stale marker fails the rebuild safely; it cannot reset a live partition or
@@ -675,12 +688,18 @@ aggregate computation and publication use only rows selected by the authoritativ
 default-generation mapping; candidate generations are excluded until promotion.
 Processor assigns every selection change a strictly monotonic per-`watchtower_id`
 selection revision, persists that revision with the mapping, and emits it with
-canonical replay metadata. Query and every recovery or rebuild consumer retain
-the highest applied revision for each record, ignore lower revisions, and treat
-an equal revision as an idempotent replay only when it has the same selection.
-After recovery or rebuild, Processor replays retained selection changes,
-validates the resulting mapping against canonical history, and only then
-republishes the selection to Query. External historical imports are not supported.
+canonical replay metadata. It also assigns every selection change a strictly
+monotonic project-scoped `selection_change_sequence`; the sequence is the
+rebuild cursor and is contiguous across records. Query and every recovery or
+rebuild consumer retain the highest applied revision for each record, ignore
+lower revisions, and treat an equal revision as an idempotent replay only when
+it has the same selection. During a projection rebuild, Processor retains
+selection changes after the immutable target in the rebuild-scoped buffer, and
+Query applies them only through the authenticated selection cutover cursor.
+After recovery or rebuild, Processor replays the retained selection target and
+selection changes, validates the resulting mapping against canonical history,
+and only then republishes the selection to Query. External historical imports
+are not supported.
 
 ## Export Contract
 
@@ -1053,7 +1072,9 @@ compare the selected aggregate state, aggregate revisions, and retention-windowe
 source set with complete digest-verified coverage across the matching
 per-aggregate derived revision snapshot page entries and source-set chunks;
 projection rebuild completion additionally requires the immutable accepted
-derived key/revision target descriptor and complete digest-verified coverage;
+selection target and derived key/revision target descriptors, complete
+digest-verified coverage, and the authenticated selection and derived cutover
+cursors;
 no scalar revision is used to claim cross-aggregate completion.
 Correlation-ID digests are compared only for represented records in the same
 dimension. A mismatch is not silently repaired or treated as successful
@@ -1167,20 +1188,25 @@ The owning implementation contracts must make these scenarios testable:
    that each requested canonical partition receives a matching
    `ProjectionRebuildBaselineV1` marker before its first retained sequence,
    captures an authenticated fixed available `target_sequence` for every
-   requested partition and an immutable bounded derived key/revision target
-   descriptor of every eligible aggregate key and `authoritative_revision` at
-   acceptance when derived data is selected, retains post-target derived
-   changes including a newly created aggregate in a durable rebuild buffer, and
-   emits and validates an authenticated
-   `ProjectionRebuildDerivedCutoverV1` through a later derived cursor, and accepts a first
-   sequence greater than one without
+   requested partition and an immutable bounded selection target plus
+   project-scoped `selection_change_sequence` target when canonical data is
+   selected, retains post-target selection changes in a durable rebuild buffer,
+   and emits and validates an authenticated
+   `ProjectionRebuildSelectionCutoverV1` through a later selection cursor;
+   captures an immutable bounded derived key/revision target descriptor of
+   every eligible aggregate key and `authoritative_revision` at acceptance when
+   derived data is selected, retains post-target derived changes including a
+   newly created aggregate in a durable rebuild buffer, and emits and validates
+   an authenticated `ProjectionRebuildDerivedCutoverV1` through a later derived
+   cursor, and accepts a first sequence greater than one without
    a false gap; emits and validates
    contiguous authenticated `ProjectionRebuildSkipV1` coverage only for
    retention-excluded interleaved sequences, live `CanonicalChangeSkipV1`
    coverage for an expired staged sequence, writes every eligible row before
    advancing the global checkpoint, declares completion only through each fixed
-   target and after complete digest-verified coverage of every derived
-   descriptor entry, leaves that checkpoint unchanged for an incomplete
+   canonical, selection, and derived target and after complete digest-verified
+   coverage of every selection and derived descriptor entry and buffered change,
+   leaves that checkpoint unchanged for an incomplete
    subrange request, and fails safely when coverage is missing, stale,
    incomplete, or mismatched. When all
    retained rows have expired while a later sequence is reserved but not yet
@@ -1328,7 +1354,10 @@ The owning implementation contracts must make these scenarios testable:
    distinct processing generations, full-range promotion, preservation of the
    prior default result, ordered per-record selection revisions with stale
    delivery rejection, selection-state recovery and republishing after a
-   Processor rebuild, generation-aware cross-stage reconciliation, derived
+   Processor rebuild, an in-flight promotion buffered after the immutable
+   rebuild selection target and applied through the selection cutover cursor,
+   safe rejection of incomplete or conflicting selection cutover coverage,
+   generation-aware cross-stage reconciliation, derived
    aggregates exclude candidate generations, consistent derived-aggregate
    lifecycle anchors after later contributions, and rejection of lower or
    conflicting equal derived-aggregate revisions; reject a corrupted or truncated

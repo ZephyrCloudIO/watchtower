@@ -129,19 +129,22 @@ The allowed protocol and data-flow direction is:
    `ExportSnapshotHoldInstallV1` request, accepts Query's authorized
    `ProjectionRebuildV1` requests, captures a fixed available,
    published-contiguous target watermark for each requested partition and, when
-   derived data is selected, an immutable bounded derived key/revision target
-   descriptor plus a monotonically ordered durable `derived_change_sequence`
-   target at request acceptance. It emits a matching
-   `ProjectionRebuildBaselineV1` marker before the first retained sequence or
-   at that watermark for an empty rebuild, and emits contiguous change or
-   authenticated skip coverage through each fixed target. Processor retains
-   every selected-scope derived change after the descriptor target, including a
-   newly created aggregate, in a rebuild-scoped durable buffer or replay stream.
-   It seals that buffer with an authenticated
-   `ProjectionRebuildDerivedCutoverV1` marker carrying a later derived cursor;
-   Query applies the descriptor and every buffered change through that cursor
-   before recording the derived cutover and declaring the rebuild complete.
-   Changes after the cutover remain on the normal live-change path. A
+   canonical data is selected, an immutable bounded
+   `SelectionRebuildTargetDescriptorV1` plus a project-scoped
+   `selection_change_sequence` target. When derived data is selected, it also
+   captures an immutable bounded derived key/revision target descriptor plus a
+   monotonically ordered durable `derived_change_sequence` target at request
+   acceptance. It emits a matching `ProjectionRebuildBaselineV1` marker before
+   the first retained sequence or at that watermark for an empty rebuild, and
+   emits contiguous change or authenticated skip coverage through each fixed
+   target. Processor retains every selected-scope selection change and derived
+   change after their respective targets, including a newly created aggregate,
+   in rebuild-scoped durable buffers or replay streams. It seals those buffers
+   with authenticated `ProjectionRebuildSelectionCutoverV1` and
+   `ProjectionRebuildDerivedCutoverV1` markers carrying later cursors; Query
+   applies each target and every buffered change through its cursor before
+   recording the cutover fences and declaring the rebuild complete. Changes
+   after either cutover remain on the normal live-change path. A
    retention-expired
    staged live write uses an idempotent no-row `CanonicalChangeSkipV1` marker
    for its reserved sequence only when no authoritative ClickHouse row exists;
@@ -589,8 +592,16 @@ fences, durably records the request and its idempotency state with `rebuild_id`
 stored as PostgreSQL `uuid` before acknowledging it. At durable request
 acceptance, Processor captures the current available, published-contiguous
 watermark as an immutable `target_sequence` for every requested canonical
-partition. When derived data is selected, it also captures an immutable bounded
-derived key/revision target descriptor of every eligible aggregate key and its
+partition. When canonical data is selected, it also captures an immutable
+bounded `SelectionRebuildTargetDescriptorV1` containing the rebuild scope,
+snapshot identity, fixed page parameters, entry and page counts, final digest,
+and the current contiguous project-scoped `selection_change_sequence` target.
+Its authenticated pages contain each eligible `(watchtower_id,
+processing_generation, selection_revision)` mapping. Processor retains every
+selection change after that target for the authorized rebuild scope in a
+rebuild-scoped durable buffer or replay stream. When derived data is selected,
+it also captures an immutable bounded derived key/revision target descriptor of
+every eligible aggregate key and its
 `authoritative_revision` at acceptance, with bounded authenticated pages and a
 final descriptor digest, plus a monotonically ordered durable
 `derived_change_sequence` target for the selected scope. Processor retains
@@ -611,19 +622,22 @@ digest. A rebuild that initializes or advances a partition's global checkpoint
 must cover the entire currently eligible retained window; a narrower subrange
 request is rejected for checkpoint recovery and leaves the checkpoint
 unchanged. An unexpired row omitted by a narrower request is not a valid skip.
-Query verifies complete contiguous canonical coverage and complete
+Query verifies complete contiguous canonical coverage, complete
+digest-verified coverage of every selection target page, and complete
 digest-verified coverage of every derived target descriptor page, advances its
 checkpoint over changes and retention-excluded skip ranges, and writes every
-eligible row in the covered window; missing, stale, conflicting, unauthorized,
-or incomplete derived coverage fails the rebuild safely. Processor then seals
-the rebuild-scoped derived buffer with an authenticated
-`ProjectionRebuildDerivedCutoverV1` marker carrying a later
-`derived_cutover_sequence` and the descriptor/fence digest. Query validates the
-marker, applies every buffered derived change through that cursor, atomically
-records the derived cursor and cutover fence, and only then declares the rebuild
-complete. Changes published after that cursor remain on the normal live-change
-path; missing, repeated, conflicting, stale, or incomplete cutover coverage
-fails the rebuild safely.
+eligible row and target selection in the covered window; missing, stale,
+conflicting, unauthorized, or incomplete coverage fails the rebuild safely.
+Processor then seals the rebuild-scoped selection buffer with an authenticated
+`ProjectionRebuildSelectionCutoverV1` marker carrying a later
+`selection_cutover_sequence` and the target/fence digest, and seals the derived
+buffer with an authenticated `ProjectionRebuildDerivedCutoverV1` marker carrying
+a later `derived_cutover_sequence` and its descriptor/fence digest. Query
+validates each marker, applies every buffered selection and derived change
+through its cursor, atomically records the selection and derived cursors and
+cutover fences, and only then declares the rebuild complete. Changes published
+after either cursor remain on the normal live-change path; missing, repeated,
+conflicting, stale, or incomplete cutover coverage fails the rebuild safely.
 The correlated response reports durable acceptance or a terminal safe error;
 Query never accesses Processor persistence directly.
 
@@ -1052,13 +1066,17 @@ become runtime acceptance criteria for the owning implementation issues:
     canonical sequence is greater than one installs the matching
     `ProjectionRebuildBaselineV1` marker before applying changes, captures and
     authenticates a fixed available target watermark for each partition and an
-    immutable bounded derived key/revision target descriptor of every eligible
-    aggregate key and `authoritative_revision` when selected, retains post-target
-    derived changes including newly created aggregates in a durable rebuild
-    buffer, and emits an authenticated
-    `ProjectionRebuildDerivedCutoverV1` through a later derived cursor;
-    verifies complete digest-checked coverage through every canonical and
-    derived target and every buffered change through that cutover before declaring
+    immutable bounded selection target plus project-scoped selection cursor when
+    canonical data is selected, retains post-target selection changes in a
+    durable rebuild buffer, and emits an authenticated
+    `ProjectionRebuildSelectionCutoverV1` through a later selection cursor;
+    captures an immutable bounded derived key/revision target descriptor of
+    every eligible aggregate key and `authoritative_revision` when selected,
+    retains post-target derived changes including newly created aggregates in a
+    durable rebuild buffer, and emits an authenticated
+    `ProjectionRebuildDerivedCutoverV1` through a later derived cursor; verifies
+    complete digest-checked coverage through every canonical, selection, and
+    derived target and every buffered change through its cutover before declaring
     completion, and emits
     contiguous `ProjectionRebuildSkipV1` coverage only for retention-excluded
     sequences, writes every eligible row before advancing the global checkpoint,
