@@ -81,7 +81,7 @@ authorization PRD.
 | Ingest | Protocol admission, raw-record writes, and recoverable handoff capacity. | Ingest owns admission outcomes and stops successful admission when safe capacity is exhausted; accepted raw records and handoffs remain recoverable. |
 | API | Control-plane, artifact, release, and Sentry management request load. | API owns control mutations and management compatibility responses; API failure does not stop valid Ingest admission or Query reads while their security projections remain fresh. |
 | Processor | Asynchronous normalization, privacy, enrichment, symbolication, and aggregate processing backlog. | Processor owns processing lag and recovery; failure preserves durable handoff work and does not create public business routes or direct storage fallbacks. |
-| Query | Native and compatible read load, projection consumption, indexes, and caches. | Query owns query results and projection freshness; Query failure stops query routes and Sentry management reads. Ordinary API-owned mutations continue, but mutations that require Query's synchronous durable fence or acknowledgement fail closed while Query is unavailable. |
+| Query | Native and compatible read load, projection consumption, indexes, and caches. | Query owns query results and projection freshness; Query failure stops query routes and Sentry management reads. Ordinary API-owned mutations continue, but mutations that require a synchronous durable fence or acknowledgement from an affected public owner fail closed while that owner is unavailable. |
 | Jobs | Scheduling, lease, retry, dead-letter, and asynchronous execution load. | Jobs owns scheduling and execution outcomes; failure preserves durable requests and domain owners remain the only writers of domain state. |
 | Web | Browser asset delivery and client-local UI work. | Web owns the browser experience and static assets; Web failure does not grant the browser server authority or stop server-owned mutations and processing. |
 
@@ -92,7 +92,10 @@ The allowed protocol and data-flow direction is:
 1. Browsers and external clients reach public routes through the shared L7
    routing layer. They cannot reach internal messages or RPCs.
 2. Ingest accepts telemetry and consumes API-published changes for local
-   authorization-related projections. It publishes recoverable processing
+   authorization-related projections. For a revocation that affects
+   telemetry-write permission, Ingest also durably installs the matching
+   `AuthorizationRevocationFenceV1` revision and rejects affected public
+   admission before acknowledging the fence. It publishes recoverable processing
    handoff work and consumes Processor's terminal `RawHandoffDispositionV1`
    messages or Jobs' `RawRetentionExpiryV1` commands before retiring the
    corresponding raw state. A `RawRetentionExpiryV1` command may carry either
@@ -104,11 +107,11 @@ The allowed protocol and data-flow direction is:
    publishes the durable `RawHandoffExpiryFenceV1` to Processor when it
    records an expiry fence.
 3. API accepts control-plane, release, artifact, and Sentry management
-   commands. It publishes versioned change events. API may call Query's
-   authenticated internal interfaces for Sentry management reads and authorized
-   export download-gateway issuance and `AuthorizationRevocationFenceV1` for
-   immediate revocation across affected Query admissions, reads, caches, and
-   downloads, and Processor's authenticated
+   commands. It publishes versioned change events. API may call affected public
+   owners' authenticated internal interfaces, including Ingest and Query for
+   `AuthorizationRevocationFenceV1`: Ingest fences telemetry-write admission
+   when write permission is revoked, while Query fences affected admissions,
+   reads, caches, and downloads. API also calls Processor's authenticated
    `ExportSnapshotHoldInstallV1` interface at export creation. When the hold
 response includes a source-expiry deadline, API first durably creates its
 `ExportExpiryScheduleV1` in Jobs; before scheduling execution, API also
@@ -142,14 +145,18 @@ retrieves bounded authenticated selection pages, derived
    `SelectionRebuildTargetDescriptorV1` plus a project-scoped
    `selection_change_sequence` target. When derived data is selected, it also
    captures an immutable bounded derived key/revision target descriptor plus a
-   monotonically ordered durable `derived_change_sequence` target at request
-   acceptance. It emits a matching `ProjectionRebuildBaselineV1` marker before
+   monotonically ordered project-scoped `(tenant_id, project_id)`
+   `derived_change_sequence` target at request acceptance. Every committed
+   derived aggregate change consumes the next sequence, regardless of the
+   requested rebuild scope. It emits a matching `ProjectionRebuildBaselineV1` marker before
    the first retained sequence or at that watermark for an empty rebuild, and
    emits contiguous change or authenticated skip coverage through each fixed
    target. Processor retains every project-scoped selection change after the
    selection target, including changes outside the authorized rebuild scope,
-   and every selected-scope derived change after its target, including a newly
-   created aggregate, in rebuild-scoped durable buffers or replay streams. It
+   and every project-scoped derived change after its target, including changes
+   outside the authorized rebuild scope and newly created aggregates, in
+   rebuild-scoped durable buffers or replay streams. Query consumes every
+   derived sequence while applying only the authorized scope. It
    seals the canonical
    buffer for each requested partition with an authenticated
    `ProjectionRebuildCanonicalCutoverV1` marker carrying a later
@@ -296,18 +303,19 @@ retrieves bounded authenticated selection pages, derived
    and terminal-fence pages through that interface; Query obtains its
    owner-scoped export-hold, terminal-fence, and completed-materialization
    recovery pages, while Jobs obtains its owner-scoped export-schedule, non-terminal
-   execution, and terminal-fence pages. Query's pages include every unresolved
-   desired authorization-revocation fence as well as resolved tombstones.
+   execution, and terminal-fence pages. Ingest and Query's owner-scoped pages
+   include every unresolved desired authorization-revocation fence relevant to
+   that owner as well as resolved tombstones.
    After reconciliation, each owner sends a final
    `ControlRegistryReadinessCommitV1` acknowledgement with the descriptor
    generation and digest. API atomically compares that pair with the current
    registry and records the owner-ready cutover: a concurrent mutation either
    waits behind that cutover or causes the acknowledgement to fail and the owner
    to remain unready until it installs a fresh descriptor. Owners become ready
-   only after this acknowledgement. API and Query apply resolved
-   authorization-revocation tombstones before readiness, and Query installs all
-   unresolved revocation fences before readiness and enforces them on affected
-   paths. Query installs a terminal execution fence before releasing a projection
+   only after this acknowledgement. API, Ingest, and Query apply resolved
+   authorization-revocation tombstones before readiness, and every affected
+   public owner installs its unresolved revocation fences before readiness and
+   enforces them on affected paths. Query installs a terminal execution fence before releasing a projection
    hold, and Jobs installs every restored terminal fence before re-enabling export
    dispatch or scheduling.
 7. Before Ingest, Processor, Query, or Jobs begins a break-glass, restoration,
@@ -334,9 +342,10 @@ This direction contains no circular protocol or persistence dependency. API
 outages do not immediately stop valid Ingest admission or Query reads while
 their security projections remain valid. Query outages stop Query routes and
 Sentry management reads, but not ordinary API-owned mutations. API-owned
-mutations that require Query's synchronous durable fence or acknowledgement,
-including retention-policy shortening, project deletion, and
-authorization-revocation fencing, fail closed while Query is unavailable.
+mutations that require a synchronous durable fence or acknowledgement from an
+affected public owner, including retention-policy shortening, project
+deletion, and authorization-revocation fencing, fail closed while that owner
+is unavailable.
 Processor or Jobs outages preserve durable work for later processing.
 
 ## Data Flow and Failure Boundaries
@@ -736,11 +745,15 @@ projection. When derived data is selected,
 it also captures an immutable bounded derived key/revision target descriptor of
 every eligible aggregate key and its
 `authoritative_revision` at acceptance, with bounded authenticated pages and a
-final descriptor digest, plus a monotonically ordered durable
-`derived_change_sequence` target for the selected scope. Processor retains
-every derived change after that target, including a newly created aggregate,
-in a rebuild-scoped durable buffer or replay stream rather than allowing a
-staged projection to omit it. When canonical data is selected, before
+   final descriptor digest, plus a monotonically ordered project-scoped
+   `(tenant_id, project_id)` `derived_change_sequence` target. Every committed
+   derived aggregate change consumes the next sequence, regardless of the
+   requested rebuild scope. Processor retains every derived change after that
+   target, including changes outside the authorized rebuild scope and newly
+   created aggregates, in a rebuild-scoped durable buffer or replay stream
+   rather than allowing a staged projection to omit its cursor coverage. Query
+   advances over every sequence while applying only the authorized scope. When
+   canonical data is selected, before
 republishing eligible versioned canonical changes through its normal change
 path, Processor emits a matching `ProjectionRebuildBaselineV1` marker for each
 requested canonical partition.
@@ -986,21 +999,23 @@ existing minimal post-deletion evidence after their project context key is
 destroyed.
 
 The authorization-revocation fence is a versioned unary Protobuf-over-HTTP call
-under `/internal/v1` from API to Query. API first appends a durable pre-commit
-revocation intent to its restore-independent authorization-revocation registry,
-then sends the affected actor, project or export scope, the monotonic
-authorization revision, correlation identifier, and idempotency key. Query
-durably persists the highest fence and acknowledges it; only then may API commit
-the authoritative revocation or acknowledge it. API retains a minimal resolved
-revocation tombstone, containing the scope, authorization revision, registry
-generation, and integrity digest but no customer payload, until no restorable
-API or Query backup can predate it. API reloads unresolved intents
-before accepting traffic after recovery, reapplies the highest fences, and
-retries unresolved commits. Every affected native and compatible Query
+under `/internal/v1` from API to every affected public owner, including Ingest
+and Query. API first appends a durable pre-commit revocation intent to its
+restore-independent authorization-revocation registry, then sends each owner
+the affected actor, project or export scope, the monotonic authorization
+revision, correlation identifier, and idempotency key. Each affected owner
+durably persists its highest fence and acknowledges it; Ingest rejects affected
+telemetry-write admission and Query rejects affected native and compatible
 admission, read, provider/index, cache lookup, cache use, gateway issuance, and
-download request must reject authorization at or below that fence until the
-matching security projection revision is installed, even when the asynchronous
-security projection is still within its normal freshness boundary.
+download requests at or below that fence. Only after every affected owner has
+acknowledged may API commit the authoritative revocation or acknowledge it.
+API retains a minimal resolved revocation tombstone, containing the scope,
+authorization revision, registry generation, and integrity digest but no
+customer payload, until no restorable API or affected-owner backup can predate
+it. API reloads unresolved intents before accepting traffic after recovery,
+reapplies the highest fences at every affected owner, and retries unresolved
+commits. These owner-local fences remain authoritative even when an
+asynchronous security projection is still within its normal freshness boundary.
 
 | Canonical code | HTTP status |
 | --- | ---: |
@@ -1313,16 +1328,19 @@ become runtime acceptance criteria for the owning implementation issues:
     committing the PostgreSQL audit row and acknowledges only after both
     boundaries are durable.
 16. Revoke authorization after a native or compatible Query read, cache entry,
-    or export URL exists and verify the restore-independent pre-commit intent is
-    durable, Query's synchronous revision fence is installed before the
-    authoritative revocation commit, and the fence blocks every affected
-    admission, read, cache lookup/use, issuance, and download despite stale
-    asynchronous projection state; recover after each boundary and verify an
-    unresolved intent retries the fence and commit, a resolved minimal tombstone
-    remains through the applicable restorable-backup horizon and is reapplied before API or
-    Query readiness, and a restored Query receives and enforces every unresolved
-    desired revocation fence before its readiness cutover; Query unavailability leaves API durably fail-closed
-    rather than acknowledging the revocation.
+    export URL, or telemetry-write attempt exists and verify the
+    restore-independent pre-commit intent is durable. When write permission is
+    affected, Ingest's synchronous revision fence must be installed before the
+    authoritative revocation commit and must block telemetry admission; Query's
+    fence must likewise block every affected admission, read, cache lookup/use,
+    issuance, and download despite stale asynchronous projection state. Recover
+    after each boundary and verify an unresolved intent retries every required
+    owner fence and commit, a resolved minimal tombstone remains through the
+    applicable restorable-backup horizon and is reapplied before API, Ingest, or
+    Query readiness, and restored owners receive and enforce every unresolved
+    desired revocation fence before their readiness cutovers. Unavailable
+    required owners leave API durably fail-closed rather than acknowledging the
+    revocation.
 17. Restore Ingest, Processor, Query, and Jobs independently and verify each
     obtains and persists immutable, paginated current retention-policy,
     deletion-tombstone, resolved and unresolved authorization-revocation, and

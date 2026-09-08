@@ -101,7 +101,7 @@ canonical telemetry.
 | Enriched records | Processor; authoritative only as processing input | Processor-owned encrypted S3 replay-batch prefix, with separate class metadata | Retained only as needed for replay, no longer than 90 days |
 | Canonical telemetry | Processor; authoritative for the four signal histories | Four independent ClickHouse canonical table families | Immutable history for 90 days from `accepted_at` |
 | Canonical replay representations | Processor; non-authoritative, immutable replay copies of canonical changes and no-row sequence tombstones | Processor-owned encrypted project-scoped S3 replay-batch prefix with separate class metadata | Canonical changes are retained for 90 days from each represented record's `accepted_at`; no-row `CanonicalChangeSkipV1` tombstones are retained through the source-anchored horizon and while a replayable successor sequence could depend on their coverage, or until an authenticated gap-repair baseline is established; purged with their project |
-| Canonical sequence/publication baselines | Processor; authoritative restore-independent allocation and publication baseline for each logical canonical partition | Processor-owned encrypted immutable sequence-baseline ledger independent of Processor PostgreSQL backups | Each baseline records the highest reserved sequence, published-contiguous watermark, and integrity/publication digest; it remains until no restorable Processor or Query backup can predate it, then is purged with the project |
+| Canonical sequence/publication baselines | Processor; authoritative restore-independent allocation and publication baseline for each logical canonical partition | Processor-owned encrypted immutable sequence-baseline ledger independent of Processor PostgreSQL backups | Each baseline records the highest reserved sequence, published-contiguous watermark, integrity/publication digest, and recovery intent for every reserved sequence; intents retain enough evidence to publish the row or construct its no-row skip, and remain until no restorable Processor or Query backup can predate them, then are purged with the project |
 | Default-generation selections | Processor; authoritative mapping of each `watchtower_id` to its promoted `processing_generation` | Processor-owned PostgreSQL selection state with `processing_generation` stored as `uuid`, plus monotonically revisioned selection changes and project-scoped rebuild cursors/buffers in Processor canonical replay batches | Retained while its canonical record is eligible; rebuild targets, post-target buffers, and cutover metadata remain until the rebuild completes or fails terminally, then follow the replay horizon; rebuilt from retained selection changes and validated against canonical history before Processor republishes it to Query after recovery |
 | Derived aggregates | Processor; authoritative for mutable derived results | Processor-owned PostgreSQL schemas and encrypted project-scoped derived replay batches | Retention-windowed to thirteen UTC calendar months after `accepted_at` by default or the shortened project policy; Processor persists each contribution's effective cutoff with aggregate state and selected source-set state and locally enforces expiry, while Jobs provides reconciliation; expired contributions are removed before they can remain represented in the aggregate, replay batches, or Query projections |
 | Compatibility-only representations | The sole owning adapter for each protocol interface; authoritative only for that boundary | Request-scoped memory or an adapter-owned boundary defined by #16 or its signal contract | No canonical retention; never a shared persistence model |
@@ -114,7 +114,7 @@ canonical telemetry.
 | API export hold registry | API; authoritative for restore-independent export hold, terminal-release, completion/expiry scheduling evidence, immutable captured snapshot payloads for non-terminal held revisions, completed-export source-eligibility evidence, and recovery copies of completed materialization metadata | API-owned encrypted immutable S3 export-hold registry prefix independent of API PostgreSQL backups | Retained until every held revision and expiry schedule is terminally released or reconciled; source-dependent selection pages, derived revision pages, and source-set chunks carry their exact source-expiry deadline and are deleted or made irreversibly inaccessible by an independent storage-retention fence at that deadline even if API lifecycle reconciliation is unavailable; completed-materialization recovery copies and metadata-only source-eligibility inventories remain through the full accessible lifetime of their artifact and are not removable solely because they were reconciled or replayed; after artifact expiry or earlier durable invalidation/removal and terminal cleanup, a minimal terminal tombstone remains until no restorable API, Processor, Query, or Jobs backup can contain the pre-terminal state, then follows export and project-deletion cleanup |
 | Retention policy registry | API; authoritative for shortened-retention duration policies, their current-time effective cutoffs, and restore cleanup | API-owned encrypted immutable S3 control-registry prefix, independent of API PostgreSQL backups | The active policy persists until superseded and its effective cutoff is computed from that duration at enforcement time; superseded versioned policy records are retained for 13 months and the active policy is loaded before restored owners accept traffic |
 | Deletion tombstone registry | API; authoritative for deletion fencing and restore cleanup | API-owned encrypted immutable S3 control-registry prefix, independent of API PostgreSQL backups | Non-customer-readable keyed tombstones retained for 13 months; loaded before restored owners accept traffic |
-| Authorization revocation intents and tombstones | API; authoritative for pre-commit Query fencing and restore recovery of an authorization revocation | API-owned encrypted immutable S3 control-registry prefix, independent of API PostgreSQL backups | Unresolved intents remain until the Query fence acknowledgement and authoritative revocation commit are reconciled; resolved minimal revocation tombstones remain until no restorable API or Query backup can predate the revocation, then follow the authorization and audit lifecycle owned by #15; they contain no customer payload |
+| Authorization revocation intents and tombstones | API; authoritative for pre-commit fencing at every affected public owner and restore recovery of an authorization revocation | API-owned encrypted immutable S3 control-registry prefix, independent of API PostgreSQL backups | Unresolved intents remain until every affected public owner acknowledges its fence and the authoritative revocation commit is reconciled; resolved minimal revocation tombstones remain until no restorable API or affected-owner backup can predate the revocation, then follow the authorization and audit lifecycle owned by #15; they contain no customer payload |
 | Processing and operational state | The component performing the operation | Its own PostgreSQL database or explicitly owned state boundary | Owned and retained by that component; no cross-component writer |
 
 Jobs owns scheduling, leases, execution history, and other job operational
@@ -244,10 +244,19 @@ publication.
 Processor advances an authenticated, idempotent restore-independent sequence
 baseline for each logical partition as part of reservation and publication
 reconciliation. The baseline records the highest reserved sequence, the
-published-contiguous watermark, and the digest covering the publication state;
-it is a monotonic allocation floor rather than telemetry or replay storage.
-Sequence allocation cannot move below the baseline, and a reserved sequence
-that later becomes retention-expired still uses the existing no-row skip path.
+published-contiguous watermark, and the digest covering the publication state.
+For every reserved sequence it also records an immutable recovery intent keyed
+by the partition and sequence, with the canonical candidate or a durable
+authenticated payload reference, `watchtower_id`, `processing_generation`,
+`accepted_at`, the current cutoff and expiry basis, idempotency and correlation
+context, content digest, and terminal state. The baseline is a monotonic
+allocation floor rather than telemetry or replay storage. Sequence allocation
+cannot move below the baseline, and a reserved sequence that later becomes
+retention-expired still uses the existing no-row skip path. An unresolved
+reservation intent remains in the restore-independent ledger until its row is
+published or its no-row skip is durably recorded; terminal intent evidence is
+retained through the restorable-backup horizon so recovery can distinguish a
+completed row or skip from a missing reservation.
 The baseline remains independent of Processor's PostgreSQL backups for as long
 as an older processing backup can be restored.
 
@@ -258,10 +267,13 @@ becoming ready or allocating a new sequence. The baseline is the hard lower
 bound for allocation and publication state: a restored local store may be
 advanced to that baseline, but it may never lower or reuse it. Reconciliation
 also compares surviving ClickHouse rows, retained canonical replay changes,
-and immutable no-row sequence tombstones with the restored staging, outbox, and
-publication-confirmation state. Missing, truncated, or conflicting baseline
-or telemetry evidence leaves Processor unready and prevents new canonical
-reservations until recovery is complete.
+and immutable no-row sequence tombstones with the restored staging, outbox,
+publication-confirmation state, and every reservation intent. For an intent
+whose local staging or outbox state was lost, Processor uses the retained
+candidate and cutoff evidence to publish the row or construct the matching
+`CanonicalChangeSkipV1` idempotently. Missing, truncated, or conflicting
+baseline, reservation intent, or telemetry evidence leaves Processor unready
+and prevents new canonical reservations until recovery is complete.
 
 Query stores the highest contiguous applied sequence and its digest for each
 logical partition. It rejects a gap or a conflicting equal sequence and
@@ -295,15 +307,23 @@ rebuild scope, in a rebuild-scoped durable buffer or replay stream. This
 preserves contiguous project-scoped sequence coverage through the selection
 cutover; Query consumes that complete sequence through the authenticated cursor
 while applying only changes within the authorized rebuild scope to the staged
-projection. When derived data is selected, Processor also captures a
-monotonically ordered durable
-`derived_change_sequence` target for the selected scope and retains every
-later derived change, including newly created aggregates, in a rebuild-scoped
-durable buffer or replay stream. The empty-partition value
+projection. When derived data is selected, Processor also captures the current
+contiguous target of a monotonically ordered durable `derived_change_sequence`
+partition scoped to `(tenant_id, project_id)`. Every committed derived
+aggregate create, update, deletion, or expiry consumes the next sequence in
+that project-wide partition, regardless of the requested rebuild scope; an
+arbitrary rebuild scope never creates its own counter. Processor retains every
+later project-scoped derived change, including changes outside the authorized
+rebuild scope and newly created aggregates, in a rebuild-scoped durable buffer
+or replay stream through the derived cutover. Query consumes every sequence
+through the authenticated cursor, advancing over an out-of-scope change
+without mutating the staged projection, so out-of-scope changes cannot create
+a coverage hole. The empty-partition value
 is used when all changes through `N` have expired, so the marker carries
 `baseline_sequence = N` rather than an unavailable predecessor. Reserved,
-staged, or otherwise unpublished sequences are excluded from both `N` and the
-fixed target.
+staged, or otherwise unpublished canonical sequences are excluded from `N` and
+the fixed canonical target; the derived target includes only committed derived
+changes.
 Query verifies that the
 marker matches the rebuild request and current fences, stages the requested
 partition from that baseline, and atomically records the baseline as its
@@ -340,9 +360,10 @@ after those cutovers and withholds them from the normal live path. Query marks
 the rebuild complete only after it has verified contiguous coverage through the
 authenticated `target_sequence` for every requested partition, applied every
 buffered canonical and selection change through their cutovers and, when
-derived data is selected, every buffered derived change through its cutover,
-atomically activated the staged projection, recorded the applicable cursors and
-cutover fences, and sent an authenticated `ProjectionRebuildActivationAckV1` to
+derived data is selected, every project-scoped derived sequence through its
+cutover, including cursor-only application of out-of-scope changes, atomically
+activated the staged projection, recorded the applicable cursors and cutover
+fences, and sent an authenticated `ProjectionRebuildActivationAckV1` to
 Processor. Processor then releases each applicable post-cutover buffer in order;
 sequences published after the acknowledgement use the normal live-change path.
 If Query detects
@@ -1126,15 +1147,17 @@ gateway URL and again for every download request; the URL expiry never exceeds
 object expiry. For immediate revocation, API first appends a durable pre-commit
 revocation intent to its restore-independent authorization-revocation registry,
 then uses a synchronous revision-fenced handoff: every issued URL carries the
-API authorization revision, and API waits for Query to durably install an
-`AuthorizationRevocationFenceV1` revision before committing the authoritative
-revocation or acknowledging an actor, project, or export revocation. API loads
-unresolved revocation intents before accepting traffic after recovery and
-retries the fence and authoritative commit. Query rejects every affected native and
-compatible admission, read, provider/index, cache lookup, cache use, issuance,
-or download whose authorization revision is at or below the installed fence
-until the matching security projection revision is installed, regardless of
-asynchronous projection freshness. API never accesses Query object storage or
+API authorization revision, and API waits for every affected public owner to
+durably install an `AuthorizationRevocationFenceV1` revision before committing
+the authoritative revocation or acknowledging an actor, project, or export
+revocation. When telemetry-write permission is affected, that owner includes
+Ingest, which rejects affected admission; Query rejects every affected native
+and compatible admission, read, provider/index, cache lookup, cache use,
+issuance, or download whose authorization revision is at or below the installed
+fence until the matching security projection revision is installed, regardless
+of asynchronous projection freshness. API loads unresolved revocation intents
+before accepting traffic after recovery and retries every required owner fence
+and the authoritative commit. API never accesses Query object storage or
 signing credentials, and gateway URLs never grant direct object-store access.
 The URL is never issued for a deleted, unauthorized, revoked, or expired export.
 Deletion cancels active exports and revokes issued download access. Any attempt
@@ -1229,7 +1252,8 @@ projection rebuild completion additionally requires the immutable accepted
 selection target when canonical data is selected and the derived key/revision
 target descriptor when derived data is selected, complete digest-verified
 coverage for each selected target, and the authenticated selection cutover
-cursor plus the derived cutover cursor when derived data is selected;
+cursor plus complete project-scoped derived cursor coverage through the derived
+cutover when derived data is selected, including out-of-scope changes;
 no scalar revision is used to claim cross-aggregate completion.
 Correlation-ID digests are compared only for represented records in the same
 dimension. A mismatch is not silently repaired or treated as successful
@@ -1321,7 +1345,10 @@ The owning implementation contracts must make these scenarios testable:
    ClickHouse rows, replay changes, and skip tombstones survive; require
    digest-verified sequence and publication-state reconciliation before
    readiness or any new reservation, and leave Processor unready for missing,
-   truncated, or conflicting evidence. Repeat after those lifecycle-bounded
+   truncated, or conflicting baseline or per-reservation intent evidence; for
+   each unresolved intent, publish the retained candidate or its matching
+   `CanonicalChangeSkipV1` before readiness. Repeat after those
+   lifecycle-bounded
    rows and replay changes expire; verify the restore-independent partition
    baseline prevents sequence reuse, advances the restored local floor, and
    remains retained through the restorable-backup horizon.
@@ -1366,10 +1393,13 @@ The owning implementation contracts must make these scenarios testable:
    cutover is required;
    captures an immutable bounded derived key/revision target descriptor of
    every eligible aggregate key and `authoritative_revision` at acceptance when
-   derived data is selected, retains post-target derived changes including a
-   newly created aggregate in a durable rebuild buffer, and emits and validates
-   an authenticated `ProjectionRebuildDerivedCutoverV1` through a later derived
-   cursor; when derived data is not selected, no derived target or cutover is
+   derived data is selected, uses the project-scoped `(tenant_id, project_id)`
+   `derived_change_sequence` target, retains every post-target derived change
+   including out-of-scope changes and newly created aggregates in a durable
+   rebuild buffer, and emits and validates an authenticated
+   `ProjectionRebuildDerivedCutoverV1` through a later derived cursor; Query
+   advances that cursor over every sequence while applying only the authorized
+   scope. When derived data is not selected, no derived target or cutover is
    required. The rebuild holds post-cutover changes until Query atomically
    activates the staged projection and acknowledges
    `ProjectionRebuildActivationAckV1` only
