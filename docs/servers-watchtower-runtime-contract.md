@@ -87,9 +87,10 @@ limited to mTLS certificates, CA bundles, and broker, storage, or service
 credentials. An invalid reload retains the last-known-good value and emits an
 operational alert; all other configuration changes require deployment.
 
-Detailed roles, WorkOS behavior, credential lifecycle, PII handling, retention,
-deletion, abuse controls, and compliance gates remain owned by issues #15 and
-#18.
+Detailed roles, WorkOS behavior, credential lifecycle, PII handling, abuse
+controls, and compliance gates remain owned by issues #15 and #18. Canonical
+storage lifecycle, retention, deletion, restoration, and replay mechanics
+remain owned by #14.
 
 ## Health, Readiness, and Shutdown
 
@@ -123,10 +124,13 @@ every message version still inside the replay horizon.
 Persistence changes use expand/contract sequencing so rollout and whole-stack
 rollback remain safe without destructive storage changes. API failure does not
 stop ingest or query while their security projections remain valid. Query
-failure stops query routes and Sentry management reads but not API-owned
-mutations. Processor or Jobs failure preserves durable work for later
-processing. No component bypasses an unavailable owner through direct storage
-access.
+failure stops query routes and Sentry management reads, and ordinary API-owned
+mutations continue only when they do not require Query's synchronous durable
+fence or acknowledgement. Retention-policy shortening, project deletion, and
+authorization revocation fail closed or remain durably `accepted_pending` while
+Query is unavailable; no API path treats them as successful and no component
+bypasses Query through direct storage access. Processor or Jobs failure
+preserves durable work for later processing.
 
 Structured logs, metrics, and distributed spans propagate W3C trace context and
 UUID v7 request, operation, and message identifiers. Required metrics cover
