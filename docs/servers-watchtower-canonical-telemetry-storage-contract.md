@@ -101,17 +101,17 @@ canonical telemetry.
 | Enriched records | Processor; authoritative only as processing input | Processor-owned encrypted S3 replay-batch prefix, with separate class metadata | Retained only as needed for replay, no longer than 90 days |
 | Canonical telemetry | Processor; authoritative for the four signal histories | Four independent ClickHouse canonical table families | Immutable history for 90 days from `accepted_at` |
 | Canonical replay representations | Processor; non-authoritative, immutable replay copies of canonical changes and no-row sequence tombstones | Processor-owned encrypted project-scoped S3 replay-batch prefix with separate class metadata | Canonical changes are retained for 90 days from each represented record's `accepted_at`; no-row `CanonicalChangeSkipV1` tombstones are retained through the source-anchored horizon and while a replayable successor sequence could depend on their coverage, or until an authenticated gap-repair baseline is established; purged with their project |
-| Canonical sequence/publication baselines | Processor; authoritative restore-independent allocation and publication baseline for each logical canonical partition | Processor-owned encrypted immutable sequence-baseline ledger independent of Processor PostgreSQL backups | Each baseline records the highest reserved sequence, published-contiguous watermark, integrity/publication digest, and recovery intent for every reserved sequence; an intent's canonical candidate or payload reference is retained only through the applicable canonical cutoff and independently deleted or irreversibly fenced at that cutoff, while non-payload sequence, digest, cutoff, skip, and terminal evidence remains until no restorable Processor or Query backup can predate it, then is purged with the project |
+| Canonical and derived sequence/publication baselines | Processor; authoritative restore-independent allocation, publication, and derived-change cursor baseline for each logical canonical partition and project-scoped derived sequence | Processor-owned encrypted immutable sequence-baseline ledger independent of Processor PostgreSQL backups | Each canonical baseline records the highest reserved sequence, published-contiguous watermark, integrity/publication digest, and recovery intent for every reserved sequence; each derived baseline records the project-scoped sequence high-water, digest, and recovery intent for every reserved sequence. Payload references are retained only through the applicable cutoff and independently deleted or irreversibly fenced at that cutoff, while non-payload sequence, digest, cutoff, skip, and terminal evidence remains until no restorable Processor or Query backup can predate it, then is purged with the project |
 | Default-generation selections | Processor; authoritative mapping of each `watchtower_id` to its promoted `processing_generation` | Processor-owned PostgreSQL selection state with `processing_generation` stored as `uuid`, plus monotonically revisioned selection changes and project-scoped rebuild cursors/buffers in Processor canonical replay batches | Retained while its canonical record is eligible; rebuild targets, post-target buffers, and cutover metadata remain until the rebuild completes or fails terminally, then follow the replay horizon; rebuilt from retained selection changes and validated against canonical history before Processor republishes it to Query after recovery |
 | Derived aggregates | Processor; authoritative for mutable derived results | Processor-owned PostgreSQL schemas and encrypted project-scoped derived replay batches | Retention-windowed to thirteen UTC calendar months after `accepted_at` by default or the shortened project policy; Processor persists each contribution's effective cutoff with aggregate state and selected source-set state and locally enforces expiry, while Jobs provides reconciliation; expired contributions are removed before they can remain represented in the aggregate, replay batches, or Query projections |
 | Compatibility-only representations | The sole owning adapter for each protocol interface; authoritative only for that boundary | Request-scoped memory or an adapter-owned boundary defined by #16 or its signal contract | No canonical retention; never a shared persistence model |
-| Query projections | Query; authoritative only for read projection state | Query-owned ClickHouse databases or schemas | Rebuildable canonical-signal projections are retained for 90 days; derived-aggregate projections use their authoritative aggregate's lifecycle and retention window; all are purged with the project |
+| Query projections | Query; authoritative only for read projection state | Query-owned ClickHouse databases or schemas | Rebuildable canonical-signal projections are retained for 90 days; derived-aggregate projections use their authoritative aggregate's lifecycle and retention window; non-payload applied-sequence and publication-outcome evidence remains through the applicable restorable-backup horizon; all are purged with the project |
 | Query export metadata | Query; authoritative for export materialization state and `snapshot_generation` | Query-owned PostgreSQL export-metadata boundary | Retained with the export lifecycle and purged with the project; it is not a second export authority and contains no raw telemetry |
 | Query cache | Query; never authoritative | Encrypted Query-owned cache | At most 15 minutes; immediately invalidated for retention, deletion, or authorization changes |
 | Export objects | Query; non-authoritative customer-download artifacts | Encrypted Query-owned project-scoped S3 export prefix | The earlier of seven days from API `completed_at` and the active export-object policy cutoff computed from `completed_at` for successful artifacts; artifacts from any attempt that terminates without successful `completed`, including failed or canceled attempts, are removed or made inaccessible at terminal transition, and Query's owner-side expiry fence removes or makes each successful artifact inaccessible at its exact cutoff even when API lifecycle reconciliation is delayed |
 | Audit events | API for contract-level lifecycle and access audit authority | API-owned append-only PostgreSQL audit boundary with erasable encrypted project-scoped context, plus a restore-independent immutable audit journal | Detailed history follows #15; every journaled event is replayable after an API database restore, and deleted projects retain only minimal anonymous evidence |
 | API restore audit intents | API; authoritative for pre-restore intent evidence until API records the outcome in its audit boundary | API-owned encrypted immutable S3 audit-intent prefix independent of API PostgreSQL backups | Retained through restore completion and evidence recording, then follows the applicable audit-retention policy; never stored only in the API restore target |
-| API export hold registry | API; authoritative for restore-independent export hold, terminal-release, completion/expiry scheduling evidence, immutable captured snapshot payloads for non-terminal held revisions, completed-export source-eligibility evidence, and recovery copies of completed materialization metadata | API-owned encrypted immutable S3 export-hold registry prefix independent of API PostgreSQL backups | Retained until every held revision and expiry schedule is terminally released or reconciled; source-dependent selection pages, derived revision pages, and source-set chunks carry their exact source-expiry deadline and are deleted or made irreversibly inaccessible by an independent storage-retention fence at that deadline even if API lifecycle reconciliation is unavailable; completed-materialization recovery copies and metadata-only source-eligibility inventories remain through the full accessible lifetime of their artifact and are not removable solely because they were reconciled or replayed; after artifact expiry or earlier durable invalidation/removal and terminal cleanup, a minimal terminal tombstone remains until no restorable API, Processor, Query, or Jobs backup can contain the pre-terminal state, then follows export and project-deletion cleanup |
+| API export hold registry | API; authoritative for restore-independent export hold, terminal-release, completion/expiry scheduling evidence, immutable captured snapshot payloads for unexpired non-terminal held revisions, owner-scoped source-expiry fences for expired revisions, completed-export source-eligibility evidence, and recovery copies of completed materialization metadata | API-owned encrypted immutable S3 export-hold registry prefix independent of API PostgreSQL backups | Retained until every held revision and expiry schedule is terminally released or reconciled; source-dependent selection pages, derived revision pages, and source-set chunks carry their exact source-expiry deadline and are deleted or made irreversibly inaccessible by an independent storage-retention fence at that deadline even if API lifecycle reconciliation is unavailable, while a bounded owner-scoped source-expiry fence remains as non-payload recovery evidence through the applicable restorable-backup horizon; completed-materialization recovery copies and metadata-only source-eligibility inventories remain through the full accessible lifetime of their artifact and are not removable solely because they were reconciled or replayed; after artifact expiry or earlier durable invalidation/removal and terminal cleanup, a minimal terminal tombstone remains until no restorable API, Processor, Query, or Jobs backup can contain the pre-terminal state, then follows export and project-deletion cleanup |
 | Retention policy registry | API; authoritative for shortened-retention duration policies, their current-time effective cutoffs, and restore cleanup | API-owned encrypted immutable S3 control-registry prefix, independent of API PostgreSQL backups | The active policy persists until superseded and its effective cutoff is computed from that duration at enforcement time; superseded versioned policy records are retained for 13 months and the active policy is loaded before restored owners accept traffic |
 | Deletion tombstone registry | API; authoritative for deletion fencing and restore cleanup | API-owned encrypted immutable S3 control-registry prefix, independent of API PostgreSQL backups | Non-customer-readable keyed tombstones retained for 13 months; loaded before restored owners accept traffic |
 | Authorization revocation intents and tombstones | API; authoritative for pre-commit fencing at every affected public owner and restore recovery of an authorization revocation | API-owned encrypted immutable S3 control-registry prefix, independent of API PostgreSQL backups | Unresolved intents remain until every affected public owner acknowledges its fence and the authoritative revocation commit is reconciled; resolved minimal revocation tombstones remain until no restorable API or affected-owner backup can predate the revocation, then follow the authorization and audit lifecycle owned by #15; they contain no customer payload |
@@ -249,54 +249,66 @@ conflicting payload, marker, or digest for an existing `(partition, sequence)`
 is an integrity failure; there is no distributed transaction or best-effort
 publication.
 
-Processor advances an authenticated, idempotent restore-independent sequence
-baseline for each logical partition as part of reservation and publication
-reconciliation. Reservation ordering is ledger-first: the immutable intent and
-sequence allocation are durably appended before the local Processor
-PostgreSQL reservation is committed or acknowledged, and orphan intents are
-reconciled before a later sequence is allocated. The baseline records the
-highest reserved sequence, the published-contiguous watermark, and the digest
-covering the publication state. For every reserved sequence it also records
-an immutable recovery intent keyed by the partition and sequence, with the
-canonical candidate or a durable authenticated payload reference only while
-the record remains before its applicable 90-day or shortened-policy cutoff,
-`watchtower_id`, `processing_generation`, `accepted_at`, the cutoff and expiry
-basis, idempotency and correlation context, content digest, and terminal state.
-At that cutoff, Processor independently deletes or irreversibly fences the
-candidate and payload reference; the unresolved intent retains only non-payload
-sequence, digest, cutoff, skip, and terminal evidence. The baseline is a
-monotonic allocation floor rather than telemetry or replay storage. Sequence
-allocation cannot move below the baseline, and a reserved sequence that later
-becomes retention-expired still uses the existing no-row skip path. An
-unresolved reservation intent remains in the restore-independent ledger until
-its row is published or its no-row skip is durably recorded; terminal
-non-payload intent evidence is retained through the restorable-backup horizon
-so recovery can distinguish a completed row or skip from a missing
-reservation.
+Processor advances authenticated, idempotent restore-independent sequence
+baselines for each logical canonical partition and each project-scoped derived
+sequence as part of allocation and publication reconciliation. Reservation
+ordering is ledger-first: the immutable intent and sequence allocation are
+durably appended before the local Processor PostgreSQL reservation or aggregate
+change is committed or acknowledged, and orphan intents are reconciled before a
+later sequence is allocated. Canonical baselines record the highest reserved
+sequence, the published-contiguous watermark, and the digest covering
+publication state. Derived baselines record the project-scoped sequence
+high-water and digest. Every reserved derived sequence has terminal committed-
+change or authenticated no-op evidence, so a failed local transaction cannot
+leave a cursor hole or permit sequence reuse. For every reserved canonical
+sequence, the ledger also records an immutable recovery intent keyed by the
+partition and sequence, with the canonical candidate or a durable authenticated
+payload reference only while the record remains before its applicable 90-day or
+shortened-policy cutoff, `watchtower_id`, `processing_generation`,
+`accepted_at`, the cutoff and expiry basis, idempotency and correlation context,
+content digest, and terminal state. At that cutoff, Processor independently
+deletes or irreversibly fences payload references; unresolved intents retain
+only non-payload sequence, digest, cutoff, skip, and terminal evidence. Both
+baselines are monotonic allocation floors rather than telemetry or replay
+storage. Allocation cannot move below either floor, and terminal non-payload
+intent evidence remains through the restorable-backup horizon so recovery can
+distinguish completed change, no-op, row, or skip outcomes from missing
+reservations.
 The baseline remains independent of Processor's PostgreSQL backups for as long
 as an older processing backup can be restored.
 
 After restoring its processing store, Processor first loads and digest-verifies
-the restore-independent sequence baseline, then reconciles each logical
-partition's canonical sequence high-water mark and publication state before
-becoming ready or allocating a new sequence. The baseline is the hard lower
-bound for allocation and publication state: a restored local store may be
-advanced to that baseline, but it may never lower or reuse it. Reconciliation
-also compares surviving ClickHouse rows, retained canonical replay changes,
-and immutable no-row sequence tombstones with the restored staging, outbox,
-publication-confirmation state, and every reservation intent. For an intent
-whose local staging or outbox state was lost, Processor uses the retained
-candidate to publish the row only while the record remains before its cutoff.
-At or after the cutoff, the payload is unavailable: recovery removes and
-verifies the absence of any authoritative row, then constructs the matching
-`CanonicalChangeSkipV1` from non-payload intent evidence idempotently. Missing,
-truncated, or conflicting baseline, reservation intent, or telemetry evidence
-leaves Processor unready and prevents new canonical reservations until recovery
-is complete.
+the restore-independent canonical and derived sequence baselines, then
+reconciles canonical and derived high-water marks, publication state, and
+aggregate state before becoming ready or allocating a new sequence or revision.
+The baselines are hard lower bounds: a restored local store may be advanced to
+them, but may never lower or reuse either floor. Reconciliation also compares
+surviving ClickHouse rows, retained canonical and derived replay changes, and
+immutable no-row sequence tombstones with restored staging, outbox,
+publication-confirmation state, aggregate state, and every reservation intent.
+When local canonical publication confirmation is missing, Processor sends an
+authenticated `CanonicalPublicationReconcileV1` request to Query for the
+partition, sequence, expected digest, and idempotency context. Query returns a
+durable matching row, skip, or absent outcome; it retains the applied outcome
+and digest through the restorable-backup horizon. A matching applied outcome
+terminalizes the ledger intent and advances the published-contiguous watermark
+without emitting a replacement skip. Only an explicit absent outcome, together
+with verified absence of an authoritative row, permits Processor to construct
+the matching `CanonicalChangeSkipV1` idempotently. A conflicting or unavailable
+reconciliation result leaves Processor unready. Before the cutoff, a retained
+candidate may still be republished idempotently. Missing, truncated, or
+conflicting baseline, reservation intent, or telemetry evidence likewise leaves
+Processor unready and prevents new canonical or derived work until recovery is
+complete.
 
 Query stores the highest contiguous applied sequence and its digest for each
-logical partition. It rejects a gap or a conflicting equal sequence and
-replays missing sequences through the normal Processor-owned change path.
+logical partition, plus the applied row/skip outcome needed for publication
+reconciliation. It rejects a gap or a conflicting equal sequence and replays
+missing sequences through the normal Processor-owned change path. Query serves
+the authenticated `CanonicalPublicationReconcileV1` handoff without exposing
+its persistence: a matching applied row or skip is idempotently confirmed, an
+uncovered sequence is reported absent, and a conflicting digest is an integrity
+failure.
 `ProjectionRebuildV1` is the only path that may initialize a lost Query
 checkpoint or repair a live gap after a replay tombstone has been retired.
 The gap-repair request names the missing partition and sequence, and Processor
@@ -804,14 +816,17 @@ the complete requested range passes integrity validation. Processor commits each
 candidate row to canonical ClickHouse and durably publishes its canonical change
 before it can promote that row's authoritative default-generation mapping.
 Publication confirmation is the existing Processor durable canonical publication
-state and published-contiguous watermark; it does not require a Query
-projection acknowledgement. Promotion also performs the current-cutoff and
-row-existence check and updates the mapping only after every candidate row has
-publication confirmation and the full range succeeds. A partial or failed range,
-an unconfirmed publication, or a failed final eligibility check never becomes
-the default and the prior default result remains active; recovery either
-completes publication and promotion or removes the candidate and emits the
-appropriate skip without leaving a mapping to an unavailable generation.
+state and published-contiguous watermark. It does not require a successful
+Query projection acknowledgement before initial publication, but a missing
+local confirmation is reconciled through `CanonicalPublicationReconcileV1`
+before an expired intent can become a skip. Promotion also performs the
+current-cutoff and row-existence check and updates the mapping only after every
+candidate row has publication confirmation and the full range succeeds. A
+partial or failed range, an unconfirmed publication, or a failed final
+eligibility check never becomes the default and the prior default result remains
+active; recovery either completes publication and promotion or removes the
+candidate and emits the appropriate skip without leaving a mapping to an
+unavailable generation.
 Derived aggregate computation and publication use only rows selected by the
 authoritative default-generation mapping; candidate generations are excluded
 until promotion.
@@ -845,8 +860,11 @@ The registry is append-only, keyed by `export_id` and held
 `export_revision`, and records the authorized scope, requested range, selected
 signals, every hold, cancellation, release, and completion/expiry intent, the
 corresponding owner acknowledgements, and the immutable bounded selection pages,
-derived revision pages, and source-set chunks captured for each non-terminal
-held revision. At export
+derived revision pages, and source-set chunks captured for each unexpired
+non-terminal held revision. When a source deadline has elapsed before API
+lifecycle reconciliation, the registry retains only the bounded owner-scoped
+source-expiry fence for that held revision after its source-dependent pages are
+independently removed. At export
 creation, API sends Processor an
 authenticated, versioned `ExportSnapshotHoldInstallV1` request containing
 `export_id` and `export_revision`, authorized tenant and project scope,
@@ -1047,12 +1065,16 @@ recovery copy of Query's materialization metadata: manifest content and digest,
 artifact object references and digests, the canonical partition-sequence vector,
 derived revision snapshot descriptor and digest, selection-snapshot descriptor
 and digest, `snapshot_generation`, and the effective export-object expiry
-deadline. For every non-terminal held revision,
-the registry also retains the immutable bounded selection pages, derived
+deadline. For every non-terminal held revision whose source deadline has not
+elapsed, the registry retains the immutable bounded selection pages, derived
 revision pages, and source-set chunks with their descriptor, cursor, page/chunk,
 and final digests; Processor receives these owner-scoped payload pages through
-`ControlRegistrySnapshotV1` and persists them before readiness. Before releasing
-a successfully completed hold, API materializes a compact
+`ControlRegistrySnapshotV1` and persists them before readiness. For a source-
+expired non-terminal revision, the registry instead retains a minimal
+owner-scoped terminal `ExportSnapshotSourceExpiryFenceV1` containing the held
+revision, effective source deadline, authorized scope, and integrity evidence;
+Processor receives and reconciles that fence without requiring deleted payload
+pages. Before releasing a successfully completed hold, API materializes a compact
 metadata-only source-eligibility inventory from the captured pages and chunks.
 It retains each selected source's membership, data class, lifecycle anchor or
 effective cutoff, and integrity digest through the associated artifact's
@@ -1366,12 +1388,20 @@ The owning implementation contracts must make these scenarios testable:
    readiness or any new reservation, and leave Processor unready for missing,
    truncated, or conflicting baseline or per-reservation intent evidence; for
    each unresolved intent, publish its retained candidate only while it remains
-   before the cutoff, and otherwise independently fence or delete the payload
-   and publish its matching `CanonicalChangeSkipV1` before readiness. Repeat
-   after those lifecycle-bounded
+   before the cutoff, and otherwise reconcile Query's durable
+   `CanonicalPublicationReconcileV1` outcome before readiness: a matching
+   applied row or skip must terminalize the intent without a replacement skip,
+   while only an explicit absent outcome plus verified row absence may publish
+   `CanonicalChangeSkipV1`. A conflicting or unavailable outcome leaves
+   Processor unready. Repeat after those lifecycle-bounded
    rows and replay changes expire; verify the restore-independent partition
    baseline prevents sequence reuse, advances the restored local floor, and
-   remains retained through the restorable-backup horizon.
+   remains retained through the restorable-backup horizon. Restore an older
+   Processor PostgreSQL state after derived replay batches expire and verify
+   the restore-independent project-scoped `derived_change_sequence` high-water
+   prevents reuse or regression, preserves rebuild target/cursor coverage, and
+   leaves Processor unready for missing or conflicting derived baseline
+   evidence.
 3. Verify raw-object immutability, SHA-256 and size reconciliation, required
    MSK durability and seven-day default retention settings, shortened-policy
    enforcement without allowing a project duration to extend a shorter class
@@ -1413,8 +1443,9 @@ The owning implementation contracts must make these scenarios testable:
    cutover is required;
    captures an immutable bounded derived key/revision target descriptor of
    every eligible aggregate key and `authoritative_revision` at acceptance when
-   derived data is selected, uses the project-scoped `(tenant_id, project_id)`
-   `derived_change_sequence` target, retains every post-target derived change
+   derived data is selected, uses the restore-independent project-scoped
+   `(tenant_id, project_id)` `derived_change_sequence` high-water as its target,
+   retains every post-target derived change
    including out-of-scope changes and newly created aggregates in a durable
    rebuild buffer, and emits and validates an authenticated
    `ProjectionRebuildDerivedCutoverV1` through a later derived cursor; Query
@@ -1497,14 +1528,17 @@ The owning implementation contracts must make these scenarios testable:
    expiry-intent, and unresolved plus resolved authorization-revocation-tombstone
    registry recovery before any restored or rebuilt owner accepts
    traffic; verify restored Processor loads and digest-verifies the
-   restore-independent canonical sequence/publication baselines, then replays
+   restore-independent canonical and derived sequence/publication baselines,
+   then replays
    retained derived replay batches, reconstructs authoritative aggregate state
    and
    selected source sets, and reconciles per-aggregate revision high-water marks
    before accepting new derived work; verify it also reconciles immutable
    selection and derived snapshot payload pages and source-set chunks for every
-   non-terminal
-   held export and completed-export source-eligibility inventory, while Query
+   non-terminal held export whose source deadline has not elapsed; verify that
+   an elapsed source deadline supplies an owner-scoped
+   `ExportSnapshotSourceExpiryFenceV1` and allows Processor readiness without
+   deleted payload pages, while Query
    reconciles its owner-scoped export holds and every
    completed, failed, canceled, and expired
    terminal execution fence from the immutable paginated API registry snapshot

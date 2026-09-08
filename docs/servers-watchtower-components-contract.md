@@ -131,7 +131,10 @@ retrieves bounded authenticated selection pages, derived
    for Query's artifact invalidation acknowledgement in the post-commit phase,
    but never reads another component's persistence directly.
 4. Processor consumes Ingest handoff work and relevant API changes. It
-   publishes canonical and derived changes, installs the export-scoped hold and
+   publishes canonical and derived changes; when local canonical publication
+   confirmation is missing, Query serves the authenticated
+   `CanonicalPublicationReconcileV1` outcome handoff without exposing its
+   persistence. Processor installs the export-scoped hold and
    returns the authoritative canonical partition-sequence vector, immutable
    selection-snapshot descriptor, derived revision snapshot descriptor, and
    earliest held-source
@@ -146,9 +149,11 @@ retrieves bounded authenticated selection pages, derived
    `selection_change_sequence` target. When derived data is selected, it also
    captures an immutable bounded derived key/revision target descriptor plus a
    monotonically ordered project-scoped `(tenant_id, project_id)`
-   `derived_change_sequence` target at request acceptance. Every committed
-   derived aggregate change consumes the next sequence, regardless of the
-   requested rebuild scope. It emits a matching `ProjectionRebuildBaselineV1` marker before
+   `derived_change_sequence` target at request acceptance from the
+   restore-independent derived sequence baseline. Every committed derived
+   aggregate change consumes the next sequence, regardless of the requested
+   rebuild scope; a restored local counter may advance to the baseline but may
+   never regress or reuse it. It emits a matching `ProjectionRebuildBaselineV1` marker before
    the first retained sequence or at that watermark for an empty rebuild, and
    emits contiguous change or authenticated skip coverage through each fixed
    target. Processor retains every project-scoped selection change after the
@@ -187,21 +192,27 @@ retrieves bounded authenticated selection pages, derived
    for its reserved sequence only when no authoritative ClickHouse row exists;
    if the row was committed while still within its cutoff and publication then
    failed, Processor reconciles and publishes the row; if the cutoff arrives
-   after commit but before publication, recovery removes the row, verifies its
-   absence, and publishes the skip. Live consumers therefore receive
+   after commit but before publication, recovery first reconciles Query's
+   applied row/skip outcome and only when it is explicitly absent removes the
+   row, verifies its absence, and publishes the skip. Live consumers therefore receive
    contiguous coverage, and Processor persists each live skip marker in the
    retained canonical replay class so it remains available through the replay
    horizon.
    Before Processor becomes ready after restoring its processing store, it
    loads and digest-verifies the restore-independent canonical
-   sequence/publication baseline, then replays retained canonical and derived
-   evidence and reconciles restored staging, outbox, publication-confirmation,
-   aggregate, and selected-source state. The baseline is the hard allocation
-   floor; a restored local counter may advance to it but may not regress or
-   reuse a sequence. Missing, truncated, or conflicting baseline or replay
-   evidence leaves Processor unready; it accepts no new canonical sequence
-   reservation or derived aggregate work and allocates no revision until
-   reconciliation is committed.
+   sequence/publication and project-scoped derived sequence baselines, then
+   replays retained canonical and derived evidence and reconciles restored
+   staging, outbox, publication-confirmation, aggregate, and selected-source
+   state. The baselines are hard allocation floors; restored local counters may
+   advance to them but may not regress or reuse a sequence. When local canonical
+   publication confirmation is missing, Processor reconciles Query through
+   `CanonicalPublicationReconcileV1`; a matching applied row or skip completes
+   the ledger intent, while an absent outcome permits a skip only after the
+   authoritative row is verified absent. Missing, truncated, conflicting, or
+   unavailable baseline, replay, or publication-outcome evidence leaves
+   Processor unready; it accepts no new canonical sequence reservation or
+   derived aggregate work and allocates no revision until reconciliation is
+   committed.
    It publishes a
    terminal
    `RawHandoffDispositionV1` to Ingest for every completed,
@@ -299,8 +310,9 @@ retrieves bounded authenticated selection pages, derived
    owner scope, cursor order, page digests, counts, and final digest before
    persisting the complete snapshot. A new registry generation creates a new
    immutable descriptor; it cannot mutate pages already being restored.
-   Processor obtains its owner-scoped export-hold, immutable snapshot-payload,
-   and terminal-fence pages through that interface; Query obtains its
+   Processor obtains its owner-scoped export-hold, immutable snapshot-payload
+   pages for unexpired holds, source-expiry fence pages for elapsed holds, and
+   other terminal-fence pages through that interface; Query obtains its
    owner-scoped export-hold, terminal-fence, and completed-materialization
    recovery pages, while Jobs obtains its owner-scoped export-schedule, non-terminal
    execution, and terminal-fence pages. Ingest and Query's owner-scoped pages
@@ -648,11 +660,16 @@ accepted, API applies each tombstone to the restored export state, preventing
 status regression or redispatch at a lower revision.
 When Processor restores its own store, it receives the owner-scoped desired
 holds, the complete immutable selection and derived snapshot payload pages and
-source-set chunks for every non-terminal held export, every terminal fence that
-can coexist with a restorable backup, and the corresponding digests in the
+source-set chunks for every non-terminal held export whose source deadline has
+not elapsed, plus a minimal owner-scoped terminal
+`ExportSnapshotSourceExpiryFenceV1` for each source-expired hold whose payload
+pages were independently removed. It also receives every terminal fence that
+can coexist with a restorable backup and the corresponding digests in the
 immutable, paginated `ControlRegistrySnapshotV1` descriptor and pages. It
-persists and verifies those payloads before readiness so later selection or
-aggregate revisions cannot replace the captured evidence. When Query restores
+persists and verifies available payloads and fences before readiness; an
+elapsed source-expiry fence causes Processor to remove or make inaccessible
+local captured snapshots and reject delayed retrieval or replay without
+requiring deleted payload pages. When Query restores
 its own store, it receives the owner-scoped desired holds, every terminal fence
 that can coexist with a restorable backup, and completed-export materialization
 and source-eligibility recovery metadata through the same descriptor and pages.
@@ -746,9 +763,10 @@ it also captures an immutable bounded derived key/revision target descriptor of
 every eligible aggregate key and its
 `authoritative_revision` at acceptance, with bounded authenticated pages and a
    final descriptor digest, plus a monotonically ordered project-scoped
-   `(tenant_id, project_id)` `derived_change_sequence` target. Every committed
-   derived aggregate change consumes the next sequence, regardless of the
-   requested rebuild scope. Processor retains every derived change after that
+   `(tenant_id, project_id)` `derived_change_sequence` target taken from the
+   restore-independent derived sequence baseline. Every committed derived
+   aggregate change consumes the next sequence, regardless of the requested
+   rebuild scope. Processor retains every derived change after that
    target, including changes outside the authorized rebuild scope and newly
    created aggregates, in a rebuild-scoped durable buffer or replay stream
    rather than allowing a staged projection to omit its cursor coverage. Query
@@ -876,9 +894,11 @@ readiness. Large completed-export manifests are represented by bounded ordered
 recovery entries or chunks covered by the same descriptor digest.
 
 The owner-scoped Processor snapshot pages include desired export holds, the
-immutable selection and derived snapshot payload pages and source-set chunks,
-and every terminal execution fence from the restore-independent completion
-intent. Query pages include desired export holds and completed-export
+immutable selection and derived snapshot payload pages and source-set chunks
+for unexpired source-dependent holds, the minimal terminal
+`ExportSnapshotSourceExpiryFenceV1` for source-expired holds, and every
+terminal execution fence from the restore-independent completion intent. Query
+pages include desired export holds and completed-export
 materialization recovery metadata, including each effective export-object
 expiry deadline. The owner-scoped Jobs pages include each desired
 `ExportExpiryScheduleV1` in a basis-specific shape: a
@@ -1253,8 +1273,9 @@ become runtime acceptance criteria for the owning implementation issues:
     `ProjectionRebuildSelectionCutoverV1` through a later selection cursor;
     captures an immutable bounded derived key/revision target descriptor of
     every eligible aggregate key and `authoritative_revision` when selected,
-    retains post-target derived changes including newly created aggregates in a
-    durable rebuild buffer, and emits an authenticated
+    takes the project-scoped derived sequence target from the
+    restore-independent high-water, and retains post-target derived changes
+    including newly created aggregates in a durable rebuild buffer, and emits an authenticated
     `ProjectionRebuildDerivedCutoverV1` through a later derived cursor; holds
     post-cutover changes until Query atomically activates the staged projection
     and acknowledges `ProjectionRebuildActivationAckV1`; verifies complete
@@ -1296,7 +1317,11 @@ become runtime acceptance criteria for the owning implementation issues:
     and cleaned up. When Jobs is unavailable at the source deadline, verify
     Processor's persisted hold deadline locally fences and removes captured
     source snapshots and rejects delayed retrieval or replay before later
-    Jobs/API reconciliation.
+    Jobs/API reconciliation. Restore Processor after the source-dependent
+    registry pages have been removed and verify the owner-scoped
+    `ExportSnapshotSourceExpiryFenceV1` is sufficient to reconcile the expired
+    hold and reach readiness without payload pages; an unexpired hold still
+    requires complete digest-verified pages.
     An empty export has no source deadline or source-retention
     schedule or source-deadline check but still receives ordinary
     completed-object expiry. Shortened-retention preparation installs reversible
