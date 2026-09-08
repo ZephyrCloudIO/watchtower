@@ -103,7 +103,7 @@ canonical telemetry.
 | Canonical replay representations | Processor; non-authoritative, immutable replay copies of canonical changes and no-row sequence tombstones | Processor-owned encrypted project-scoped S3 replay-batch prefix with separate class metadata | Canonical changes are retained for 90 days from each represented record's `accepted_at`; no-row `CanonicalChangeSkipV1` tombstones are retained through the source-anchored horizon and while a replayable successor sequence could depend on their coverage, or until an authenticated gap-repair baseline is established; purged with their project |
 | Canonical sequence/publication baselines | Processor; authoritative restore-independent allocation and publication baseline for each logical canonical partition | Processor-owned encrypted immutable sequence-baseline ledger independent of Processor PostgreSQL backups | Each baseline records the highest reserved sequence, published-contiguous watermark, and integrity/publication digest; it remains until no restorable Processor or Query backup can predate it, then is purged with the project |
 | Default-generation selections | Processor; authoritative mapping of each `watchtower_id` to its promoted `processing_generation` | Processor-owned PostgreSQL selection state with `processing_generation` stored as `uuid`, plus monotonically revisioned selection changes and project-scoped rebuild cursors/buffers in Processor canonical replay batches | Retained while its canonical record is eligible; rebuild targets, post-target buffers, and cutover metadata remain until the rebuild completes or fails terminally, then follow the replay horizon; rebuilt from retained selection changes and validated against canonical history before Processor republishes it to Query after recovery |
-| Derived aggregates | Processor; authoritative for mutable derived results | Processor-owned PostgreSQL schemas and encrypted project-scoped derived replay batches | Retention-windowed to thirteen UTC calendar months after `accepted_at` by default or the shortened project policy; expired contributions are removed before they can remain represented in the aggregate, replay batches, or Query projections |
+| Derived aggregates | Processor; authoritative for mutable derived results | Processor-owned PostgreSQL schemas and encrypted project-scoped derived replay batches | Retention-windowed to thirteen UTC calendar months after `accepted_at` by default or the shortened project policy; Processor persists each contribution's effective cutoff with aggregate state and selected source-set state and locally enforces expiry, while Jobs provides reconciliation; expired contributions are removed before they can remain represented in the aggregate, replay batches, or Query projections |
 | Compatibility-only representations | The sole owning adapter for each protocol interface; authoritative only for that boundary | Request-scoped memory or an adapter-owned boundary defined by #16 or its signal contract | No canonical retention; never a shared persistence model |
 | Query projections | Query; authoritative only for read projection state | Query-owned ClickHouse databases or schemas | Rebuildable canonical-signal projections are retained for 90 days; derived-aggregate projections use their authoritative aggregate's lifecycle and retention window; all are purged with the project |
 | Query export metadata | Query; authoritative for export materialization state and `snapshot_generation` | Query-owned PostgreSQL export-metadata boundary | Retained with the export lifecycle and purged with the project; it is not a second export authority and contains no raw telemetry |
@@ -177,8 +177,12 @@ durably records a class-default or shortened-policy expiry fence through
 `RawRetentionExpiryV1`.
 For a `completed` disposition, Processor commits the verified normalized replay
 representation before sending the disposition, so Ingest may retire raw state
-immediately without losing the reprocessing source. Ingest redelivers and
-reconciles pending handoffs if the seven-day MSK window expires.
+immediately without losing the reprocessing source. Ingest retries and
+reconciles pending handoffs while their raw acceptance remains eligible. If a
+handoff remains unprocessed at the seven-day class-default cutoff, the
+`RawRetentionExpiryV1` sweep causes Ingest to durably record `default_expired`
+and fence the handoff; it is not redelivered after the raw source or MSK
+handoff record expires, and late fetches or dispositions are rejected.
 
 Canonical ClickHouse tables are partitioned monthly by `accepted_at` and
 ordered by:
@@ -431,14 +435,20 @@ canonical store; their separate metadata identifies the represented canonical
 versions for reconciliation and deletion. Derived aggregates are
 retention-windowed: Processor removes expired contributions by recomputing or
 deleting each aggregate before they can outlive the applicable thirteen-month
-default or shortened project policy. Their replay batches and Query projections
-contain only that recomputed result. Processor assigns each derived aggregate
-change a strictly monotonic per-project, per-aggregate `authoritative_revision`,
-persists it with the aggregate state and selected source set, and emits it with
-derived change and replay metadata. Query and every recovery or rebuild consumer
-retain the highest applied revision for each aggregate, ignore lower revisions,
-and apply an equal revision only when the aggregate state and selected source
-set match; a conflicting equal revision is rejected as an integrity conflict.
+default or shortened project policy. Processor persists each contribution's
+effective cutoff with the aggregate state and selected source set. Its local
+deadline path independently fences each contribution at that cutoff, recomputes
+or deletes the affected aggregate, records the revisioned result, and publishes
+the derived change. The recurring Jobs baseline is an idempotent reconciliation
+path for missed or duplicate local-deadline work, not the sole expiry trigger.
+Their replay batches and Query projections contain only that recomputed result.
+Processor assigns each derived aggregate change a strictly monotonic
+per-project, per-aggregate `authoritative_revision`, persists it with the
+aggregate state and selected source set, and emits it with derived change and
+replay metadata. Query and every recovery or rebuild consumer retain the highest
+applied revision for each aggregate, ignore lower revisions, and apply an equal
+revision only when the aggregate state and selected source set match; a
+conflicting equal revision is rejected as an integrity conflict.
 Before Processor becomes ready after restoring its processing store, it
 digest-verifies every retained derived replay batch, replays the batches in
 authoritative per-project/per-aggregate revision order, and reconciles the
@@ -615,9 +625,12 @@ schedule is paused during prepare and enabled only after the activation
 handshake. Jobs owns scheduling and retrying each purge dispatch at the
 effective cutoff. At that cutoff, the data owner fences access and removes or
 irreversibly anonymizes active data; retries are recovery mechanics and do not
-create a 14-day grace period. For derived aggregates, the baseline schedule
-recomputes or removes expired contributions and publishes the resulting
-revisioned state so Query projections cannot retain dormant expired data. Before any restored or
+create a 14-day grace period. For derived aggregates, Processor persists each
+contribution's effective cutoff with aggregate state and selected source-set
+state and locally recomputes or removes expired contributions at that deadline,
+publishing the resulting revisioned state so Query projections cannot retain
+dormant expired data. The baseline schedule is an idempotent reconciliation
+path for missed or duplicate local-deadline work, not the sole trigger. Before any restored or
 rebuilt Ingest,
 Processor, Query, or Jobs owner becomes ready, it obtains current
 retention-policy, deletion-tombstone, and applicable authorization-revocation
@@ -747,12 +760,21 @@ an eligible raw source or a verified normalized replay representation is
 rejected rather than reprocessed from an unverified or unavailable source.
 
 A new result uses a new UUID v7 `processing_generation` and is a candidate until
-the complete requested range passes integrity validation. Processor records the
-authoritative default-generation mapping for each `watchtower_id`; promotion
-updates that mapping only after full-range success. A partial or failed range
-never becomes the default and the prior default result remains active. Derived
-aggregate computation and publication use only rows selected by the authoritative
-default-generation mapping; candidate generations are excluded until promotion.
+the complete requested range passes integrity validation. Processor commits each
+candidate row to canonical ClickHouse and durably publishes its canonical change
+before it can promote that row's authoritative default-generation mapping.
+Publication confirmation is the existing Processor durable canonical publication
+state and published-contiguous watermark; it does not require a Query
+projection acknowledgement. Promotion also performs the current-cutoff and
+row-existence check and updates the mapping only after every candidate row has
+publication confirmation and the full range succeeds. A partial or failed range,
+an unconfirmed publication, or a failed final eligibility check never becomes
+the default and the prior default result remains active; recovery either
+completes publication and promotion or removes the candidate and emits the
+appropriate skip without leaving a mapping to an unavailable generation.
+Derived aggregate computation and publication use only rows selected by the
+authoritative default-generation mapping; candidate generations are excluded
+until promotion.
 Processor assigns every selection change a strictly monotonic per-`watchtower_id`
 selection revision, persists that revision with the mapping, and emits it with
 canonical replay metadata. It also assigns every selection change a strictly
@@ -1307,7 +1329,8 @@ The owning implementation contracts must make these scenarios testable:
    MSK durability and seven-day default retention settings, shortened-policy
    enforcement without allowing a project duration to extend a shorter class
    default, normalized-source retention through the applicable raw cutoff
-   before raw retirement, redelivery of unprocessed work after the MSK window expires, the
+   before raw retirement, redelivery and reconciliation of unprocessed work before the
+   MSK/raw cutoff, `default_expired` fencing at that cutoff, the
    `default_expired` disposition for an unprocessed handoff beyond the class
    default, the project-scoped Jobs-to-Ingest `RawRetentionExpiryV1` sweep
    during Processor outage, Ingest enumeration of expired state, rejection of
@@ -1337,8 +1360,10 @@ The owning implementation contracts must make these scenarios testable:
    selected, retains every post-target project-scoped selection change,
    including changes outside the authorized rebuild scope, in a durable rebuild
    buffer,
-   and emits and validates an authenticated
-   `ProjectionRebuildSelectionCutoverV1` through a later selection cursor;
+   and, when canonical data is selected, emits and validates an authenticated
+   `ProjectionRebuildSelectionCutoverV1` through a later selection cursor; when
+   canonical data is not selected, no selection target, buffer, or selection
+   cutover is required;
    captures an immutable bounded derived key/revision target descriptor of
    every eligible aggregate key and `authoritative_revision` at acceptance when
    derived data is selected, retains post-target derived changes including a
@@ -1403,8 +1428,10 @@ The owning implementation contracts must make these scenarios testable:
    values and PostgreSQL `uuid` Jobs state; fencing of
    pending, handoff, replayed, queued, retry, dead-letter, dispatchable, leased,
    and in-flight work; rejection of late execution outcomes; terminal disposition
-   and retirement of policy-fenced raw handoffs; derived-aggregate recomputation
-   without expired contributions; UTC thirteen-calendar-month arithmetic with
+   and retirement of policy-fenced raw handoffs; Processor-local contribution
+   deadlines enforced while Jobs is unavailable, derived-aggregate recomputation
+   without expired contributions, and idempotent Jobs reconciliation; UTC
+   thirteen-calendar-month arithmetic with
    end-of-month clamping; current-time duration enforcement; baseline
    Jobs schedules for default lifecycles even without a shortened policy;
    recurring Jobs-scheduled, owner-run active purges at each effective cutoff
@@ -1535,7 +1562,8 @@ The owning implementation contracts must make these scenarios testable:
 7. Reprocess a successful and a partially failed `[start, end)` range; verify
    that records exactly at `end` are excluded and adjacent ranges do not
    overlap; verify provenance,
-   distinct processing generations, full-range promotion, preservation of the
+   distinct processing generations, publication confirmation for every candidate
+   row before full-range selection promotion, preservation of the
    prior default result, ordered per-record selection revisions with stale
    delivery rejection, selection-state recovery and republishing after a
    Processor rebuild, an in-flight promotion outside the requested `accepted_at`

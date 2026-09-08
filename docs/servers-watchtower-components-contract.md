@@ -351,8 +351,10 @@ Processor disposition or its own expiry fence from `RawRetentionExpiryV1`,
 whether the fence basis is class-default or an active shortened policy.
 
 Processor owns asynchronous normalization, privacy processing, enrichment,
-symbolication execution, canonical telemetry, processing state, and derived
-aggregates. Query consumes Processor's canonical and derived changes and owns
+symbolication execution, canonical telemetry, processing state, derived
+aggregates, and the persisted contribution deadlines used to enforce derived
+expiry locally. Jobs schedules and reconciles that expiry work but is not its
+sole trigger. Query consumes Processor's canonical and derived changes and owns
 all resulting read projections, indexes, and caches.
 
 Sentry management reads enter through API's compatibility boundary. API
@@ -738,10 +740,10 @@ final descriptor digest, plus a monotonically ordered durable
 `derived_change_sequence` target for the selected scope. Processor retains
 every derived change after that target, including a newly created aggregate,
 in a rebuild-scoped durable buffer or replay stream rather than allowing a
-staged projection to omit it. Before republishing eligible versioned
-canonical or derived changes through its normal change path, Processor emits a
-matching `ProjectionRebuildBaselineV1` marker for each requested canonical
-partition.
+staged projection to omit it. When canonical data is selected, before
+republishing eligible versioned canonical changes through its normal change
+path, Processor emits a matching `ProjectionRebuildBaselineV1` marker for each
+requested canonical partition.
 The marker establishes the first retained sequence (or an explicit empty
 partition), carries the fixed target sequence, and is accepted only for its
 matching rebuild and active fences. For every sequence after the baseline
@@ -760,17 +762,19 @@ descriptor page, advances its checkpoint over changes and retention-excluded
 skip ranges, and writes every eligible row and target selection in the covered
 window; missing, stale, conflicting, unauthorized, or incomplete coverage
 fails the rebuild safely.
-Processor then seals each rebuild-scoped canonical buffer with an authenticated
-`ProjectionRebuildCanonicalCutoverV1` marker carrying a later
-`canonical_cutover_sequence` and the target/fence digest, seals the selection
-buffer with an authenticated `ProjectionRebuildSelectionCutoverV1` marker
-carrying a later `selection_cutover_sequence` and the target/fence digest, and
-when derived data is selected, seals the derived buffer with an authenticated
+When canonical data is selected, Processor seals each rebuild-scoped canonical
+buffer with an authenticated `ProjectionRebuildCanonicalCutoverV1` marker
+carrying a later `canonical_cutover_sequence` and the target/fence digest and
+seals the selection buffer with an authenticated
+`ProjectionRebuildSelectionCutoverV1` marker carrying a later
+`selection_cutover_sequence` and the target/fence digest. When derived data is
+selected, it seals the derived buffer with an authenticated
 `ProjectionRebuildDerivedCutoverV1` marker carrying a later
 `derived_cutover_sequence` and its descriptor/fence digest. Processor continues
-buffering every canonical and selection change after their cutovers and, when
-derived data is selected, every derived change after its cutover; it withholds
-all of them from the normal live path. Query validates each applicable marker,
+buffering every applicable canonical and selection change after their cutovers
+and, when derived data is selected, every derived change after its cutover; it
+withholds all of them from the normal live path. Query validates each applicable
+marker,
 applies every buffered canonical and selection change through their cursors and,
 when derived data is selected, every buffered derived change through its cursor,
 atomically activates the staged projection, records the applicable cursors and
