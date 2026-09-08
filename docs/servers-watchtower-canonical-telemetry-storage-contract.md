@@ -101,7 +101,7 @@ canonical telemetry.
 | Enriched records | Processor; authoritative only as processing input | Processor-owned encrypted S3 replay-batch prefix, with separate class metadata | Retained only as needed for replay, no longer than 90 days |
 | Canonical telemetry | Processor; authoritative for the four signal histories | Four independent ClickHouse canonical table families | Immutable history for 90 days from `accepted_at` |
 | Canonical replay representations | Processor; non-authoritative, immutable replay copies of canonical changes and no-row sequence tombstones | Processor-owned encrypted project-scoped S3 replay-batch prefix with separate class metadata | Canonical changes are retained for 90 days from each represented record's `accepted_at`; no-row `CanonicalChangeSkipV1` tombstones are retained through the source-anchored horizon and while a replayable successor sequence could depend on their coverage, or until an authenticated gap-repair baseline is established; purged with their project |
-| Canonical sequence/publication baselines | Processor; authoritative restore-independent allocation and publication baseline for each logical canonical partition | Processor-owned encrypted immutable sequence-baseline ledger independent of Processor PostgreSQL backups | Each baseline records the highest reserved sequence, published-contiguous watermark, integrity/publication digest, and recovery intent for every reserved sequence; intents retain enough evidence to publish the row or construct its no-row skip, and remain until no restorable Processor or Query backup can predate them, then are purged with the project |
+| Canonical sequence/publication baselines | Processor; authoritative restore-independent allocation and publication baseline for each logical canonical partition | Processor-owned encrypted immutable sequence-baseline ledger independent of Processor PostgreSQL backups | Each baseline records the highest reserved sequence, published-contiguous watermark, integrity/publication digest, and recovery intent for every reserved sequence; an intent's canonical candidate or payload reference is retained only through the applicable canonical cutoff and independently deleted or irreversibly fenced at that cutoff, while non-payload sequence, digest, cutoff, skip, and terminal evidence remains until no restorable Processor or Query backup can predate it, then is purged with the project |
 | Default-generation selections | Processor; authoritative mapping of each `watchtower_id` to its promoted `processing_generation` | Processor-owned PostgreSQL selection state with `processing_generation` stored as `uuid`, plus monotonically revisioned selection changes and project-scoped rebuild cursors/buffers in Processor canonical replay batches | Retained while its canonical record is eligible; rebuild targets, post-target buffers, and cutover metadata remain until the rebuild completes or fails terminally, then follow the replay horizon; rebuilt from retained selection changes and validated against canonical history before Processor republishes it to Query after recovery |
 | Derived aggregates | Processor; authoritative for mutable derived results | Processor-owned PostgreSQL schemas and encrypted project-scoped derived replay batches | Retention-windowed to thirteen UTC calendar months after `accepted_at` by default or the shortened project policy; Processor persists each contribution's effective cutoff with aggregate state and selected source-set state and locally enforces expiry, while Jobs provides reconciliation; expired contributions are removed before they can remain represented in the aggregate, replay batches, or Query projections |
 | Compatibility-only representations | The sole owning adapter for each protocol interface; authoritative only for that boundary | Request-scoped memory or an adapter-owned boundary defined by #16 or its signal contract | No canonical retention; never a shared persistence model |
@@ -199,16 +199,24 @@ signal_family)` tuple, where `signal_family` is one of
 the sole authority for a partition's strictly increasing unsigned 64-bit
 `canonical_change_sequence`. Because the authoritative row is in ClickHouse
 and the coordination state is Processor-owned PostgreSQL, the row and outbox
-are not committed in one physical transaction. Processor first reserves the
-sequence and persists an immutable canonical-write staging record, its
-canonical-content digest, and a durable outbox intent in one Processor-local
-PostgreSQL transaction. A reconciler then idempotently commits the staged row
-to ClickHouse using the partition and sequence identity. After verifying the
-same digest, it marks the staging record `clickhouse_committed`; only that
-state is eligible for durable outbox publication. Processor performs the
-current-cutoff check before committing the row. If that check fails before
-commit, the reconciler marks the staged write retention-expired and, after
-proving that no authoritative row exists, publishes an idempotent no-row
+are not committed in one physical transaction. Processor first appends an
+immutable reservation intent to the restore-independent sequence-baseline
+ledger, which durably allocates and records the next sequence, its
+canonical-content digest, applicable cutoff, idempotency and correlation
+context, and the candidate or payload reference only while it remains eligible.
+Only after that append is durable does Processor commit or acknowledge the
+corresponding local PostgreSQL reservation, immutable canonical-write staging
+record, and durable outbox intent in one Processor-local transaction. A
+reconciler completes orphaned ledger intents idempotently before allocating a
+later sequence: it restores the local reservation and staging while the record
+remains eligible, or uses the cutoff/no-row path after expiry. A sequence is
+never reused. The reconciler then idempotently commits the staged row to
+ClickHouse using the partition and sequence identity. After verifying the same
+digest, it marks the staging record `clickhouse_committed`; only that state is
+eligible for durable outbox publication. Processor performs the current-cutoff
+check before committing the row. If that check fails before commit, the
+reconciler marks the staged write retention-expired and, after proving that no
+authoritative row exists, publishes an idempotent no-row
 `CanonicalChangeSkipV1` marker for the reserved sequence through the same
 canonical-change path. If ClickHouse committed the row while it was still
 within its cutoff and publication then failed, recovery verifies its digest,
@@ -243,20 +251,28 @@ publication.
 
 Processor advances an authenticated, idempotent restore-independent sequence
 baseline for each logical partition as part of reservation and publication
-reconciliation. The baseline records the highest reserved sequence, the
-published-contiguous watermark, and the digest covering the publication state.
-For every reserved sequence it also records an immutable recovery intent keyed
-by the partition and sequence, with the canonical candidate or a durable
-authenticated payload reference, `watchtower_id`, `processing_generation`,
-`accepted_at`, the current cutoff and expiry basis, idempotency and correlation
-context, content digest, and terminal state. The baseline is a monotonic
-allocation floor rather than telemetry or replay storage. Sequence allocation
-cannot move below the baseline, and a reserved sequence that later becomes
-retention-expired still uses the existing no-row skip path. An unresolved
-reservation intent remains in the restore-independent ledger until its row is
-published or its no-row skip is durably recorded; terminal intent evidence is
-retained through the restorable-backup horizon so recovery can distinguish a
-completed row or skip from a missing reservation.
+reconciliation. Reservation ordering is ledger-first: the immutable intent and
+sequence allocation are durably appended before the local Processor
+PostgreSQL reservation is committed or acknowledged, and orphan intents are
+reconciled before a later sequence is allocated. The baseline records the
+highest reserved sequence, the published-contiguous watermark, and the digest
+covering the publication state. For every reserved sequence it also records
+an immutable recovery intent keyed by the partition and sequence, with the
+canonical candidate or a durable authenticated payload reference only while
+the record remains before its applicable 90-day or shortened-policy cutoff,
+`watchtower_id`, `processing_generation`, `accepted_at`, the cutoff and expiry
+basis, idempotency and correlation context, content digest, and terminal state.
+At that cutoff, Processor independently deletes or irreversibly fences the
+candidate and payload reference; the unresolved intent retains only non-payload
+sequence, digest, cutoff, skip, and terminal evidence. The baseline is a
+monotonic allocation floor rather than telemetry or replay storage. Sequence
+allocation cannot move below the baseline, and a reserved sequence that later
+becomes retention-expired still uses the existing no-row skip path. An
+unresolved reservation intent remains in the restore-independent ledger until
+its row is published or its no-row skip is durably recorded; terminal
+non-payload intent evidence is retained through the restorable-backup horizon
+so recovery can distinguish a completed row or skip from a missing
+reservation.
 The baseline remains independent of Processor's PostgreSQL backups for as long
 as an older processing backup can be restored.
 
@@ -270,10 +286,13 @@ also compares surviving ClickHouse rows, retained canonical replay changes,
 and immutable no-row sequence tombstones with the restored staging, outbox,
 publication-confirmation state, and every reservation intent. For an intent
 whose local staging or outbox state was lost, Processor uses the retained
-candidate and cutoff evidence to publish the row or construct the matching
-`CanonicalChangeSkipV1` idempotently. Missing, truncated, or conflicting
-baseline, reservation intent, or telemetry evidence leaves Processor unready
-and prevents new canonical reservations until recovery is complete.
+candidate to publish the row only while the record remains before its cutoff.
+At or after the cutoff, the payload is unavailable: recovery removes and
+verifies the absence of any authoritative row, then constructs the matching
+`CanonicalChangeSkipV1` from non-payload intent evidence idempotently. Missing,
+truncated, or conflicting baseline, reservation intent, or telemetry evidence
+leaves Processor unready and prevents new canonical reservations until recovery
+is complete.
 
 Query stores the highest contiguous applied sequence and its digest for each
 logical partition. It rejects a gap or a conflicting equal sequence and
@@ -1346,9 +1365,10 @@ The owning implementation contracts must make these scenarios testable:
    digest-verified sequence and publication-state reconciliation before
    readiness or any new reservation, and leave Processor unready for missing,
    truncated, or conflicting baseline or per-reservation intent evidence; for
-   each unresolved intent, publish the retained candidate or its matching
-   `CanonicalChangeSkipV1` before readiness. Repeat after those
-   lifecycle-bounded
+   each unresolved intent, publish its retained candidate only while it remains
+   before the cutoff, and otherwise independently fence or delete the payload
+   and publish its matching `CanonicalChangeSkipV1` before readiness. Repeat
+   after those lifecycle-bounded
    rows and replay changes expire; verify the restore-independent partition
    baseline prevents sequence reuse, advances the restored local floor, and
    remains retained through the restorable-backup horizon.
