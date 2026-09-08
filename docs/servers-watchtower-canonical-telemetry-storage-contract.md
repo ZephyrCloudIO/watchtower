@@ -311,7 +311,19 @@ canonical, selection, and derived change through their cutovers, atomically
 activated the staged projection, recorded all three cursors and cutover fences,
 and sent an authenticated `ProjectionRebuildActivationAckV1` to Processor.
 Processor then releases each post-cutover buffer in order; sequences published
-after the acknowledgement use the normal live-change path. An empty retained window records the
+after the acknowledgement use the normal live-change path. If Query detects
+missing, stale, conflicting, unauthorized, or incomplete coverage, it discards
+the staged projection without activation and sends an authenticated, versioned
+`ProjectionRebuildAbortV1` containing the matching rebuild scope, failure
+reason, and target or cutover fence digests. Processor accepts the abort only
+for that active rebuild, terminally fails it, and returns an authenticated
+`ProjectionRebuildAbortAckV1` only after it has durably released or replayed
+every buffered canonical, selection, and derived change through the normal
+authenticated path, in per-partition, project-selection, and aggregate order.
+Newer live changes remain behind that drain, and Query applies the replay
+idempotently; the abort remains retryable until the drain is acknowledged. No
+buffered change is discarded, and a later rebuild may start after terminal
+cleanup. An empty retained window records the
 published-contiguous watermark `N` as its baseline, allowing Query to accept
 the next live sequence without resetting the partition. A missing, conflicting,
 or stale marker fails the rebuild safely; it cannot reset a live partition or
@@ -750,9 +762,12 @@ The canonical vector is keyed by every requested Processor change partition and
 contains that partition's monotonic sequence. The selection descriptor contains
 the immutable snapshot identity, request scope, fixed-size page parameters, entry
 count, page count, and a final selection digest; it does not inline one entry
-or an unbounded page-digest list for every canonical record. Processor holds promotions affecting those
-records until the export hold is released, so the selected generation cannot
-change after the descriptor is captured. The derived revision descriptor
+or an unbounded page-digest list for every canonical record. Processor does not
+hold live promotions for these records. The captured selection pages and final
+digest are immutable export evidence, while the authoritative default-generation
+mapping and later selection revisions may advance and publish during the export
+hold. Query materializes canonical rows from the captured pages, so later live
+promotions cannot change this export. The derived revision descriptor
 contains the immutable snapshot identity, request scope, fixed-size page
 parameters, entry count, page count, and final digest; it never inlines one
 entry or an unbounded page-digest list for every aggregate. Each aggregate
@@ -780,9 +795,14 @@ cancellation and release path. Entries from different partitions, records, or
 aggregates are never compared as one global order, and missing or conflicting
 descriptor or page coverage is invalid. After Processor returns the hold-install
 response, API appends the returned canonical vector, snapshot descriptors and
-digests, and optional source-expiry deadline to the same hold registry. Before
-creating the durable scheduling request to Jobs, API retrieves every selected
-selection page, derived revision page, and source-set chunk through bounded,
+digests, and optional source-expiry deadline to the same hold registry. When a
+source-expiry deadline is present, API immediately durably creates the
+`ExportExpiryScheduleV1` request in Jobs with `expiry_basis=source_retention`,
+the held revision, and effective source deadline, before retrieving any
+recovery page or chunk or scheduling execution. Jobs must durably accept that
+schedule before API begins the recovery copy; if it is unavailable, the hold
+remains retryable and no execution is scheduled. API then retrieves every
+selected selection page, derived revision page, and source-set chunk through bounded,
 authenticated `ExportSelectionSnapshotRecoveryPageV1`,
 `ExportDerivedRevisionSnapshotRecoveryPageV1`, and
 `ExportDerivedSourceSetSnapshotRecoveryChunkV1` calls from API to Processor.
@@ -845,12 +865,12 @@ deadline, regardless of delivery order or whether the delayed expiry message has
 arrived. After Jobs acknowledges `ExportCompletionV1`, API performs an atomic
 current-time check that the optional source-expiry deadline has not passed, that
 the persisted export-object expiry deadline has not passed, and that no newer
-retention, deletion, cancellation, or authorization fence applies immediately
-before committing `completed`; a failed check does not expose the artifact and
-uses the corresponding revision-fenced expiry cancellation, cleanup, and
-hold-release path. Jobs
-durably owns the
-export schedule, lease, retry, and cancellation state, then dispatches a
+retention, deletion, cancellation, or authorization fence applies. A failed
+check does not expose the artifact and uses the corresponding revision-fenced
+expiry cancellation, cleanup, and hold-release path. The export-object expiry
+schedule must be durably acknowledged by Jobs and Query before API commits or
+exposes `completed`. Jobs durably owns the export schedule, lease, retry, and
+cancellation state, then dispatches a
 revision-fenced `ExportExecutionV1` command to Query carrying the
 API-persisted canonical partition-sequence vector, derived revision snapshot
 descriptor and digest, selection-snapshot descriptor and digest, authorized
@@ -939,8 +959,10 @@ database restore, API loads that registry before accepting traffic, treats each
 unresolved terminal intent as the desired state, reconciles the owner hold
 inventories, and retries the matching completion, install, cancellation,
 release, or expiry-schedule command. For an unresolved completion intent, API
-replays the idempotent `ExportCompletionV1` handoff to Jobs and resumes the same
-final expiry-and-fence check and commit-or-cleanup sequence; it does not replace
+replays the idempotent `ExportCompletionV1` handoff to Jobs, restores or retries
+the export-object expiry schedule until Jobs and Query acknowledge it, and then
+performs the same final expiry-and-fence check and commit-or-cleanup sequence;
+it does not expose completion while the schedule is missing or replace
 completion with an expiry schedule. A hold or expiry schedule cannot be treated
 as orphaned merely because it is absent from the restored PostgreSQL backup.
 Terminal tombstones remain in the restore-independent registry until no
@@ -991,19 +1013,25 @@ artifact when cancellation is fenced. After Jobs acknowledges the pre-commit
 the persisted source-expiry deadline and that no newer retention, deletion,
 cancellation, or authorization fence applies. If the check fails, API does not
 persist `completed` and follows the revision-fenced source-expiry cancellation,
-artifact cleanup, and hold-release path. Only after the check succeeds does API
-persist a successful `completed` transition and send Jobs an idempotent
-`ExportExpiryScheduleV1` request with `expiry_basis=export_object` containing
-the export ID, current export revision, authoritative `completed_at`, and the
-effective export-object expiry deadline. The deadline is
+artifact cleanup, and hold-release path. Before committing or exposing
+`completed`, API sends Jobs an idempotent `ExportExpiryScheduleV1` request with
+`expiry_basis=export_object` containing the export ID, current export revision,
+authoritative `completed_at`, and the effective export-object expiry deadline.
+The deadline is
 the earlier of `completed_at + 7 days` and the active export-object policy
 cutoff, using `completed_at` as the export-object lifecycle anchor. Jobs
 persists that timestamp and dispatches an idempotent
 `ExportArtifactExpiryScheduleV1` to Query carrying the export ID, current
 revision, authoritative `completed_at`, and effective deadline. Query persists
 the deadline with the materialization metadata and installs an idempotent
-`ExportArtifactExpiryFenceV1` owner-side cleanup for that deadline. Jobs also
-sends the existing `ExportExpiryV1` handoff to API at the deadline. When the
+`ExportArtifactExpiryFenceV1` owner-side cleanup for that deadline, and Query
+durably acknowledges the installed schedule through Jobs. API performs the
+same final deadline and fence check immediately after the Jobs and Query
+acknowledgements; only then does it persist and expose `completed`. If either
+owner acknowledgement is missing, the export remains non-terminal and
+unavailable while the restore-independent intent retries; it is not exposed or
+downloadable. Jobs also sends the existing `ExportExpiryV1` handoff to API at
+the deadline. When the
 deadline arrives or is already past during recovery, Query deletes or makes
 inaccessible the Query-owned artifact, invalidates its local metadata, and
 rejects every download. This owner-side fence does not change API lifecycle
@@ -1268,8 +1296,10 @@ The owning implementation contracts must make these scenarios testable:
    canonical, selection, and derived target and after complete digest-verified
    coverage of every selection and derived descriptor entry and buffered change,
    leaves that checkpoint unchanged for an incomplete
-   subrange request, and fails safely when coverage is missing, stale,
-   incomplete, or mismatched. When all
+   subrange request, and sends an authenticated `ProjectionRebuildAbortV1` on
+   missing, stale, conflicting, unauthorized, or incomplete coverage; verify
+   that `ProjectionRebuildAbortAckV1` drains every canonical, selection, and
+   derived buffer in order without activation or data loss. When all
    retained rows have expired while a later sequence is reserved but not yet
    published, verify the empty baseline uses the highest published-contiguous
    watermark rather than the reserved sequence and accepts that later
@@ -1361,14 +1391,16 @@ The owning implementation contracts must make these scenarios testable:
    bounded authenticated API-to-Processor recovery-page calls across a
    pre-hold Processor restore, live derived-aggregate retention
    recomputation and publication while an export hold retains an immutable
-   captured revision, promotion fencing for held selections,
-   API-to-Jobs scheduling,
+   captured revision, live selection promotions while immutable captured
+   selection pages remain export evidence, API-to-Jobs scheduling of source
+   expiry before recovery-page copying,
    the durable completion/expiry intent and complete recovery copy before
    `ExportCompletionV1`, `completed_at` reuse from that intent through API and
    Jobs, final optional-source and export-object-expiry plus retention-fence
    checking immediately before
    the API completion commit, and `ExportCompletionV1` terminalization of Jobs
-   execution before API exposes completion or schedules object expiry,
+   execution and the Jobs/Query artifact-expiry schedule acknowledgements
+   before API commits or exposes completion,
    Jobs-to-Query
    revision-fenced execution with the returned bounded snapshot evidence,
    authenticated page retrieval and complete-coverage validation, export
@@ -1387,7 +1419,8 @@ The owning implementation contracts must make these scenarios testable:
    absent source-expiry for an empty export with no source-retention schedule,
    authoritative `completed_at` for completed artifacts, the
    restore-independent completion/expiry intent, replay of an unresolved
-   completion handoff before expiry scheduling after API restore, source-expiry
+   completion handoff and owner schedule acknowledgements before completion
+   commit after API restore, source-expiry
    cancellation at the earliest held-source cutoff, rejection of completion
    outcomes at or after that persisted source deadline regardless of delivery
    order, owner-side Query fencing and partial-artifact cleanup through a
