@@ -685,8 +685,10 @@ work. API assigns each export a canonical lowercase UUID v7 `export_id`, stores
 it as PostgreSQL `uuid` in API state, and uses that canonical lowercase UUID v7
 representation at every external boundary. Query produces selected-signal
 canonical and derived snapshots from its own projections into its encrypted
-project-scoped S3 export prefix. Before requesting a hold, API durably records
-an export-hold intent in its restore-independent `API export hold registry`.
+project-scoped S3 export prefix. Before requesting a Processor hold, API
+durably records a pre-request export-hold intent containing only fields known at
+that point in its restore-independent `API export hold registry`; the intent
+does not contain the source-expiry deadline computed by Processor.
 The registry is append-only, keyed by `export_id` and held
 `export_revision`, and records the authorized scope, requested range, selected
 signals, every hold, cancellation, release, and completion/expiry intent, and
@@ -710,8 +712,12 @@ change after the descriptor is captured. The derived revision descriptor
 contains the immutable snapshot identity, request scope, fixed-size page
 parameters, entry count, page count, and final digest; it never inlines one
 entry or an unbounded page-digest list for every aggregate. Its pages contain
-the requested fully qualified aggregate keys and their `authoritative_revision`
-values, including explicit empty revision entries, in a deterministic order.
+bounded, materializable entries with the requested fully qualified aggregate
+keys, captured aggregate state, selected source set, and their
+`authoritative_revision` values, including explicit empty revision entries, in
+a deterministic order. The captured state and source set are the immutable
+export-specific snapshot evidence Query uses for materialization; they are not
+read from Processor storage directly.
 During the export hold, Processor records each captured derived aggregate's
 state, selected source set, and `authoritative_revision`, including explicit
 empty revision entries, in immutable export-specific/MVCC snapshot state keyed
@@ -723,22 +729,21 @@ revisions cannot change its descriptor pages; this snapshot does not extend the
 earliest effective source-retention cutoff or bypass the existing source-expiry
 cancellation and release path. Entries from different partitions, records, or
 aggregates are never compared as one global order, and missing or conflicting
-descriptor or page coverage is invalid. API persists the canonical
-partition-sequence vector, the selection
-descriptor and digest, and, when present, the derived revision descriptor and
-digest, plus the earliest effective expiry among all held
-canonical rows, selection entries, and derived contributions, and sends that
-bounded snapshot evidence only in the durable scheduling request to Jobs. The
-Query retrieves the derived revision entries through the authenticated,
-versioned `ExportDerivedRevisionSnapshotPageV1` handoff from Query to
-Processor. Each request carries the export ID and revision, descriptor ID, and
-a bounded page cursor; each response carries a bounded set of aggregate keys
-and authoritative revisions, the page digest, the next cursor, and the final
-descriptor digest when complete. Query verifies descriptor scope, cursor order,
-page digests, entry count, and final digest before materializing any derived
-row. A missing, repeated, conflicting, or unauthorized page fails the export
-without an artifact. API and Jobs persist and forward only the descriptor and
-its integrity evidence. The hold-install response has an explicit optional
+descriptor or page coverage is invalid. After Processor returns the hold-install
+response, API appends the returned canonical vector, snapshot descriptors and
+digests, and optional source-expiry deadline to the same hold registry before
+creating the durable scheduling request to Jobs. The Query retrieves the
+derived revision entries through the authenticated, versioned
+`ExportDerivedRevisionSnapshotPageV1` handoff from Query to Processor. Each
+request carries the export ID and revision, descriptor ID, and a bounded page
+cursor; each response carries a bounded set of aggregate entries containing the
+aggregate key, authoritative revision, captured state, and selected source set,
+the page digest, the next cursor, and the final descriptor digest when
+complete. Query verifies descriptor scope, cursor order, page digests, entry
+count, and final digest before materializing each derived row from the captured
+state and source set. A missing, repeated, conflicting, or unauthorized page
+fails the export without an artifact. API and Jobs persist and forward only the
+descriptor and its integrity evidence. The hold-install response has an explicit optional
 source-expiry value: it
 is absent when the requested snapshot has no eligible canonical rows, selection
 entries, or derived contributions. API records a present source-expiry deadline

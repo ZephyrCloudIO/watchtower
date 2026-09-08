@@ -355,11 +355,16 @@ identity, request scope, fixed-size page parameters, entry count, page count,
 and final selection digest; it never inlines one entry or an unbounded
 page-digest list for every record. The derived revision descriptor uses the
 same bounded metadata shape and never inlines aggregate entries or an
-unbounded page-digest list. Processor freezes each captured derived aggregate's
+unbounded page-digest list. Processor records each captured derived aggregate's
 state, selected source set, and `authoritative_revision`, including explicit
-empty revision entries, until the matching export hold is released; updates for
-those aggregates are queued and cannot publish a higher revision during the
-hold. The source-expiry value is absent
+empty revision entries, in immutable export-specific/MVCC snapshot state keyed
+by `export_id` and `export_revision`. The live aggregate remains authoritative
+and continues to accept contributions and retention recomputations: expired
+contributions are removed, and higher revisions may publish to Query during the
+hold. Export materialization reads the captured snapshot state, so live
+revisions cannot change the descriptor pages; this snapshot does not extend the
+earliest effective source-retention cutoff or bypass the existing source-expiry
+cancellation and release path. The source-expiry value is absent
 when the requested snapshot has no eligible canonical rows, selection entries,
 or derived contributions. API persists the canonical partition-sequence
 vector, the selection descriptor and digest, and, when present, the derived
@@ -392,13 +397,15 @@ Query obtains derived revision pages through the authenticated versioned unary
 `ExportDerivedRevisionSnapshotPageV1` Protobuf-over-HTTP interface from Query to
 Processor. Each request carries the export ID and revision, derived descriptor
 ID, and bounded page cursor; each response carries a bounded set of fully
-qualified aggregate keys and `authoritative_revision` values, including
+qualified aggregate entries containing the aggregate key, `authoritative_revision`,
+and materializable captured aggregate state and selected source set, including
 explicit empty revision entries, the page digest, next cursor, and final
 descriptor digest when complete. Query verifies descriptor scope, cursor order,
-page digests, entry count, and final digest before materializing any derived
-row. A missing, repeated, conflicting, or unauthorized page fails the export
-without an artifact. API and Jobs persist and forward only the descriptor and
-its integrity evidence.
+page digests, entry count, and final digest before materializing each derived
+row from the captured state and source set. A missing, repeated, conflicting,
+or unauthorized page fails the export without an artifact. API and Jobs persist
+and forward only the descriptor and its integrity evidence; Query never reads
+Processor persistence directly.
 
 Jobs schedules a present source-expiry deadline from the hold-install response
 using `ExportExpiryScheduleV1` with `expiry_basis=source_retention`; no
@@ -458,9 +465,16 @@ Query installs the terminal execution fence before releasing its projection
 hold, so a delayed execution command cannot recreate a hold or artifact after
 the terminal transition.
 
-API records an export-hold intent, including the present source-expiry deadline,
-before installing a Processor or Query hold in its restore-independent encrypted
-S3 export-hold registry. Before API
+Before requesting the Processor hold, API appends a pre-request export-hold
+intent containing only the export, scope, range, selected signals, and other
+fields known before the Processor response to its restore-independent encrypted
+S3 export-hold registry; this intent does not contain a source-expiry deadline.
+Processor then atomically installs the hold and returns the optional deadline.
+API appends the response evidence, including the canonical vector, snapshot
+descriptors and digests, and the present source-expiry deadline when one
+exists, before persisting or dispatching the durable scheduling request to Jobs
+and its Jobs-to-Query execution handoff. The deadline remains absent for an
+empty snapshot. Before API
 persists any terminal export transition or dispatches its cleanup command, it
 also appends the matching cancellation, failure, or release intent to that
 registry; the intent precedes `ExportCancellationV1`, `ExportFailureV1`, or
@@ -584,10 +598,8 @@ Query verifies complete contiguous canonical coverage and complete
 digest-verified coverage of every derived target descriptor page, advances its
 checkpoint over changes and retention-excluded skip ranges, and writes every
 eligible row in the covered window; missing, stale, conflicting, unauthorized,
-or incomplete derived coverage fails the rebuild safely. Query marks the rebuild
-complete only after coverage reaches the authenticated target sequence for every
-requested partition and every derived descriptor entry is covered. Processor
-then seals the rebuild-scoped derived buffer with an authenticated
+or incomplete derived coverage fails the rebuild safely. Processor then seals
+the rebuild-scoped derived buffer with an authenticated
 `ProjectionRebuildDerivedCutoverV1` marker carrying a later
 `derived_cutover_sequence` and the descriptor/fence digest. Query validates the
 marker, applies every buffered derived change through that cursor, atomically
