@@ -263,9 +263,12 @@ identity, fixed page parameters, entry and page counts, final digest, and the
 current contiguous project-scoped `selection_change_sequence` target. Its
 authenticated pages contain each eligible `(watchtower_id,
 processing_generation, selection_revision)` mapping. Processor retains every
-later selection
-change for the authorized rebuild scope in a rebuild-scoped durable buffer or
-replay stream. When derived data is selected, Processor also captures a
+later project-scoped selection change, including changes outside the authorized
+rebuild scope, in a rebuild-scoped durable buffer or replay stream. This
+preserves contiguous project-scoped sequence coverage through the selection
+cutover; Query consumes that complete sequence through the authenticated cursor
+while applying only changes within the authorized rebuild scope to the staged
+projection. When derived data is selected, Processor also captures a
 monotonically ordered durable
 `derived_change_sequence` target for the selected scope and retains every
 later derived change, including newly created aggregates, in a rebuild-scoped
@@ -288,11 +291,12 @@ must cover the entire currently eligible retained window; a narrower subrange
 request is rejected for checkpoint recovery and leaves the checkpoint
 unchanged. An unexpired row omitted by a narrower request is not a valid skip.
 Query verifies complete contiguous coverage, complete digest-verified coverage
-of every selection target page, and complete digest-verified coverage of every
-derived target descriptor page, advances its checkpoint over changes and
-retention-excluded skip ranges, and writes every eligible row and target
-selection in the covered window; missing, stale, conflicting, or unauthorized
-coverage fails the rebuild safely. For every requested canonical partition,
+of every selection target page, and, when derived data is selected, complete
+digest-verified coverage of every derived target descriptor page, advances its
+checkpoint over changes and retention-excluded skip ranges, and writes every
+eligible row and target selection in the covered window; missing, stale,
+conflicting, or unauthorized coverage fails the rebuild safely. For every
+requested canonical partition,
 Processor retains every canonical change after the fixed target in a
 rebuild-scoped durable buffer or replay stream and withholds it from the normal
 live path. It seals that buffer with an authenticated
@@ -300,26 +304,30 @@ live path. It seals that buffer with an authenticated
 `canonical_cutover_sequence` and the target/fence digest. Processor also seals
 the selection buffer with an authenticated
 `ProjectionRebuildSelectionCutoverV1` marker carrying a later
-`selection_cutover_sequence` and the target/fence digest, and seals the derived
-buffer with an authenticated `ProjectionRebuildDerivedCutoverV1` marker carrying
-a later `derived_cutover_sequence` and the descriptor/fence digest. Processor
-continues buffering every canonical, selection, and derived change after those
-cutovers and withholds them from the normal live path. Query marks the rebuild
-complete only after it has verified contiguous coverage through the authenticated
-`target_sequence` for every requested partition, applied every buffered
-canonical, selection, and derived change through their cutovers, atomically
-activated the staged projection, recorded all three cursors and cutover fences,
-and sent an authenticated `ProjectionRebuildActivationAckV1` to Processor.
-Processor then releases each post-cutover buffer in order; sequences published
-after the acknowledgement use the normal live-change path. If Query detects
+`selection_cutover_sequence` and the target/fence digest when canonical data is
+selected. When derived data is selected, Processor seals the derived buffer
+with an authenticated `ProjectionRebuildDerivedCutoverV1` marker carrying a
+later `derived_cutover_sequence` and the descriptor/fence digest. Processor
+continues buffering every applicable canonical, selection, and derived change
+after those cutovers and withholds them from the normal live path. Query marks
+the rebuild complete only after it has verified contiguous coverage through the
+authenticated `target_sequence` for every requested partition, applied every
+buffered canonical and selection change through their cutovers and, when
+derived data is selected, every buffered derived change through its cutover,
+atomically activated the staged projection, recorded the applicable cursors and
+cutover fences, and sent an authenticated `ProjectionRebuildActivationAckV1` to
+Processor. Processor then releases each applicable post-cutover buffer in order;
+sequences published after the acknowledgement use the normal live-change path.
+If Query detects
 missing, stale, conflicting, unauthorized, or incomplete coverage, it discards
 the staged projection without activation and sends an authenticated, versioned
 `ProjectionRebuildAbortV1` containing the matching rebuild scope, failure
 reason, and target or cutover fence digests. Processor accepts the abort only
 for that active rebuild, terminally fails it, and returns an authenticated
 `ProjectionRebuildAbortAckV1` only after it has durably released or replayed
-every buffered canonical, selection, and derived change through the normal
-authenticated path, in per-partition, project-selection, and aggregate order.
+every applicable buffered canonical and selection change and, when derived data
+is selected, every buffered derived change through the normal authenticated
+path, in per-partition, project-selection, and aggregate order.
 Newer live changes remain behind that drain, and Query applies the replay
 idempotently; the abort remains retryable until the drain is acknowledged. No
 buffered change is discarded, and a later rebuild may start after terminal
@@ -1154,9 +1162,10 @@ compare the selected aggregate state, aggregate revisions, and retention-windowe
 source set with complete digest-verified coverage across the matching
 per-aggregate derived revision snapshot page entries and source-set chunks;
 projection rebuild completion additionally requires the immutable accepted
-selection target and derived key/revision target descriptors, complete
-digest-verified coverage, and the authenticated selection and derived cutover
-cursors;
+selection target when canonical data is selected and the derived key/revision
+target descriptor when derived data is selected, complete digest-verified
+coverage for each selected target, and the authenticated selection cutover
+cursor plus the derived cutover cursor when derived data is selected;
 no scalar revision is used to claim cross-aggregate completion.
 Correlation-ID digests are compared only for represented records in the same
 dimension. A mismatch is not silently repaired or treated as successful
@@ -1275,7 +1284,9 @@ The owning implementation contracts must make these scenarios testable:
    `ProjectionRebuildCanonicalCutoverV1` through a later canonical cursor;
    captures an immutable bounded selection target plus
    project-scoped `selection_change_sequence` target when canonical data is
-   selected, retains post-target selection changes in a durable rebuild buffer,
+   selected, retains every post-target project-scoped selection change,
+   including changes outside the authorized rebuild scope, in a durable rebuild
+   buffer,
    and emits and validates an authenticated
    `ProjectionRebuildSelectionCutoverV1` through a later selection cursor;
    captures an immutable bounded derived key/revision target descriptor of
@@ -1283,18 +1294,21 @@ The owning implementation contracts must make these scenarios testable:
    derived data is selected, retains post-target derived changes including a
    newly created aggregate in a durable rebuild buffer, and emits and validates
    an authenticated `ProjectionRebuildDerivedCutoverV1` through a later derived
-   cursor, holds post-cutover changes until Query atomically activates the
-   staged projection and acknowledges `ProjectionRebuildActivationAckV1` only
-   after applying canonical, selection, and derived buffered changes through
-   their cutovers, and
+   cursor; when derived data is not selected, no derived target or cutover is
+   required. The rebuild holds post-cutover changes until Query atomically
+   activates the staged projection and acknowledges
+   `ProjectionRebuildActivationAckV1` only
+   after applying canonical and selection buffered changes through their
+   cutovers and, when derived data is selected, applying derived buffered
+   changes through their cutover, and
    accepts a first sequence greater than one without
    a false gap; emits and validates
    contiguous authenticated `ProjectionRebuildSkipV1` coverage only for
    retention-excluded interleaved sequences, live `CanonicalChangeSkipV1`
    coverage for an expired staged sequence, writes every eligible row before
    advancing the global checkpoint, declares completion only through each fixed
-   canonical, selection, and derived target and after complete digest-verified
-   coverage of every selection and derived descriptor entry and buffered change,
+   each selected fixed target and after complete digest-verified coverage of
+   every selected descriptor entry and buffered change,
    leaves that checkpoint unchanged for an incomplete
    subrange request, and sends an authenticated `ProjectionRebuildAbortV1` on
    missing, stale, conflicting, unauthorized, or incomplete coverage; verify
@@ -1462,8 +1476,9 @@ The owning implementation contracts must make these scenarios testable:
    distinct processing generations, full-range promotion, preservation of the
    prior default result, ordered per-record selection revisions with stale
    delivery rejection, selection-state recovery and republishing after a
-   Processor rebuild, an in-flight promotion buffered after the immutable
-   rebuild selection target and applied through the selection cutover cursor,
+   Processor rebuild, an in-flight promotion outside the requested `accepted_at`
+   range buffered after the immutable rebuild selection target and applied
+   through the selection cutover cursor,
    safe rejection of incomplete or conflicting selection cutover coverage,
    generation-aware cross-stage reconciliation, derived
    aggregates exclude candidate generations, consistent derived-aggregate
