@@ -523,9 +523,13 @@ baseline lifecycle-purge registration for every applicable project and data
 class, even when the project keeps the default policy. Project creation causes
 API to run the generation-matched `project_create` lifecycle barrier: each
 applicable data owner submits an idempotent baseline
-`LifecyclePurgeRegistrationV1`, Jobs returns and persists an active registration,
-and API exposes the project only after every owner acknowledges the active
-barrier. A
+`LifecyclePurgeRegistrationV1`. API keeps the project inventory pending and the
+project unavailable through active-generation commit and post-commit enablement;
+Jobs and every applicable owner must return a generation-matched acknowledgement
+showing the baseline registration enabled and active before API marks the
+inventory active, exposes the project, or admits project data. An armed but
+non-dispatchable registration is insufficient, and a stalled owner or Jobs
+leaves creation `accepted_pending` and retryable. A
 shortened policy or project deletion adds a generation-scoped registration; its
 schedule is paused during prepare and enabled only after the activation
 handshake. Jobs owns scheduling and retrying each purge dispatch at the
@@ -711,17 +715,22 @@ records until the export hold is released, so the selected generation cannot
 change after the descriptor is captured. The derived revision descriptor
 contains the immutable snapshot identity, request scope, fixed-size page
 parameters, entry count, page count, and final digest; it never inlines one
-entry or an unbounded page-digest list for every aggregate. Its pages contain
-bounded, materializable entries with the requested fully qualified aggregate
-keys, captured aggregate state, selected source set, and their
+entry or an unbounded page-digest list for every aggregate. Each aggregate
+entry carries a bounded `DerivedSourceSetSnapshotDescriptorV1` containing the
+source-set snapshot identity, aggregate and `authoritative_revision` binding,
+fixed-size chunk parameters, source count, chunk count, and final source-set
+digest; it never inlines source tuples or an unbounded chunk-digest list. Its
+pages contain bounded, materializable entries with the requested fully
+qualified aggregate keys, captured aggregate state, source-set descriptor, and
 `authoritative_revision` values, including explicit empty revision entries, in
-a deterministic order. The captured state and source set are the immutable
-export-specific snapshot evidence Query uses for materialization; they are not
-read from Processor storage directly.
+a deterministic order. The captured state and source-set chunks are the
+immutable export-specific snapshot evidence Query uses for materialization; they
+are not read from Processor storage directly.
 During the export hold, Processor records each captured derived aggregate's
-state, selected source set, and `authoritative_revision`, including explicit
-empty revision entries, in immutable export-specific/MVCC snapshot state keyed
-by `export_id` and `export_revision`. The live aggregate remains authoritative
+state, `authoritative_revision`, and immutable source-set snapshot metadata,
+including explicit empty revision entries, in export-specific/MVCC snapshot
+state keyed by `export_id` and `export_revision`. The live aggregate remains
+authoritative
 and continues to accept contributions and retention recomputations: expired
 contributions are removed, and higher revisions may publish to Query during the
 hold. Export materialization reads the captured snapshot state, so live
@@ -737,13 +746,21 @@ derived revision entries through the authenticated, versioned
 `ExportDerivedRevisionSnapshotPageV1` handoff from Query to Processor. Each
 request carries the export ID and revision, descriptor ID, and a bounded page
 cursor; each response carries a bounded set of aggregate entries containing the
-aggregate key, authoritative revision, captured state, and selected source set,
-the page digest, the next cursor, and the final descriptor digest when
-complete. Query verifies descriptor scope, cursor order, page digests, entry
-count, and final digest before materializing each derived row from the captured
-state and source set. A missing, repeated, conflicting, or unauthorized page
-fails the export without an artifact. API and Jobs persist and forward only the
-descriptor and its integrity evidence. The hold-install response has an explicit optional
+aggregate key, authoritative revision, captured state, and bounded source-set
+descriptor, the page digest, the next cursor, and the final descriptor digest
+when complete. Query verifies descriptor scope, cursor order, page digests,
+entry count, and final digest before retrieving source-set chunks through the
+authenticated, versioned `ExportDerivedSourceSetSnapshotChunkV1` handoff.
+Each request carries the export ID and revision, derived descriptor ID,
+aggregate key, authoritative revision, source-set descriptor ID, and a bounded
+per-aggregate source cursor; each response carries a bounded set of
+`(watchtower_id, processing_generation)` tuples, the chunk digest, next cursor,
+and final source-set digest when complete. Query verifies the aggregate and
+revision binding, descriptor scope, cursor order, source and chunk counts,
+per-chunk digests, and final source-set digest before materializing each derived
+row. A missing, repeated, reordered, conflicting, or unauthorized page or
+chunk fails the export without an artifact. API and Jobs persist and forward
+only the bounded descriptors and their integrity evidence. The hold-install response has an explicit optional
 source-expiry value: it
 is absent when the requested snapshot has no eligible canonical rows, selection
 entries, or derived contributions. API records a present source-expiry deadline
@@ -883,8 +900,9 @@ processing-generation, canonical-content-digest, and correlation-ID digests
 where those fields are represented. For derived rows, it records an ordered
 digest of aggregate keys,
 authoritative derived revisions, selected aggregate state, and deterministic
-selected-canonical-source-set digests at the corresponding derived revision
-snapshot page entries. For canonical rows, the manifest additionally records the
+selected-canonical-source-set digests reconstructed from the complete
+per-aggregate source-set chunk streams bound to the corresponding derived
+revision snapshot entries. For canonical rows, the manifest additionally records the
 deterministic digest of the authoritative default-generation selection
 materialized from the selection-snapshot descriptor; every exported canonical
 row must match that selection and its captured `selection_revision`. Query's
@@ -1032,7 +1050,8 @@ ordered content-aware digests; and Query projections and canonical exports
 compare the authoritative default-generation selection and canonical content
 digests at matching canonical vector entries. Derived projections and exports
 compare the selected aggregate state, aggregate revisions, and retention-windowed
-source set at matching per-aggregate derived revision snapshot page entries;
+source set with complete digest-verified coverage across the matching
+per-aggregate derived revision snapshot page entries and source-set chunks;
 projection rebuild completion additionally requires the immutable accepted
 derived key/revision target descriptor and complete digest-verified coverage;
 no scalar revision is used to claim cross-aggregate completion.
@@ -1170,8 +1189,12 @@ The owning implementation contracts must make these scenarios testable:
    publication without a conflicting equal-sequence rejection.
 5. Create a project through the generation-matched `project_create`
    `LifecycleMutationV1` barrier and verify it remains unavailable until every
-   applicable owner has an active baseline Jobs registration and matching
-   acknowledgement. Verify the active-project generation inventory is persisted
+   applicable owner has an enabled, active baseline Jobs registration and a
+   generation-matched enablement acknowledgement. Stall post-commit enablement
+   for one owner or Jobs and verify the armed, non-dispatchable registration
+   does not expose the project or admit data; after every enablement
+   acknowledgement arrives, verify exposure and admission become possible.
+   Verify the active-project generation inventory is persisted
    outside API PostgreSQL before a default-policy project is exposed and lets
    Jobs recreate its baseline registration after stale API and Jobs restores.
    Shorten retention and delete a project; verify API participates as a fifth
@@ -1240,7 +1263,8 @@ The owning implementation contracts must make these scenarios testable:
    `ExportSnapshotHoldInstallV1` request/response with the canonical
    partition-sequence vector plus bounded derived-revision and immutable
    selection-snapshot descriptors, paginated derived-revision and selection
-   pages with per-page and final digests, live derived-aggregate retention
+   pages plus bounded per-aggregate source-set chunks with per-page, per-chunk,
+   and final digests, live derived-aggregate retention
    recomputation and publication while an export hold retains an immutable
    captured revision, promotion fencing for held selections,
    API-to-Jobs scheduling,

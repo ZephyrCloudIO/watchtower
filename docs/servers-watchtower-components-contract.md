@@ -204,8 +204,10 @@ The allowed protocol and data-flow direction is:
    is reported complete. During the API `project_create` barrier, each
    applicable data owner sends an idempotent baseline
    `LifecyclePurgeRegistrationV1` request for the default-policy generation,
-   so Jobs has a versioned registration for every baseline schedule before API
-   exposes the project.
+   so every baseline schedule is enabled and acknowledged before API exposes
+   the project. An armed but non-dispatchable registration is insufficient:
+   API keeps the project unavailable and does not admit data while
+   post-commit enablement is pending.
    During a lifecycle prepare phase, API's local lifecycle participant, Ingest,
    Processor, and Query send a
    versioned `LifecyclePurgeRegistrationV1` request to Jobs for the affected
@@ -355,10 +357,15 @@ identity, request scope, fixed-size page parameters, entry count, page count,
 and final selection digest; it never inlines one entry or an unbounded
 page-digest list for every record. The derived revision descriptor uses the
 same bounded metadata shape and never inlines aggregate entries or an
-unbounded page-digest list. Processor records each captured derived aggregate's
-state, selected source set, and `authoritative_revision`, including explicit
-empty revision entries, in immutable export-specific/MVCC snapshot state keyed
-by `export_id` and `export_revision`. The live aggregate remains authoritative
+unbounded page-digest list. Each aggregate entry carries a bounded
+`DerivedSourceSetSnapshotDescriptorV1` containing the source-set snapshot
+identity, aggregate and `authoritative_revision` binding, fixed-size chunk
+parameters, source count, chunk count, and final source-set digest; it never
+inlines source tuples or an unbounded chunk-digest list. Processor records each
+captured derived aggregate's state, `authoritative_revision`, and immutable
+source-set snapshot metadata, including explicit empty revision entries, in
+export-specific/MVCC snapshot state keyed by `export_id` and
+`export_revision`. The live aggregate remains authoritative
 and continues to accept contributions and retention recomputations: expired
 contributions are removed, and higher revisions may publish to Query during the
 hold. Export materialization reads the captured snapshot state, so live
@@ -398,13 +405,23 @@ Query obtains derived revision pages through the authenticated versioned unary
 Processor. Each request carries the export ID and revision, derived descriptor
 ID, and bounded page cursor; each response carries a bounded set of fully
 qualified aggregate entries containing the aggregate key, `authoritative_revision`,
-and materializable captured aggregate state and selected source set, including
-explicit empty revision entries, the page digest, next cursor, and final
-descriptor digest when complete. Query verifies descriptor scope, cursor order,
-page digests, entry count, and final digest before materializing each derived
-row from the captured state and source set. A missing, repeated, conflicting,
-or unauthorized page fails the export without an artifact. API and Jobs persist
-and forward only the descriptor and its integrity evidence; Query never reads
+and materializable captured aggregate state plus its bounded source-set
+descriptor, including explicit empty revision entries, the page digest, next
+cursor, and final descriptor digest when complete. Query verifies descriptor
+scope, cursor order, page digests, entry count, and final digest before
+retrieving the source set. Query obtains each source set through the
+authenticated versioned unary `ExportDerivedSourceSetSnapshotChunkV1`
+Protobuf-over-HTTP interface from Query to Processor. Each request carries the
+export ID and revision, derived descriptor ID, aggregate key,
+`authoritative_revision`, source-set descriptor ID, and bounded per-aggregate
+source cursor; each response carries a bounded set of
+`(watchtower_id, processing_generation)` tuples, the chunk digest, next cursor,
+and the final source-set digest when complete. Query verifies the aggregate and
+revision binding, descriptor scope, cursor order, source count, chunk count,
+per-chunk digests, and final source-set digest before materializing the derived
+row. A missing, repeated, reordered, conflicting, or unauthorized page or
+chunk fails the export without an artifact. API and Jobs persist and forward
+only the bounded descriptors and their integrity evidence; Query never reads
 Processor persistence directly.
 
 Jobs schedules a present source-expiry deadline from the hold-install response
@@ -746,14 +763,16 @@ For project creation, API uses the same request with
 `mutation_kind=project_create` and the project-creation generation. Each
 applicable owner prepares its project fence and baseline registration. API first
 records the project inventory as a pending generation in the
-restore-independent lifecycle registry; after all required owner
-acknowledgements and the active-generation commit, it marks that inventory
-active before exposing the project. Owners then
-activates that registration through Jobs. API exposes the project only after
-all applicable owners return generation-matched active
-`LifecycleMutationAcknowledgementV1` responses; Jobs returns its
-`purge_registration_id` before the owner acknowledges the active creation
-barrier.
+restore-independent lifecycle registry. After the armed acknowledgements and
+active-generation commit, every baseline registration is sent through the
+post-commit `registration_phase=enable` step. API keeps the inventory pending,
+the project unavailable, and project data inadmissible until every applicable
+owner, including Jobs, returns a generation-matched acknowledgement showing its
+baseline registration is enabled and active. Only then does API atomically mark
+the inventory active and expose the project. A stalled owner or Jobs leaves the
+creation `accepted_pending` and retryable; the active-generation commit alone
+never exposes or admits the project. Jobs returns its `purge_registration_id`
+before the owner acknowledges the creation barrier.
 During prepare, Jobs durably persists the registration in `paused` state and returns its
 `purge_registration_id`; the owner persists that ID and the paused confirmation
 before acknowledging the lifecycle prepare. Jobs handles its own local
@@ -980,8 +999,13 @@ become runtime acceptance criteria for the owning implementation issues:
    security projection, then cross its freshness boundary and fail closed.
 6. Create a project through the generation-matched `project_create`
    `LifecycleMutationV1` barrier and verify the project remains unavailable
-   until each applicable owner registers an active baseline schedule with Jobs
-   and returns an active acknowledgement. Verify the project-generation
+   until each applicable owner registers an enabled, active baseline schedule
+   with Jobs and returns a generation-matched enablement acknowledgement.
+   After the active-generation commit, stall one owner or Jobs during
+   post-commit enablement and verify the armed, non-dispatchable registration
+   does not expose the project or admit data; after all enablement
+   acknowledgements arrive, verify exposure and admission become possible.
+   Verify the project-generation
    inventory is durable outside API PostgreSQL before exposure and is used to
    recreate a default-policy baseline after an API and Jobs restore. Redeliver a retention or deletion
    request and verify each data owner uses `LifecyclePurgeRegistrationV1` to
@@ -1015,7 +1039,8 @@ become runtime acceptance criteria for the owning implementation issues:
     API-to-Processor `ExportSnapshotHoldInstallV1` request/response, canonical
     partition-sequence vector, bounded derived-revision and immutable
     selection-snapshot descriptors, authenticated paginated derived-revision
-    and selection pages with complete digest validation, API-to-Jobs scheduling, Jobs-to-Query
+    and selection pages plus bounded per-aggregate source-set chunks with
+    complete digest validation, API-to-Jobs scheduling, Jobs-to-Query
     `ExportExecutionV1` hold installation, and an export snapshot hold that
     preserves inputs through completion or fails without an artifact when any
     vector member or selection page cannot be materialized; verify terminal
