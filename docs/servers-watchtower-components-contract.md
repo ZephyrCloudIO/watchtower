@@ -1189,6 +1189,22 @@ and organization gates before readiness. Consumers install affected authorizatio
 fences through existing owner-mediated handoffs. Recovery restores only approved,
 still-valid permissions and cannot revive deleted accounts or suspended access.
 
+Customer audit history uses Query's native public read boundary and an
+authenticated unary Protobuf-over-HTTP `/internal/v1` handoff to API, which reads
+its own authoritative audit rows and erasable context. Query forwards the exact
+requesting principal, credential and organization/action scope through the existing
+trusted workload boundary; API independently enforces current Owner/Admin authority,
+credential scope, resource state and context expiry/erasure. mTLS caller identity
+alone is insufficient. Requests use bounded pagination and filters; cursors bind
+to the original authorized scope and are rechecked on every page. API returns only
+customer-safe history with currently readable context; erased fragments stay
+anonymous. Query does not persist or cache audit rows, context or result payloads,
+and no direct API-store access or new audit projection is allowed. Before responding,
+Query also enforces current revocation/deletion fences. API unavailability or
+unverifiable erasure/authorization state returns 503, with no stale-cache fallback.
+Validate cross-tenant filters/cursors, role revocation between pages, account/project
+context erasure during reads, stale restore and dependency failure.
+
 API owns control-plane recovery state and external identity synchronization.
 Its consumers enforce security projections with a maximum freshness of 60
 seconds. WorkOS synchronization unconfirmed for more than five minutes blocks
