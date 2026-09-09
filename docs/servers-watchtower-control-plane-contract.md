@@ -246,6 +246,59 @@ Operational upper bounds are independent of billing. Operator sets upper bounds;
 - Process suspension-time deletion requests through verified support handling without requiring suspension removal or weakening deletion rules.
 - Reactivation restores use only of otherwise valid, unrevoked credentials. Recovery and reactivation never revive revoked credentials.
 
+### Staff Role Authority and Provisioning
+
+API owns the authoritative assignments of `StaffAdmin`, `Support`, and
+`Operator`. Staff SSO and mandatory IdP MFA authenticate staff identities;
+IdP roles or groups never automatically grant Watchtower staff permissions.
+Every staff operation checks the current API-owned role as well as the existing
+network, authentication, resource-state, purpose, and audit requirements.
+
+| Staff action | Required authority |
+| --- | --- |
+| Assign or revoke another staff member's roles, including StaffAdmin | StaffAdmin through the internal operator web with a user session actively reauthenticated within five minutes |
+| Approve verified customer recovery | Support; StaffAdmin alone is insufficient |
+| Change operational limits or suspend/reactivate organizations | Operator; StaffAdmin alone is insufficient |
+| Request or approve emergency customer-data reads | Operator with the existing distinct-approver, scope, audit, and expiry requirements |
+| Register the first StaffAdmin | Authorized deployment operator through the audited, first-registration-only bootstrap procedure |
+
+StaffAdmin carries no implicit customer recovery, suspension, impersonation, or
+data-read authority. A staff member needs the corresponding separate role for
+those operations. Support, Operator, and customer Owner/Admin alone cannot assign
+staff roles. Self-assignment, self-revocation, and every other change to one's own
+roles are forbidden. Another StaffAdmin may assign StaffAdmin, but removal of the
+last StaffAdmin is rejected. Serialize role changes so concurrent removals cannot
+bypass this invariant. Role mutation audit records identify the acting and target
+staff identities, previous and new roles, reason, and outcome. Audit unavailability
+blocks role changes; staff authentication alone is never authorization to mutate.
+
+The initial StaffAdmin is designated by an authorized deployment operator in an
+audited bootstrap operation. API records first registration durably outside its
+restorable PostgreSQL state. Bootstrap is allowed only when no StaffAdmin has
+ever been registered and no registration or revocation evidence exists; an empty
+restored table is not proof of eligibility. Concurrent or repeated bootstrap
+attempts cannot create additional initial administrators. Existing or unavailable
+registry evidence prevents bootstrap. Subsequent assignments use the internal
+web and the current StaffAdmin policy, not the bootstrap path.
+
+Role revocation durably records a monotonically increasing staff-authorization
+version and a restore-independent revocation intent before acknowledging success.
+Fence role-dependent operating sessions, unfinished approvals, and active
+emergency access at every affected enforcement surface before completing the
+revocation. Requests and in-flight privileged use must recheck current authority;
+remaining roles authorize only independently permitted actions and do not preserve
+an approval or capability issued under the revoked role. A missing acknowledgement
+leaves the revocation incomplete and fail-closed, never a successful stale grant.
+
+Before restored API state or any affected enforcement surface admits staff
+operations, reconcile the restore-independent registration and revocation records
+and install the latest authorization version. Stale replay must not lower the
+version, restore withdrawn roles or capabilities, or reopen bootstrap. Retain the
+required evidence through every affected restorable-backup horizon; first-registration
+evidence continues to prohibit subsequent bootstrap. Missing or unverifiable state
+keeps staff access blocked. This extends the existing API-owned revocation and
+audit boundary without granting consumers direct access to API persistence.
+
 ## Audit, notifications, and observability
 
 - Audit all management changes and authentication, recovery, and operator-access successes/failures, in addition to existing mandatory lifecycle/export events. Ordinary reads use safe operational logs.
@@ -286,6 +339,7 @@ routes. No owner may fulfill a request by reading another owner's persistence.
 | Immediate revocation | API to every affected public owner through existing `AuthorizationRevocationFenceV1` | Durable pre-commit intent, monotonic revision, scope and correlation; all affected owner fences acknowledged before successful authoritative revocation |
 | Project lifecycle and retention | API and existing owner/Jobs lifecycle barriers | Generation-matched prepare/activate/enablement acknowledgements; durable pending operation; no premature success or destructive rollback |
 | Settings application | API to applicable domain consumers | Stored version and consumer-specific application result; retries do not overwrite a newer observed version; special security/lifecycle barriers still apply |
+| Staff role provisioning and revocation | API; internal staff web and affected enforcement surfaces | Current StaffAdmin, recent reauthentication, no self-change or last-admin removal; audited first registration, monotonic revocation and reconciliation before staff access |
 | Recovery and staff administration | API; user recovery and separate internal staff web | Verified identity evidence, current role, purpose, expiry, scoped approval and audit; no implicit customer-data privilege |
 | Audit | API; all components through existing `AuditIntentV1`/`AuditEvidenceV1` | Durable audit acknowledgement before required side effects; correlated outcome, restore replay and erasable identity context |
 | External authentication events | WorkOS to API through Events API polling | Durable cursor and event identity; no external grant authority; unresolved security mismatch blocks affected user access |
@@ -331,7 +385,7 @@ audit identity context, and irreversible revocation/deletion decisions.
 | WorkOS outage conceals identity revocation | Separate five-minute external and 60-second internal limits; test each outage independently, including DSN/service-token behavior |
 | Recovery escalates privileges across organizations | Purpose-separated code hashes, atomic single use, current Owner rechecks and per-organization reapproval; test evidence reuse, expiry and cross-organization reconnection |
 | Contact change captures future recovery | Fresh authentication, existing recovery code and new-address proof; invalidate old bundles and requests, notify old address |
-| Staff abuse or self-approved raw access | Separate Support/Operator roles, distinct emergency approver, explicit scope and one-hour expiry; no deletion/retention bypass or routine impersonation |
+| Staff abuse or self-approved raw access | API-owned StaffAdmin/Support/Operator assignments, no IdP-derived grants, no self-role change, last-StaffAdmin protection, restore-independent bootstrap/revocation evidence, distinct emergency approver, explicit scope and one-hour expiry; no deletion/retention bypass or routine impersonation |
 | Repeated or concurrent changes duplicate authority | Scoped idempotency through execution plus 24 hours after completion, version conflicts and honest pending state; never replay token plaintext |
 | Backup/replay restores deleted or revoked state | Restore-independent tombstones, authorization fences and audit reconciliation before readiness; erased actor/organization context must not reappear |
 | Audit outage silently permits privileged changes | Durable intent and fail-closed new authentication/management changes; existing permitted reads only; safely report the inability to audit |
@@ -381,6 +435,7 @@ provider integration validation, and another threat-model review before release.
 - Exercise optimistic conflicts, duplicate requests, mismatched idempotency payloads, operations lasting beyond 24 hours, delayed acknowledgements, and honest pending UI.
 - Verify every quota boundary, lowered limits, hidden environments, rolling rate windows, independent security budgets, and unavailable enforcement dependencies.
 - Inject reordered/replayed internal changes and duplicate external events; verify cursor recovery, revocation fences, readiness gating, and no unauthorized privilege restoration.
+- Verify IdP group changes do not grant staff roles; deny role mutations by Support/Operator or customer administrators without StaffAdmin. Test self-assignment/removal, concurrent last-StaffAdmin removal, repeated bootstrap and bootstrap after an old backup restore. Revoke a role during a session, pending approval and emergency read; verify immediate role-dependent fencing and only independently permitted remaining-role actions. Reject role changes during audit failure and block restored staff access until current registration/revocation records are reconciled.
 - Test staff-role separation, self-approval denial, emergency-access expiry, retention/deletion restrictions, suspension recovery, and customer-visible notifications.
 - Verify audit fail-closed behavior, journal recovery, privacy erasure, email retries/manual resend, and configured alert conditions.
 - Validate core web flows, keyboard and assistive-technology access, WCAG 2.2 AA requirements, and customer-safe error/progress/recovery guidance in isolated non-production environments.

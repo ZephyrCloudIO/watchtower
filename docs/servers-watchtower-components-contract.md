@@ -1151,6 +1151,16 @@ Cleanup retains its original deadlines and tombstones survive every affected
 restorable-backup horizon, preventing restored authority or identifying context
 from reappearing after deletion.
 
+API owns StaffAdmin, Support, and Operator role assignments under
+`docs/servers-watchtower-control-plane-contract.md`; staff SSO/IdP groups do not
+supply authorization grants. API also owns restore-independent first-registration
+and monotonically versioned staff-revocation evidence. Restored API and affected
+enforcement surfaces reconcile the latest records before allowing staff access;
+stale replay cannot restore withdrawn roles, sessions, approvals, emergency
+capabilities, or bootstrap eligibility. Revocation success requires fencing all
+affected role-dependent access. Consumers use owner-mediated interfaces, never
+API persistence, and missing or unverifiable evidence fails closed.
+
 API owns control-plane recovery state and external identity synchronization.
 Its consumers enforce security projections with a maximum freshness of 60
 seconds. WorkOS synchronization unconfirmed for more than five minutes blocks
