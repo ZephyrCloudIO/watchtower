@@ -1218,6 +1218,10 @@ restore-independent authority, not merely audit evidence. API reconciles pending
 claims and replacements with immutable current invalidation records before any
 recovery hash check or recovery readiness; replay cannot revive consumed codes
 or obsolete bundles. Their minimal fences survive every affected backup horizon.
+API commits fetched event cursors atomically with a durable idempotent inbox and
+replays unapplied events after restart. Only the contiguous fully applied position,
+including required revocation fences, confirms external security synchronization;
+new successful polls cannot conceal pending security changes.
 Its consumers enforce security projections with a maximum freshness of 60
 seconds. WorkOS synchronization unconfirmed for more than five minutes blocks
 user-session and personal-token access independently of that internal window;
