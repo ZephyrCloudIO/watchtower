@@ -69,7 +69,7 @@ Additional restrictions:
 
 - Admin cannot change or remove an Owner.
 - The creator is the initial Owner. Multiple Owners are supported, and the last Owner cannot leave or be demoted.
-- Owner designation promotes an existing member; direct Owner invitations are unsupported. The promoting Owner must reauthenticate, and promotion completes only after the new Owner prepares recovery codes.
+- Owner designation promotes an existing member; direct Owner invitations are unsupported. The promoting Owner must reauthenticate, and promotion completes only after the new Owner registers and verifies a recovery contact and confirms recovery-code storage.
 - Project deletion, disablement, reactivation, retention shortening, organization deletion, Owner changes, SSO/MFA policy changes, and management-token issuance require a recently reauthenticated user session.
 - Personal tokens may remove or demote non-Owner members and revoke project grants when explicitly scoped and currently authorized.
 - All ungranted actions are denied. Sentry adapters map their external requests to the same native authorization decisions.
@@ -118,6 +118,7 @@ Watchtower API owns recovery-code hashes, atomic consumption, code replacement, 
 - Separate personal MFA recovery codes from organization-and-Owner-specific recovery codes.
 - Each bundle contains ten single-use codes, shown once and stored only as hashes. Codes have no fixed expiry. Reissuing a bundle invalidates all prior codes in it.
 - Require code-storage confirmation before MFA activation, organization creation completion, Owner promotion completion, and SSO enforcement or replacement.
+- Organization creation and Owner promotion additionally require the prospective Owner to explicitly register and verify their organization-specific recovery email before completion. The login-profile address is not implicitly a registered recovery contact; using the same address requires explicit recovery-contact registration and verification. Initial registration occurs in the authenticated ownership-preparation flow alongside the first code bundle and does not require a nonexistent prior recovery code. Until both email verification and code-storage confirmation finish, ownership preparation remains incomplete. Later changes use the separate existing-contact replacement rules. SSO enforcement/replacement readiness requires this verified contact as well as the prepared code bundle.
 - Owner privilege loss invalidates that Owner’s organization codes. SSO replacement invalidates all organization Owner recovery bundles and requires fresh preparation.
 - MFA recovery requires primary authentication and a personal recovery code. Revoke all other sessions and all personal tokens; the restricted recovery session must complete new MFA verification before ordinary access.
 - Organization recovery requires the registered recovery email, an organization recovery code, and approval by one Support operator. Consume the code atomically when identity verification succeeds.
@@ -296,7 +297,7 @@ are rechecked at transitions and use, not only at the initial request.
 
 | Resource or flow | Transition and guard | Result and recovery |
 | --- | --- | --- |
-| Organization creation / Owner promotion | Preparation to completion after required Owner recovery-code confirmation | No completed organization creation or Owner promotion without prepared recovery material; last-Owner removal stays forbidden |
+| Organization creation / Owner promotion | Preparation to completion after verified Owner recovery-contact registration and code-storage confirmation | No completed organization creation or Owner promotion without both verified recovery contact and prepared codes; last-Owner removal stays forbidden |
 | Project creation | `accepted_pending` to active only after the existing owner/schedule barrier | Unavailable until completion; retry the same durable operation |
 | Project disablement | Active to disabled by recently reauthenticated Owner/Admin | New collection and ordinary changes stop; accepted processing, authorized reads/exports and retention continue; no new alerts or reprocessing |
 | Project reactivation | Disabled to active by recently reauthenticated Owner/Admin | Re-evaluate current permissions and credential expiry/revocation; never resurrect invalid credentials |
@@ -366,6 +367,7 @@ provider integration validation, and another threat-model review before release.
 - Verify Owner/Admin service-account creation, deletion, project-grant changes, and token revocation; require recent user reauthentication for issuance/rotation and deny all service-account administration to project-only Manage and service tokens.
 - Verify each organization role can issue/rotate its own personal token only after recent reauthentication, inspect only safe own-token metadata, and revoke its own token. Deny another owner ID, excessive scopes, Viewer writes, and token-authenticated issuance/rotation; preserve policy-driven revocation.
 - Verify credential issuance response loss, expiry, emergency revocation, overlapping rotation, at-limit replacement, and concurrent in-flight requests.
+- Attempt organization creation and Owner promotion with only recovery codes, only a verified contact, or an unverified contact; completion must require both verified contact registration and confirmed codes. Verify initial contact registration does not require an old code and does not silently inherit the login profile.
 - Test MFA recovery, Owner recovery, consumed-code retries, approval expiry, privilege loss during recovery, contact changes, identity reconnection, and cross-organization reapproval.
 - Disable/reactivate projects while collection, processing, alerts, queries, exports, and retention are active.
 - Restore API and each affected owner from before organization/account deletion, including a crash after registry intent but before PostgreSQL commit and after partial cleanup. Verify reconciliation before readiness, original deadlines, erased audit-context protection, rejection of stale grants/recovery material, retention through the last usable backup, and preservation of unrelated organization data.
