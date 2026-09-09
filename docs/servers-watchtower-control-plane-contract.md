@@ -46,6 +46,8 @@ Organization roles are Owner, Admin, Member, and Viewer. Project levels are Read
 | Issue state, assignment, comments; release/artifact registration and modification; project alert-rule management | Write, Manage |
 | Release/artifact deletion; reprocessing; ordinary project settings | Manage |
 | Project DSN issuance, rotation, revocation, and redisplay | Manage |
+| Create/delete organization service accounts; grant/change/remove their project permissions; revoke their tokens | Owner, Admin |
+| Issue or rotate service-account tokens | Owner, Admin, using a recently reauthenticated user session |
 | Export creation and download | Manage |
 | Project access grants and project deletion | Owner, Admin |
 | Project disablement, reactivation, and retention shortening | Owner, Admin |
@@ -93,6 +95,7 @@ Additional restrictions:
 - If a token-issuance response is lost, an idempotent retry returns its identifier and issuance status, not plaintext. The user must revoke and replace an unrecoverable token.
 - Service accounts are restricted to explicitly granted project Read/Write/Manage operations. Explicit DSN management and export scopes are allowed. Organization administration, membership/grant management, project creation/deletion, service-account privilege changes, and management-token issuance are forbidden.
 - Personal and service tokens may export only with explicit export scope and current Manage authority, subject to existing export audit, limits, and download checks.
+- Organization service-account administration is Owner/Admin-only; project Manage alone grants no service-account administration authority. Creation, deletion, project-grant changes, and token revocation may use an authorized user session or an explicitly scoped Owner/Admin personal token. Issuance and rotation create new management-token secrets and require a recently reauthenticated Owner/Admin user session. No service token may perform these administration operations. Account deletion and permission reduction revoke affected access through the existing acknowledged fence protocol.
 - Internal workload authentication remains mTLS with explicit caller policy, independent of customer service accounts.
 
 ## Recovery
@@ -309,6 +312,7 @@ provider integration validation, and another threat-model review before release.
 - Exercise every role/action/principal combination, including Viewer ceilings, team/direct unions, Admin management, last-Owner protection, and token restrictions.
 - Attempt cross-tenant reads/writes, resource probing, credential reuse, mismatched organization SSO, external-role privilege injection, and replay of stale grants.
 - Exercise email-code, Google, SSO, organization MFA, active reauthentication, SSO enforcement/replacement, and WorkOS outages across the 60-second internal and five-minute external boundaries.
+- Verify Owner/Admin service-account creation, deletion, project-grant changes, and token revocation; require recent user reauthentication for issuance/rotation and deny all service-account administration to project-only Manage and service tokens.
 - Verify credential issuance response loss, expiry, emergency revocation, overlapping rotation, at-limit replacement, and concurrent in-flight requests.
 - Test MFA recovery, Owner recovery, consumed-code retries, approval expiry, privilege loss during recovery, contact changes, identity reconnection, and cross-organization reapproval.
 - Disable/reactivate projects while collection, processing, alerts, queries, exports, and retention are active.
