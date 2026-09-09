@@ -323,13 +323,25 @@ staff identities, previous and new roles, reason, and outcome. Audit unavailabil
 blocks role changes; staff authentication alone is never authorization to mutate.
 
 The initial StaffAdmin is designated by an authorized deployment operator in an
-audited bootstrap operation. API records first registration durably outside its
-restorable PostgreSQL state. Bootstrap is allowed only when no StaffAdmin has
-ever been registered and no registration or revocation evidence exists; an empty
-restored table is not proof of eligibility. Concurrent or repeated bootstrap
-attempts cannot create additional initial administrators. Existing or unavailable
-registry evidence prevents bootstrap. Subsequent assignments use the internal
-web and the current StaffAdmin policy, not the bootstrap path.
+audited bootstrap operation. Before any assignment, API atomically claims the
+never-registered state in its restore-independent registry with a durable pending
+intent containing the operation ID, exact target staff identity/binding, expected
+version and audit evidence. The claim is serialized against all bootstrap attempts;
+an empty restored table is not proof of eligibility. Any existing pending,
+completed or revoked registration blocks a new bootstrap, and unavailable evidence
+fails closed. An identical retry may resume its pending intent, never select a
+different target or create a second assignment.
+
+API reconciles that intent idempotently to exactly one PostgreSQL assignment and
+records completion outside restorable rows before enabling staff access. A crash
+before the assignment or completion record resumes the same intent. Before replay,
+apply the latest binding and revocation fences: a later withdrawal is not undone by
+an older bootstrap intent. Completed registration is permanent evidence against
+new bootstrap even if assignments are later erased or revoked. Subsequent
+assignments use the internal web and current StaffAdmin policy. Test crashes at
+each write boundary, lost responses, concurrent different-target attempts and
+restoration before/after revocation; none may strand a pending registration or
+create another initial administrator.
 
 ### Inaccessible Last StaffAdmin Recovery
 

@@ -1158,8 +1158,10 @@ last-StaffAdmin identity-reconnection procedure and its restore-independent bind
 intents/fences; it changes no role assignments and cannot reopen bootstrap.
 Recovery reconciles binding versions and revocations before staff access and
 fences old sessions, approvals and emergency capabilities before completion.
-API also owns restore-independent first-registration
-and monotonically versioned staff-revocation evidence. Restored API and affected
+API also owns restore-independent first-registration pending intents, their
+idempotent assignment/completion reconciliation, and monotonically versioned
+staff-revocation evidence. A pending bootstrap blocks competing registration
+but permits resuming its exact target; replay applies newer revocations first. Restored API and affected
 enforcement surfaces reconcile the latest records before allowing staff access;
 stale replay cannot restore withdrawn roles, sessions, approvals, emergency
 capabilities, or bootstrap eligibility. Revocation success requires fencing all
