@@ -109,7 +109,7 @@ canonical telemetry.
 | Query export metadata | Query; authoritative for export materialization state and `snapshot_generation` | Query-owned PostgreSQL export-metadata boundary | Retained with the export lifecycle and purged with the project; it is not a second export authority and contains no raw telemetry |
 | Query cache | Query; never authoritative | Encrypted Query-owned cache | At most 15 minutes; immediately invalidated for retention, deletion, or authorization changes |
 | Export objects | Query; non-authoritative customer-download artifacts | Encrypted Query-owned project-scoped S3 export prefix | The earlier of seven days from API `completed_at` and the active export-object policy cutoff computed from `completed_at` for successful artifacts; artifacts from any attempt that terminates without successful `completed`, including failed or canceled attempts, are removed or made inaccessible at terminal transition, and Query's owner-side expiry fence removes or makes each successful artifact inaccessible at its exact cutoff even when API lifecycle reconciliation is delayed |
-| Audit events | API for contract-level lifecycle and access audit authority | API-owned append-only PostgreSQL audit boundary with erasable encrypted project-scoped context, plus a restore-independent immutable audit journal | Detailed history lasts 13 calendar months under the control-plane contract, subject to earlier identity-context erasure; every journaled event is replayable after an API database restore, and deleted projects retain only minimal anonymous evidence |
+| Audit events | API for contract-level lifecycle and access audit authority | API-owned append-only PostgreSQL audit boundary with independently erasable encrypted project, organization, account, and staff context, plus a restore-independent immutable audit journal | Detailed history lasts 13 calendar months under the control-plane contract, subject to earlier identity-context erasure; every journaled event is replayable after an API database restore, and deleted projects retain only minimal anonymous evidence |
 | API restore audit intents | API; authoritative for pre-restore intent evidence until API records the outcome in its audit boundary | API-owned encrypted immutable S3 audit-intent prefix independent of API PostgreSQL backups | Retained through restore completion and evidence recording, then follows the applicable audit-retention policy; never stored only in the API restore target |
 | API export hold registry | API; authoritative for restore-independent export hold, terminal-release, completion/expiry scheduling evidence, immutable captured snapshot payloads for unexpired non-terminal held revisions, owner-scoped source-expiry fences for expired revisions, completed-export source-eligibility evidence, and recovery copies of completed materialization metadata | API-owned encrypted immutable S3 export-hold registry prefix independent of API PostgreSQL backups | Retained until every held revision and expiry schedule is terminally released or reconciled; source-dependent selection pages, derived revision pages, and source-set chunks carry their exact source-expiry deadline and are deleted or made irreversibly inaccessible by an independent storage-retention fence at that deadline even if API lifecycle reconciliation is unavailable, while a bounded owner-scoped source-expiry fence remains as non-payload recovery evidence through the applicable restorable-backup horizon; completed-materialization recovery copies and metadata-only source-eligibility inventories remain through the full accessible lifetime of their artifact and are not removable solely because they were reconciled or replayed; after artifact expiry or earlier durable invalidation/removal and terminal cleanup, a minimal terminal tombstone remains until no restorable API, Processor, Query, or Jobs backup can contain the pre-terminal state, then follows export and project-deletion cleanup |
 | Retention policy registry | API; authoritative for shortened-retention duration policies, their current-time effective cutoffs, and restore cleanup | API-owned encrypted immutable S3 control-registry prefix, independent of API PostgreSQL backups | The active policy persists until superseded and its effective cutoff is computed from that duration at enforcement time; superseded versioned policy records are retained for 13 months and the active policy is loaded before restored owners accept traffic |
@@ -1338,6 +1338,33 @@ reconcile these fences before readiness through the existing owner-scoped
 original deadlines, matching scope and backup-horizon retention.
 Replay must not reconstruct erased context. These rules do not shorten the
 required non-identifying fence or recovery evidence retention horizons.
+
+Audit context is not restricted to projects. API stores organization settings and
+membership targets in organization-scoped encrypted context, customer actor and
+authentication/recovery identity in account-scoped context, and staff identity in
+staff-scoped context. Project events retain their project-scoped target context.
+An event may reference several independently erasable context fragments so account
+erasure cannot leave an actor name/email copied in surviving organization context,
+and organization erasure need not destroy unrelated staff or account history.
+Pre-account authentication failures use event-scoped erasable identity context;
+they never invent an account, project, or tenant to hold an email address.
+
+Immutable audit rows and journal entries contain only non-identifying evidence and
+opaque context references or encrypted fragments, never plaintext attributable
+identity outside its erasable context. Non-project history follows the control-plane
+13-calendar-month limit and applicable earlier erasure rules. The same erasure must
+cover the PostgreSQL view, journal, recovery copies and any lookup associating a
+subject with an event. Staff-context expiry does not erase non-identifying staff
+bootstrap/revocation evidence required to prevent privilege restoration.
+
+API records monotonic context-erasure fences in its immutable restore-independent
+control registry, identifying the opaque context scope, generation and effective
+cutoff without the erased identity payload or recoverable key. Reconcile these
+fences before audit replay or readiness. Journal replay may restore minimal event
+evidence but cannot recreate erased context, destroyed keys or subject lookups;
+missing/unverifiable fences fail closed. Retain the fences through every affected
+restorable-backup horizon. Existing account/organization deletion deadlines and
+project context-key destruction remain in force.
 
 Project disablement is reversible and continues existing-data reads, exports,
 and already accepted processing under the control-plane contract. It is distinct
