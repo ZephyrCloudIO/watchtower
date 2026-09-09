@@ -789,9 +789,16 @@ the shortened cutoff. Only after the tombstone is active and the required purge
 activation acknowledgements are complete may API irreversibly remove those
 project policy versions. API retains the non-customer-readable registry tombstone
 for 13 months. Audit rows remain append-only and are never updated or deleted:
-their actor or workload identity, tenant/project context, action, and target
-resource are encrypted under an erasable project-scoped context key, and
-deletion irreversibly destroys that key. Only irreversible minimal evidence
+their tenant/project target context and attributable action details are encrypted
+under an erasable project-scoped context key. Customer actor identity is in a
+separate account-scoped fragment, staff identity in a staff-scoped fragment, and
+workload identity in independently erasable context for its owning principal.
+Project-scoped access to those fragments is also gated by the project context,
+so destroying the project key leaves only the minimal evidence below. Account
+erasure destroys its actor fragment and identifying lookups even while project
+target context survives; it must not destroy unrelated project history. No actor
+identity may be duplicated inside surviving target context. Project deletion
+irreversibly destroys its project context key. Only irreversible minimal evidence
 remains available after project deletion: deletion timestamp, result,
 correlation ID, and the keyed tombstone, without tenant-identifying or
 customer-payload content.
