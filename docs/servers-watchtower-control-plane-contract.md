@@ -31,7 +31,7 @@ it does not relax their safeguards. The project index owns downstream scope.
 
 Organization roles are Owner, Admin, Member, and Viewer. Project levels are Read, Write, and Manage.
 
-- Owner and Admin have access to all organization projects.
+- Owner and Admin have effective Manage permission on every project in their organization without a team or direct grant. This includes every Read and Write action in the matrix; it does not bypass credential scope, resource state, authentication conditions, or Owner-only restrictions.
 - Member access is the union of explicit team and direct project grants.
 - Viewer receives access only to granted projects and remains read-only regardless of a higher project grant.
 - Current organization role, membership, project grants, credential scope, resource state, and applicable authentication policy are independently enforced.
@@ -305,6 +305,7 @@ provider integration validation, and another threat-model review before release.
 ## Test Scenarios
 
 - Create an organization, prepare Owner recovery codes, invite a member, create teams/projects, grant access, and register environments through collection.
+- Verify Owner and Admin can perform Read, Write, and Manage project actions without explicit grants, while token scopes, disabled resources, recent authentication, and Owner-only operations remain enforced.
 - Exercise every role/action/principal combination, including Viewer ceilings, team/direct unions, Admin management, last-Owner protection, and token restrictions.
 - Attempt cross-tenant reads/writes, resource probing, credential reuse, mismatched organization SSO, external-role privilege injection, and replay of stale grants.
 - Exercise email-code, Google, SSO, organization MFA, active reauthentication, SSO enforcement/replacement, and WorkOS outages across the 60-second internal and five-minute external boundaries.
