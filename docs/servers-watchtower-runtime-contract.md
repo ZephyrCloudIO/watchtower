@@ -60,13 +60,26 @@ retries are budget-limited and are allowed only for operations explicitly
 declared idempotent.
 
 Asynchronous messages use a common versioned envelope containing a canonical
-lowercase UUID v7 message ID, message type and schema version, producer, tenant
-and project context, event time, causation and correlation identifiers, W3C
+lowercase UUID v7 message ID, message type and schema version, producer, an explicit scope discriminator and matching scope context, event time, causation and correlation identifiers, W3C
 trace context, idempotency key, and either a bounded payload or authorized
 payload reference. Credentials and unrestricted customer payloads are
 prohibited. Delivery is at least once, consumers are idempotent, and no global
 ordering is guaranteed unless a downstream domain contract declares ordering
 for an aggregate partition.
+
+The envelope scope is one of `project`, `organization`, `account`, or `staff`.
+Project scope requires the canonical tenant/organization UUID and project UUID;
+organization scope requires only that organization UUID. Account and staff scopes
+require their respective canonical principal UUID and do not invent a tenant or
+project. Prohibit unrelated scope fields. Telemetry messages remain project-scoped;
+control-plane messages use the owning aggregate's scope. Consumers validate the
+message type's allowed scope, producer authority and resource ownership before
+applying it; scope metadata does not grant authority or imply fan-out access to
+all organizations. Unknown or mismatched scopes are rejected, never interpreted
+as a global grant. Introduce these variants through the existing versioned N/N-1
+compatibility boundary before producers emit them. Validate all four variants,
+missing/extra identifiers, cross-tenant projects and old-consumer behavior in
+contract tests before implementation release.
 
 ## Security and Configuration
 
