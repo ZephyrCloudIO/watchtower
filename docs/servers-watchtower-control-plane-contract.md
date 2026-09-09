@@ -23,7 +23,7 @@ it does not relax their safeguards. The project index owns downstream scope.
 - An organization is exactly one tenant. Its Watchtower organization UUID is the canonical `tenant_id`; there is no separate tenant resource or translated tenant identifier. Each project belongs to exactly one such organization, and its immutable owning organization UUID is the `tenant_id` used in storage, messages, projections, authorization predicates, and deletion scope. A user may have memberships in multiple tenants but is not itself a tenant. WorkOS organization IDs are external references, never canonical tenant IDs.
 - Organizations own projects. Teams are organization-scoped groups granting project access; multiple teams may access one project. Direct user grants are also supported.
 - Teams have no separate administrator role. Owner and Admin manage teams and memberships.
-- Environment names register automatically on first collection. Manage may hide them from the normal list; renaming, deletion, and environment-level authorization are unsupported. Hidden environments still count toward limits.
+- Environment names register automatically on first collection. Manage may hide them from the normal list; renaming, environment data deletion, and environment-level authorization are unsupported. Hidden active registrations still count toward limits. Owner/Admin may retire a registration to reclaim its slot without deleting historical data, and explicitly permit that name again through the registration lifecycle below.
 - Repository-owned identifiers are canonical lowercase UUID v7 values, persisted as PostgreSQL `uuid`. Organization slugs are globally unique; team and project slugs are unique within their organization. Slugs may change; display names need not be unique.
 - Project organization ownership is immutable. Project transfers and organization merges are unsupported.
 - Recreating a deleted resource requires a new ID and credentials, with no inherited data or permissions. Names and slugs may be reused only after deletion completes.
@@ -77,6 +77,7 @@ Organization roles are Owner, Admin, Member, and Viewer. Project levels are Read
 | Export creation and download | Manage |
 | Project access grants and project deletion | Owner, Admin |
 | Project disablement, reactivation, and retention shortening | Owner, Admin |
+| Retire or explicitly reactivate an environment registration | Owner, Admin; user session or explicitly scoped personal token |
 | Organization/project audit access | Owner, Admin only |
 
 Additional restrictions:
@@ -264,7 +265,7 @@ Operational upper bounds are independent of billing. Operator sets upper bounds;
 | Projects per organization | 1,000 |
 | Service accounts per organization | 1,000 |
 | Valid DSNs per project | 50 |
-| Environments per project, including hidden entries | 1,000 |
+| Active environment registrations per project, including hidden entries | 1,000 |
 | Personal tokens per user/organization pair | 50 |
 | Tokens per service account | 50 |
 
@@ -275,6 +276,8 @@ Operational upper bounds are independent of billing. Operator sets upper bounds;
 - A proposed organization slug is not globally reserved during recovery-email/code preparation. Enforce global slug uniqueness only at the atomic organization activation commit; a conflict cannot activate the organization or steal another organization's slug. Abandoned preparations remain resumable/cancelable within the bounded slot count and cannot squat global slugs.
 - Limits may be lowered below current usage. Keep existing resources, expose the exceeded state, and block additional creation.
 - At the environment limit, reject collection for a new environment while continuing collection for existing environments.
+- API owns versioned environment retirement/reactivation. Retirement writes a durable name tombstone and obtains Ingest's admission-fence acknowledgement before releasing the active slot; collection for that name is then rejected, never silently dropped or automatically re-registered. Accepted data finishes normally and retained historical reads remain authorized. Explicit reactivation atomically checks/reserves capacity and advances the registration generation before admitting that name again. Retirement is idempotent and cannot release a slot twice; concurrent first collection, retirement and reactivation serialize on project/name and quota state. Tombstones and generation fences survive backup restore and stay effective until an authorized newer reactivation or project deletion. Repeated retirement of already-retired names creates no extra registration. No new environment ACL is introduced.
+- Test quota exhaustion from a compromised DSN, retirement with in-flight collection, blocked automatic re-registration, explicit at-cap reactivation, hidden registrations, stale projection replay and backup restore. Retiring a name must preserve its historical data and free exactly one slot only after admission fencing.
 - Organization-scoped general management APIs enforce both 600 requests per principal and 6,000 per organization over the preceding 60 seconds.
 - Organization-scoped revocation, recovery, and deletion use an independent budget of 30 per principal and 300 per organization per preceding 60 seconds, without bypassing authentication, authorization, or audit.
 - Authenticated account-scoped operations with no single owning organization use only the applicable principal budget: 600 per preceding 60 seconds for ordinary operations such as organization creation, or the independent 30-per-60-second security budget for account deletion/recovery/revocation. Do not select a membership, invent an organization, or charge every organization for such a request. No organization counter is required in this explicit exception; an unavailable applicable principal counter still fails closed with 503. Principal budgets aggregate across that principal's requests regardless of organization, session, or token, so changing memberships cannot reset the window. Organization-scoped requests always apply both their principal and organization limits.
@@ -580,7 +583,7 @@ provider integration validation, and another threat-model review before release.
 - Billing, pricing, subscription entitlements, and feature-flag rollout.
 - Custom roles, team administrators, automatic domain membership, SCIM, and Directory Sync.
 - Multiple simultaneously active enterprise IdPs, Watchtower MFA after SSO, SMS MFA, and passkeys.
-- Project transfer, organization merge, environment rename/deletion, and environment-level authorization.
+- Project transfer, organization merge, environment rename/data deletion, and environment-level authorization; registration retirement is supported.
 - Self-service primary-email editing, general operator impersonation, or recovery without required evidence.
 - Cancellation/restoration after final project deletion.
 - Sentry wire semantics, signal algorithms/defaults, notification-provider implementation, and numeric SLO choices delegated above.
