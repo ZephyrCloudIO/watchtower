@@ -1223,6 +1223,12 @@ Validate cross-tenant filters/cursors, role revocation between pages, account/pr
 context erasure during reads, stale restore and dependency failure.
 
 API owns control-plane recovery state and external identity synchronization.
+External-membership reconciliation uses restricted Owner authorization or the
+existing Owner/Support recovery flow. API repairs provider state, rechecks current
+membership and policy, and clears only the matching blocked generation after
+durable completion. Restore-independent generations and existing owner fences
+prevent stale events or backups from unblocking newer revocations; provider repair
+alone never grants Watchtower access.
 Recovery-code consumption claims and bundle/contact generation fences are
 restore-independent authority, not merely audit evidence. API reconciles pending
 claims and replacements with immutable current invalidation records before any
