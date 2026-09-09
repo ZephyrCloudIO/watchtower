@@ -1189,6 +1189,13 @@ and organization gates before readiness. Consumers install affected authorizatio
 fences through existing owner-mediated handoffs. Recovery restores only approved,
 still-valid permissions and cannot revive deleted accounts or suspended access.
 
+API owns the narrow deletion-receipt status exception to native Query reads.
+It authenticates only the receipt bound to an account/organization deletion and
+returns minimal operation status after ordinary credentials are revoked. The
+control-plane contract defines its hash-only storage, lifetime, budgets and
+restore-independent operation evidence; it provides no general data read or
+mutation authority and is not an audit projection.
+
 Customer audit history uses Query's native public read boundary and an
 authenticated unary Protobuf-over-HTTP `/internal/v1` handoff to API, which reads
 its own authoritative audit rows and erasable context. Query forwards the exact
