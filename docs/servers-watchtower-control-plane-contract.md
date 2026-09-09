@@ -365,6 +365,39 @@ each write boundary, lost responses, concurrent different-target attempts and
 restoration before/after revocation; none may strand a pending registration or
 create another initial administrator.
 
+### Deployment-operator authority
+
+The separate deployment IAM is authoritative for explicit, environment-scoped
+bootstrap, recovery-verification and recovery-approval permissions. Its IAM
+administrators grant and revoke these permissions through audited IAM administration,
+independently of Watchtower StaffAdmin/Support/Operator assignments. Watchtower
+cannot grant deployment authority, and a staff IdP group or internal-network
+location alone grants none. Deployment IAM administrators are the external security
+root; their own access lifecycle belongs to deployment IAM rather than Watchtower
+bootstrap. Before implementation, the operating contract must name the deployed
+IAM service, trusted issuer/audience and administrator enrollment/runbook.
+
+API authenticates the human through the separate staff SSO with mandatory IdP MFA
+and active reauthentication within five minutes, then verifies current explicit
+permission with deployment IAM on every bootstrap/recovery step and at commit.
+Bind the authorization decision to the exact environment, action, target, staff
+person and request. Reject wrong issuers/audiences, expired or replayed proofs,
+unavailable authority checks and arbitrary internal callers. Internal transport
+still requires its existing workload authentication and caller policy.
+
+Deployment IAM links every operator registration to a non-reassignable person
+identifier from the independently maintained staff identity/employment record.
+API compares that identifier across old/new SSO registrations, requester, target,
+verifier and approver; email or external account IDs alone cannot establish
+separation. Operators cannot edit their own person linkage to qualify. Permission
+withdrawal or employment deactivation immediately disqualifies pending approvals
+and further recovery actions; API rechecks both verifier and approver before any
+commit, without a stale-authority fallback. Recovery cannot restore IAM privileges.
+Record authority versions and outcomes in durable, erasable audit context, and
+reconcile current IAM authority before operational access after an API restore.
+Test forged/internal callers, wrong environment, same-person aliases, revoked
+permissions during approval, IAM outage and stale backup/authorization replay.
+
 ### Inaccessible Last StaffAdmin Recovery
 
 Loss or deletion of the last StaffAdmin's external SSO identity permits a narrowly

@@ -1155,6 +1155,12 @@ Cleanup retains its original deadlines and tombstones survive every affected
 restorable-backup horizon, preventing restored authority or identifying context
 from reappearing after deletion.
 
+Separate deployment IAM owns environment-scoped bootstrap and staff-recovery
+operator permissions; API validates live authority and staff SSO/MFA, bound to
+stable staff-person identity, at each step and commit. API owns neither IAM grants
+nor their restoration. Missing authority verification blocks operational access,
+and an API restore rechecks current IAM permissions before resuming approvals.
+
 API owns StaffAdmin, Support, and Operator role assignments under
 `docs/servers-watchtower-control-plane-contract.md`; staff SSO/IdP groups do not
 supply authorization grants. API also owns the separately verified and approved
