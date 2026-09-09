@@ -1166,6 +1166,18 @@ capabilities, or bootstrap eligibility. Revocation success requires fencing all
 affected role-dependent access. Consumers use owner-mediated interfaces, never
 API persistence, and missing or unverifiable evidence fails closed.
 
+API owns exclusive per-environment Watchtower-to-WorkOS organization mappings,
+external provisioning reconciliation, cleanup, and approved organization rebinding.
+Organization activation requires confirmed external provisioning. API validates
+portal targets, SSO proofs and external organization events against the current
+binding generation; external roles never grant Watchtower privileges. Replacement
+preserves the tenant UUID and authentication policy, with restore-independent
+immutable binding intents and retired-generation fences. API reconciles mappings
+and every affected owner installs relevant revocation fences through the existing
+snapshot boundary before readiness or completed replacement. Delayed events and
+restored rows cannot revive retired bindings or credentials. Consumers receive
+owner-mediated projections and never access API persistence directly.
+
 API owns control-plane recovery state and external identity synchronization.
 Its consumers enforce security projections with a maximum freshness of 60
 seconds. WorkOS synchronization unconfirmed for more than five minutes blocks
