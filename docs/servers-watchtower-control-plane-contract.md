@@ -69,6 +69,7 @@ Organization roles are Owner, Admin, Member, and Viewer. Project levels are Read
 | Designate, demote, or remove an Owner | Owner only |
 | Organization SSO/MFA policy and organization deletion | Owner only |
 | Approve non-Owner identity reconnection for this organization | A different human who is a current Owner, using a user session reauthenticated within five minutes; no token or staff-role substitute |
+| Confirm a suspended-resource deletion request | Owner/Admin user session for projects; Owner user session for organizations; recent authentication and restricted Support release required |
 | Replace a deleted external organization binding | Verified Owner recovery with separate Support approval; no ordinary session or token authority |
 | Project reads | Read, Write, Manage |
 | Issue state, assignment, comments; release/artifact registration and modification; project alert-rule management | Write, Manage |
@@ -301,7 +302,9 @@ Operational upper bounds are independent of billing. Operator sets upper bounds;
 - Emergency access cannot bypass retention expiry or deletion fences. Valid data in a suspended organization may be read only when explicitly included in the approval.
 - Operator may suspend/reactivate an organization with a reason and audit. Suspension blocks collection, reads, and ordinary changes while retention continues.
 - Verified Owner/Admin users may see only minimal suspension state, a customer-safe reason, and a support route.
-- Process suspension-time deletion requests through verified support handling without requiring suspension removal or weakening deletion rules.
+- During suspension, expose a restricted API-owned deletion-request flow to current Owner/Admin user sessions after five-minute active reauthentication and applicable organization authentication. Owner/Admin may request project deletion with exact project-name confirmation; only Owner may request organization deletion, after every project deletion completes. This explicit exception permits only minimal target confirmation, request/status access and the authorized deletion, never ordinary customer reads or suspension removal.
+- API records the exact target, requesting user, confirmations, expected resource version and audit intent. Support may verify and release that specific request through the internal support web but cannot originate deletion, change its scope or impersonate the customer. At release API rechecks the requester's current role, authentication freshness/policy, resource version, project completion prerequisites and request state; stale authentication requires the customer to reauthenticate and reconfirm the same request. Deletion uses the existing idempotency, fences and irreversible lifecycle. Support approval adds no deletion authority to Support or Admin over an organization.
+- Test suspended project and organization deletion with Support handling while suspension remains active; reject Admin organization deletion, token requests, Support-originated or widened requests, expired authentication, lost requester authority and incomplete project purges. Ordinary reads and changes remain blocked.
 - Reactivation restores use only of otherwise valid, unrevoked credentials. Recovery and reactivation never revive revoked credentials.
 
 ### Staff Role Authority and Provisioning
@@ -316,6 +319,7 @@ network, authentication, resource-state, purpose, and audit requirements.
 | --- | --- |
 | Assign or revoke another staff member's roles, including StaffAdmin | StaffAdmin through the internal operator web with a user session actively reauthenticated within five minutes |
 | Approve verified Owner/organization recovery | Support; StaffAdmin alone is insufficient; non-Owner reconnection instead requires the organization Owner |
+| Release a verified suspended-resource deletion request | Support; exact customer-authorized request only, with API revalidation; no impersonation or independent deletion authority |
 | Change operational limits or suspend/reactivate organizations | Operator; StaffAdmin alone is insufficient |
 | Request or approve emergency customer-data reads | Operator with the existing distinct-approver, scope, audit, and expiry requirements |
 | Reconnect an inaccessible last StaffAdmin identity | Verified existing unrevoked assignment; deployment-operator verification and a distinct deployment-operator approval; no role changes |
