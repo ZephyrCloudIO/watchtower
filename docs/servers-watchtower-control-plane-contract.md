@@ -49,6 +49,7 @@ Organization roles are Owner, Admin, Member, and Viewer. Project levels are Read
 | Action | Allowed authority |
 | --- | --- |
 | Create teams and projects; manage ordinary memberships and project grants | Owner, Admin |
+| Change ordinary organization metadata, including display name and slug | Owner, Admin |
 | Create, change, or remove Admin, Member, or Viewer | Owner, Admin |
 | Designate, demote, or remove an Owner | Owner only |
 | Organization SSO/MFA policy and organization deletion | Owner only |
@@ -68,6 +69,7 @@ Organization roles are Owner, Admin, Member, and Viewer. Project levels are Read
 Additional restrictions:
 
 - Admin cannot change or remove an Owner.
+- Ordinary organization metadata changes may use an Owner/Admin user session or an explicitly scoped Owner/Admin personal token. Member, Viewer, project-only Manage, service accounts, and unscoped tokens cannot change organization metadata. This authority excludes SSO/MFA policy, ownership, deletion and other separately restricted actions. Slug changes retain the immutable organization/tenant UUID and existing authorization scope, enforce global uniqueness, and use the observed-version conflict rule for settings.
 - The creator is the initial Owner. Multiple Owners are supported, and the last Owner cannot leave or be demoted.
 - Owner designation promotes an existing member; direct Owner invitations are unsupported. The promoting Owner must reauthenticate, and promotion completes only after the new Owner registers and verifies a recovery contact and confirms recovery-code storage.
 - Project deletion, disablement, reactivation, retention shortening, organization deletion, Owner changes, SSO/MFA policy changes, and management-token issuance require a recently reauthenticated user session.
@@ -363,6 +365,7 @@ provider integration validation, and another threat-model review before release.
 - Verify Owner and Admin can perform Read, Write, and Manage project actions without explicit grants, while token scopes, disabled resources, recent authentication, and Owner-only operations remain enforced.
 - Exercise every role/action/principal combination, including Viewer ceilings, team/direct unions, Admin management, last-Owner protection, and token restrictions.
 - Verify every project carries its owning organization UUID as `tenant_id` across API, storage, messages, and projections; reject a different organization UUID or WorkOS organization identifier, including for a user who belongs to both organizations.
+- Verify organization name/slug changes by Owner/Admin and explicitly scoped personal tokens; deny Member, Viewer, project-only Manage, service tokens, and missing scopes. Reject duplicate slugs and stale versions; preserve the organization/tenant UUID and Owner-only restrictions.
 - Attempt cross-tenant reads/writes, resource probing, credential reuse, mismatched organization SSO, external-role privilege injection, and replay of stale grants.
 - Exercise email-code, Google, SSO, organization MFA, active reauthentication, SSO enforcement/replacement, and WorkOS outages across the 60-second internal and five-minute external boundaries.
 - Verify Owner/Admin service-account creation, deletion, project-grant changes, and token revocation; require recent user reauthentication for issuance/rotation and deny all service-account administration to project-only Manage and service tokens.
