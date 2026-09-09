@@ -164,10 +164,26 @@ Watchtower API owns recovery-code hashes, atomic consumption, code replacement, 
 ## Organization and Account Deletion Recovery Fences
 
 API persists each authorized organization/account deletion intent in its encrypted,
-restore-independent control registry before acknowledging acceptance or committing
+immutable, versioned, restore-independent control registry before acknowledging acceptance or committing
 the deletion in restorable PostgreSQL state. This is additional to project
 tombstones and authorization-revocation fences; neither alone protects restored
 account profiles, organization rows, or erased audit context.
+
+Registry storage is an API-owned immutable S3 control-registry prefix, not merely
+a separate mutable database. Intent, acknowledgement progress and terminal
+tombstone transitions append new monotonic, integrity-checked versions; never
+overwrite prior evidence in place. Enforce storage retention against overwrite,
+rollback and deletion until required cleanup is acknowledged and every affected
+restorable backup predating the deletion is gone. Acknowledging completion does
+not release that retention early. Intent versions remain recoverable until their
+terminal fence is durably retained under the same protection.
+
+Recovery verifies complete version history and the latest authoritative registry
+generation. Missing evidence, a regressed generation, or a conflicting digest
+keeps affected access unready; a partial/older inventory cannot be treated as proof
+that no deletion occurred. Only controlled cleanup after the recorded retention
+conditions are met may retire these records. Audit cleanup retirement without
+retaining deleted identity payloads.
 
 The record contains the target kind (organization or account), a keyed target
 identity that can match restored rows without retaining email/profile payload,
@@ -490,6 +506,7 @@ provider integration validation, and another threat-model review before release.
 - Attempt organization recovery approval by the same human through distinct customer/staff accounts, aliases, and changed external IDs; deny self-approval and unverifiable person linkage. Permit only a verified different current Support operator, with separation rechecked before execution.
 - Test MFA recovery, Owner recovery, consumed-code retries, approval expiry, privilege loss during recovery, contact changes, identity reconnection, and cross-organization reapproval.
 - Disable/reactivate projects while collection, processing, alerts, queries, exports, and retention are active.
+- Attempt overwrite, premature removal, or rollback of organization/account deletion registry versions after cleanup. Verify retention prevents early retirement and missing/regressed/conflicting recovery evidence blocks readiness instead of reviving deleted identities.
 - Restore API and each affected owner from before organization/account deletion, including a crash after registry intent but before PostgreSQL commit and after partial cleanup. Verify reconciliation before readiness, original deadlines, erased audit-context protection, rejection of stale grants/recovery material, retention through the last usable backup, and preservation of unrelated organization data.
 - Delete projects, organizations, and accounts; verify deadlines, erasure, last-Owner constraints, no post-request project restoration, and no resurrection after backup restore or rollback.
 - Retry account deletion for a user with zero, one, or multiple organization memberships, including after membership removal. Verify the same immutable account namespace and operation are used, another account/organization cannot collide with the key, different payloads conflict, and current authorization remains required.
