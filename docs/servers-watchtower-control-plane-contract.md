@@ -58,6 +58,8 @@ Organization roles are Owner, Admin, Member, and Viewer. Project levels are Read
 | Project DSN issuance, rotation, revocation, and redisplay | Manage |
 | Create/delete organization service accounts; grant/change/remove their project permissions; revoke their tokens | Owner, Admin |
 | Issue or rotate service-account tokens | Owner, Admin, using a recently reauthenticated user session |
+| Issue or rotate own personal tokens | Owner, Admin, Member, Viewer, using their own recently reauthenticated user session |
+| List own personal-token metadata or manually revoke own personal tokens | Owner, Admin, Member, Viewer, using their own authenticated user session |
 | Export creation and download | Manage |
 | Project access grants and project deletion | Owner, Admin |
 | Project disablement, reactivation, and retention shortening | Owner, Admin |
@@ -96,6 +98,7 @@ Additional restrictions:
 ## Credentials
 
 - Support project-scoped, collection-only DSNs; personal management tokens; and organization service-account tokens.
+- Personal-token administration is self-service for every organization role, including Viewer. The session actor must equal the token owner; organization/project roles do not permit issuing, rotating, or inspecting another user's personal token through this self-service interface. Issuance/rotation requires current membership and applicable organization SSO/MFA conditions, and requested scopes cannot exceed the owner's current authority. Viewer tokens remain read-only. Metadata listing never returns plaintext; manual revocation uses the existing acknowledged fence protocol. Personal/service tokens cannot mint or rotate personal tokens. Policy-driven and account-wide revocation rules remain independently enforced.
 - Management tokens belong to one organization and carry explicit action and project scopes. Effective permission is the intersection of token scope and the current principal’s permissions.
 - Personal tokens have a default and maximum lifetime of 30 days; service tokens have a default and maximum lifetime of 90 days. Shorter lifetimes are allowed; indefinite tokens and automatic extension are not.
 - DSNs remain valid until revoked and may collect for multiple environments in their project. Environment values are not authorization boundaries.
@@ -361,6 +364,7 @@ provider integration validation, and another threat-model review before release.
 - Attempt cross-tenant reads/writes, resource probing, credential reuse, mismatched organization SSO, external-role privilege injection, and replay of stale grants.
 - Exercise email-code, Google, SSO, organization MFA, active reauthentication, SSO enforcement/replacement, and WorkOS outages across the 60-second internal and five-minute external boundaries.
 - Verify Owner/Admin service-account creation, deletion, project-grant changes, and token revocation; require recent user reauthentication for issuance/rotation and deny all service-account administration to project-only Manage and service tokens.
+- Verify each organization role can issue/rotate its own personal token only after recent reauthentication, inspect only safe own-token metadata, and revoke its own token. Deny another owner ID, excessive scopes, Viewer writes, and token-authenticated issuance/rotation; preserve policy-driven revocation.
 - Verify credential issuance response loss, expiry, emergency revocation, overlapping rotation, at-limit replacement, and concurrent in-flight requests.
 - Test MFA recovery, Owner recovery, consumed-code retries, approval expiry, privilege loss during recovery, contact changes, identity reconnection, and cross-organization reapproval.
 - Disable/reactivate projects while collection, processing, alerts, queries, exports, and retention are active.
