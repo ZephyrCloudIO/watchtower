@@ -20,6 +20,7 @@ it does not relax their safeguards. The project index owns downstream scope.
 ## Resource model and membership
 
 - Users may sign up and create organizations. Existing organizations require invitations; SSO authentication never creates Watchtower membership by itself.
+- An organization is exactly one tenant. Its Watchtower organization UUID is the canonical `tenant_id`; there is no separate tenant resource or translated tenant identifier. Each project belongs to exactly one such organization, and its immutable owning organization UUID is the `tenant_id` used in storage, messages, projections, authorization predicates, and deletion scope. A user may have memberships in multiple tenants but is not itself a tenant. WorkOS organization IDs are external references, never canonical tenant IDs.
 - Organizations own projects. Teams are organization-scoped groups granting project access; multiple teams may access one project. Direct user grants are also supported.
 - Teams have no separate administrator role. Owner and Admin manage teams and memberships.
 - Environment names register automatically on first collection. Manage may hide them from the normal list; renaming, deletion, and environment-level authorization are unsupported. Hidden environments still count toward limits.
@@ -310,6 +311,7 @@ provider integration validation, and another threat-model review before release.
 - Create an organization, prepare Owner recovery codes, invite a member, create teams/projects, grant access, and register environments through collection.
 - Verify Owner and Admin can perform Read, Write, and Manage project actions without explicit grants, while token scopes, disabled resources, recent authentication, and Owner-only operations remain enforced.
 - Exercise every role/action/principal combination, including Viewer ceilings, team/direct unions, Admin management, last-Owner protection, and token restrictions.
+- Verify every project carries its owning organization UUID as `tenant_id` across API, storage, messages, and projections; reject a different organization UUID or WorkOS organization identifier, including for a user who belongs to both organizations.
 - Attempt cross-tenant reads/writes, resource probing, credential reuse, mismatched organization SSO, external-role privilege injection, and replay of stale grants.
 - Exercise email-code, Google, SSO, organization MFA, active reauthentication, SSO enforcement/replacement, and WorkOS outages across the 60-second internal and five-minute external boundaries.
 - Verify Owner/Admin service-account creation, deletion, project-grant changes, and token revocation; require recent user reauthentication for issuance/rotation and deny all service-account administration to project-only Manage and service tokens.

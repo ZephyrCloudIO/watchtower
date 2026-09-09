@@ -42,7 +42,7 @@ Every canonical record contains the following typed fields:
 
 | Field | Contract |
 | --- | --- |
-| `tenant_id` | The authorized tenant owning the record. |
+| `tenant_id` | The canonical Watchtower organization UUID owning the project and record; one organization is one tenant under the control-plane contract. Never a WorkOS organization ID or separate tenant identifier. |
 | `project_id` | The authorized project owning the record, serialized as a canonical lowercase UUID v7 at external boundaries and stored as PostgreSQL `uuid` in repository-owned relational state. |
 | `watchtower_id` | A Watchtower-generated canonical lowercase UUID v7 logical-record identifier. It is serialized as a canonical lowercase UUID v7 at external boundaries and stored as PostgreSQL `uuid` wherever it is held in repository-owned relational state. It is stable across reprocessing and is never supplied by an external protocol. |
 | `processing_generation` | A Processor-assigned immutable canonical lowercase UUID v7 identifier for a canonical result. It is serialized as a canonical lowercase UUID v7 at external boundaries and stored as PostgreSQL `uuid` in Processor selection state. Together with `watchtower_id`, it identifies a canonical row version. |
