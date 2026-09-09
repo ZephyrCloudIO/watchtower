@@ -108,7 +108,7 @@ Additional restrictions:
 
 ## SSO administration
 
-- Each organization has one active SSO connection. A replacement may be tested before switching; simultaneous active IdPs are unsupported.
+- Each organization has at most one active SSO connection; non-SSO organizations have none. A replacement may be tested before switching; simultaneous active IdPs are unsupported.
 - Owner configures the connection through WorkOS Admin Portal after Watchtower authorization and recent reauthentication.
 - Portal activation alone does not enable Watchtower SSO enforcement. Require a successful connection test, a qualifying Owner, recovery-code readiness, and the explicit Watchtower activation step.
 - SSO enforcement includes Owner. Existing sessions that do not meet a newly enforced SSO or MFA policy lose organization access immediately.
