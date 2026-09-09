@@ -71,7 +71,7 @@ Additional restrictions:
 - Admin cannot change or remove an Owner.
 - Ordinary organization metadata changes may use an Owner/Admin user session or an explicitly scoped Owner/Admin personal token. Member, Viewer, project-only Manage, service accounts, and unscoped tokens cannot change organization metadata. This authority excludes SSO/MFA policy, ownership, deletion and other separately restricted actions. Slug changes retain the immutable organization/tenant UUID and existing authorization scope, enforce global uniqueness, and use the observed-version conflict rule for settings.
 - The creator is the initial Owner. Multiple Owners are supported, and the last Owner cannot leave or be demoted.
-- Owner designation promotes an existing member; direct Owner invitations are unsupported. The promoting Owner must reauthenticate, and promotion completes only after the new Owner registers and verifies a recovery contact and confirms recovery-code storage.
+- Owner designation promotes an existing member; direct Owner invitations are unsupported. The promoting Owner must reauthenticate, and promotion completes only after the new Owner registers and verifies a recovery contact and confirms recovery-code storage. The completion transaction must also atomically check and consume the target user's ownership quota; promotion cannot create an eleventh ownership even though it creates no organization.
 - Project deletion, disablement, reactivation, retention shortening, organization deletion, Owner changes, SSO/MFA policy changes, and management-token issuance require a recently reauthenticated user session.
 - Personal tokens may remove or demote non-Owner members and revoke project grants when explicitly scoped and currently authorized.
 - All ungranted actions are denied. Sentry adapters map their external requests to the same native authorization decisions.
@@ -228,6 +228,7 @@ Operational upper bounds are independent of billing. Operator sets upper bounds;
 | Tokens per service account | 50 |
 
 - Reject limit-exceeding new creation or collection without silently dropping data. Preserve permitted reads, deletion, recovery, and revocation.
+- The per-user owned-organization count includes every completed Owner membership, including shared ownership. Organization creation and promotion use the same serialized per-user quota decision with their ownership commit; concurrent creations/promotions cannot each claim the final slot. Incomplete recovery preparation does not grant ownership. Failed or repeated promotion cannot consume an extra slot; at-cap rejection leaves the prior role intact and follows the quota-exhaustion response. Removing an Owner membership releases its slot only when that removal commits under the existing last-Owner protection.
 - Limits may be lowered below current usage. Keep existing resources, expose the exceeded state, and block additional creation.
 - At the environment limit, reject collection for a new environment while continuing collection for existing environments.
 - Organization-scoped general management APIs enforce both 600 requests per principal and 6,000 per organization over the preceding 60 seconds.
@@ -356,7 +357,7 @@ are rechecked at transitions and use, not only at the initial request.
 
 | Resource or flow | Transition and guard | Result and recovery |
 | --- | --- | --- |
-| Organization creation / Owner promotion | Preparation to completion after verified Owner recovery-contact registration and code-storage confirmation | No completed organization creation or Owner promotion without both verified recovery contact and prepared codes; last-Owner removal stays forbidden |
+| Organization creation / Owner promotion | Preparation to completion after verified Owner recovery-contact registration, code-storage confirmation, and atomic ownership-quota check | No completed organization creation or Owner promotion without both verified recovery contact and prepared codes; last-Owner removal stays forbidden |
 | Project creation | `accepted_pending` to active only after the existing owner/schedule barrier | Unavailable until completion; retry the same durable operation |
 | Project disablement | Active to disabled by recently reauthenticated Owner/Admin | New collection and ordinary changes stop; accepted processing, authorized reads/exports and retention continue; no new alerts or reprocessing |
 | Project reactivation | Disabled to active by recently reauthenticated Owner/Admin | Re-evaluate current permissions and credential expiry/revocation; never resurrect invalid credentials |
@@ -438,6 +439,7 @@ provider integration validation, and another threat-model review before release.
 - Retry account deletion for a user with zero, one, or multiple organization memberships, including after membership removal. Verify the same immutable account namespace and operation are used, another account/organization cannot collide with the key, different payloads conflict, and current authorization remains required.
 - Exercise optimistic conflicts, duplicate requests, mismatched idempotency payloads, operations lasting beyond 24 hours, delayed acknowledgements, and honest pending UI.
 - Exercise first-organization creation and account deletion with zero, one, and multiple memberships. Verify 600 ordinary/30 security requests per principal per rolling minute without an organization counter, unchanged windows across membership/session/token changes, 429 on exhaustion and 503 only when an applicable counter is unavailable.
+- Promote a user owning ten organizations and verify rejection with no role change. Race two promotions or a promotion with organization creation at nine ownerships; exactly one may acquire the final slot. Retry success/failure and verify no double counting; completed demotion releases a slot only when last-Owner constraints permit it.
 - Verify every quota boundary, lowered limits, hidden environments, rolling rate windows, independent security budgets, and unavailable enforcement dependencies.
 - Inject reordered/replayed internal changes and duplicate external events; verify cursor recovery, revocation fences, readiness gating, and no unauthorized privilege restoration.
 - Verify IdP group changes do not grant staff roles; deny role mutations by Support/Operator or customer administrators without StaffAdmin. Test self-assignment/removal, concurrent last-StaffAdmin removal, repeated bootstrap and bootstrap after an old backup restore. Revoke a role during a session, pending approval and emergency read; verify immediate role-dependent fencing and only independently permitted remaining-role actions. Reject role changes during audit failure and block restored staff access until current registration/revocation records are reconciled.
