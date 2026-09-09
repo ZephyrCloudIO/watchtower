@@ -1065,7 +1065,7 @@ Every asynchronous message uses a common versioned envelope containing:
 - a canonical lowercase UUID v7 message ID;
 - message type and schema version;
 - producer;
-- tenant and project context;
+- explicit project, organization, account or staff scope and its matching canonical identifiers, as defined by the runtime contract; project telemetry still requires both tenant and project context;
 - event time;
 - causation and correlation identifiers;
 - W3C trace context;
