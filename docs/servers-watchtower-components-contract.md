@@ -1178,6 +1178,15 @@ snapshot boundary before readiness or completed replacement. Delayed events and
 restored rows cannot revive retired bindings or credentials. Consumers receive
 owner-mediated projections and never access API persistence directly.
 
+API also owns non-Owner account reconnection: pre-deletion verified-email and
+new-identity proof, current organization Owner approval, global exclusion of
+accounts with any Owner membership, and independent organization recovery gates.
+It retains restore-independent account-binding intents and monotonically versioned
+fences, revokes old sessions/tokens/MFA before completion, and reconciles bindings
+and organization gates before readiness. Consumers install affected authorization
+fences through existing owner-mediated handoffs. Recovery restores only approved,
+still-valid permissions and cannot revive deleted accounts or suspended access.
+
 API owns control-plane recovery state and external identity synchronization.
 Its consumers enforce security projections with a maximum freshness of 60
 seconds. WorkOS synchronization unconfirmed for more than five minutes blocks
