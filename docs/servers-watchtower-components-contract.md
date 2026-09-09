@@ -1213,6 +1213,11 @@ Validate cross-tenant filters/cursors, role revocation between pages, account/pr
 context erasure during reads, stale restore and dependency failure.
 
 API owns control-plane recovery state and external identity synchronization.
+Recovery-code consumption claims and bundle/contact generation fences are
+restore-independent authority, not merely audit evidence. API reconciles pending
+claims and replacements with immutable current invalidation records before any
+recovery hash check or recovery readiness; replay cannot revive consumed codes
+or obsolete bundles. Their minimal fences survive every affected backup horizon.
 Its consumers enforce security projections with a maximum freshness of 60
 seconds. WorkOS synchronization unconfirmed for more than five minutes blocks
 user-session and personal-token access independently of that internal window;
