@@ -28,6 +28,15 @@ it does not relax their safeguards. The project index owns downstream scope.
 - Project organization ownership is immutable. Project transfers and organization merges are unsupported.
 - Recreating a deleted resource requires a new ID and credentials, with no inherited data or permissions. Names and slugs may be reused only after deletion completes.
 
+## Invitation Lifecycle
+
+- Owner/Admin may issue, resend, or revoke an organization invitation within their current membership-management authority. Direct Owner invitations remain forbidden.
+- Invitations expire seven days after issuance and are single-use. Acceptance requires an authenticated account with the verified target email; knowing the link alone grants no authority.
+- Store the organization, issuer, target email, proposed non-Owner role, and any explicitly proposed team/project grants with the invitation. The recipient cannot substitute or widen this scope at redemption. A changed offer requires a replacement invitation.
+- Resending invalidates the previous link and issues a new seven-day invitation. Revocation and expiration prevent redemption; revoked or superseded links cannot be revived by retries.
+- At acceptance, recheck the issuer's current authority to grant the offered role and permissions, the target resources' organization and existence, current organization state and SSO/MFA policy, and the member quota. A stale grant or policy failure creates no membership or partial grant.
+- Commit acceptance, one-time consumption, membership, and allowed grants atomically with the quota decision. Concurrent redemption cannot consume the invitation twice or exceed the member limit. A retry after success returns the existing acceptance result without reapplying grants or undoing later permission changes.
+
 ## Organization and project authorization
 
 Organization roles are Owner, Admin, Member, and Viewer. Project levels are Read, Write, and Manage.
@@ -308,6 +317,7 @@ provider integration validation, and another threat-model review before release.
 
 ## Test Scenarios
 
+- Redeem invitations at and after their seven-day expiry; test wrong/unverified email, revocation, resend, issuer demotion/removal, changed SSO/MFA policy, deleted grant targets, quota races, concurrent redemption, and retries after later grant revocation. No rejected acceptance creates partial membership or grants.
 - Create an organization, prepare Owner recovery codes, invite a member, create teams/projects, grant access, and register environments through collection.
 - Verify Owner and Admin can perform Read, Write, and Manage project actions without explicit grants, while token scopes, disabled resources, recent authentication, and Owner-only operations remain enforced.
 - Exercise every role/action/principal combination, including Viewer ceilings, team/direct unions, Admin management, last-Owner protection, and token restrictions.
