@@ -67,17 +67,30 @@ prohibited. Delivery is at least once, consumers are idempotent, and no global
 ordering is guaranteed unless a downstream domain contract declares ordering
 for an aggregate partition.
 
-The envelope scope is one of `project`, `organization`, `account`, or `staff`.
+The envelope scope is one of `project`, `organization`, `account`, `staff`, or
+`operational`.
 Project scope requires the canonical tenant/organization UUID and project UUID;
 organization scope requires only that organization UUID. Account and staff scopes
 require their respective canonical principal UUID and do not invent a tenant or
-project. Prohibit unrelated scope fields. Telemetry messages remain project-scoped;
+project. Operational scope identifies the deployment environment, authenticated
+initiating workload, target component and bounded operation/resource context; it
+requires no fabricated tenant, project, account or staff UUID. Target components
+use the six component identifiers defined by the component contract. A human
+initiator, when present, is recorded in independently erasable actor context,
+not substituted for the operation target. Prohibit unrelated scope fields.
+Telemetry messages remain project-scoped;
 control-plane messages use the owning aggregate's scope. Consumers validate the
 message type's allowed scope, producer authority and resource ownership before
 applying it; scope metadata does not grant authority or imply fan-out access to
 all organizations. Unknown or mismatched scopes are rejected, never interpreted
 as a global grant. Introduce these variants through the existing versioned N/N-1
-compatibility boundary before producers emit them. Validate all four variants,
+compatibility boundary before producers emit them. Operational audit evidence
+must match the producer, workload, environment, target, action and correlation
+of its durably acknowledged audit intent. API enforces explicit per-workload
+action/target caller policy; operational scope is not a wildcard tenant grant
+and cannot replace customer authorization for customer-scoped work. Validate
+all five variants, automated backup/restore/key/replication evidence, unauthorized
+workloads, cross-environment targets, mismatched intent/evidence,
 missing/extra identifiers, cross-tenant projects and old-consumer behavior in
 contract tests before implementation release.
 

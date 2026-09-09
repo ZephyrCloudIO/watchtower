@@ -1065,7 +1065,7 @@ Every asynchronous message uses a common versioned envelope containing:
 - a canonical lowercase UUID v7 message ID;
 - message type and schema version;
 - producer;
-- explicit project, organization, account or staff scope and its matching canonical identifiers, as defined by the runtime contract; project telemetry still requires both tenant and project context;
+- explicit project, organization, account, staff or operational scope and its matching canonical identifiers, as defined by the runtime contract; project telemetry still requires both tenant and project context;
 - event time;
 - causation and correlation identifiers;
 - W3C trace context;
@@ -1093,6 +1093,10 @@ intent has a canonical lowercase UUID v7 `audit_intent_id`, stored as PostgreSQL
 `uuid` wherever it is held in repository-owned relational outbox or state, plus
 producer, action, target resource, actor or workload identity, tenant and
 project context when applicable, correlation identifier, and idempotency key.
+Component-wide operations use the runtime contract's operational scope with
+environment, initiating workload and target component/resource context. Their
+evidence must match the acknowledged intent and explicit workload caller policy;
+no synthetic customer or staff ownership is required or permitted.
 API validates the producer, context, correlation, and idempotency data, appends
 the intent to its restore-independent immutable S3 audit journal before
 committing the PostgreSQL audit row, and acknowledges only after both
