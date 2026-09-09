@@ -3,9 +3,10 @@
 ## Purpose
 
 This file catalogs authoritative repository contracts and documentation policy.
-The repository currently contains the Watchtower project, server runtime, and
-component boundary contracts. Additional contracts should be cataloged here
-when their owning project or domain is introduced.
+The repository currently contains the Watchtower project, server runtime,
+component boundary, canonical storage, and control-plane contracts. Additional
+contracts should be cataloged here when their owning project or domain is
+introduced.
 
 ## Naming Rules
 
@@ -23,6 +24,7 @@ when their owning project or domain is introduced.
 - `docs/project-watchtower.md`
 - `docs/servers-watchtower-components-contract.md`
 - `docs/servers-watchtower-canonical-telemetry-storage-contract.md`
+- `docs/servers-watchtower-control-plane-contract.md`
 - `docs/servers-watchtower-runtime-contract.md`
 
 ## Adding a Contract

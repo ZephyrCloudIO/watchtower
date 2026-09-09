@@ -71,8 +71,8 @@ They have no public business routes.
 An event producer remains authoritative for the data it changes, while the
 consumer owns and writes its local projection. Security-sensitive projections
 must complete an initial snapshot before readiness and must fail closed when
-unavailable or older than the maximum freshness established by the
-authorization PRD.
+unavailable or older than the 60-second maximum freshness established by
+`docs/servers-watchtower-control-plane-contract.md`.
 
 ## Scaling and Failure Matrix
 
@@ -1065,7 +1065,7 @@ Every asynchronous message uses a common versioned envelope containing:
 - a canonical lowercase UUID v7 message ID;
 - message type and schema version;
 - producer;
-- tenant and project context;
+- explicit project, organization, account, staff or operational scope and its matching canonical identifiers, as defined by the runtime contract; project telemetry still requires both tenant and project context;
 - event time;
 - causation and correlation identifiers;
 - W3C trace context;
@@ -1093,6 +1093,10 @@ intent has a canonical lowercase UUID v7 `audit_intent_id`, stored as PostgreSQL
 `uuid` wherever it is held in repository-owned relational outbox or state, plus
 producer, action, target resource, actor or workload identity, tenant and
 project context when applicable, correlation identifier, and idempotency key.
+Component-wide operations use the runtime contract's operational scope with
+environment, initiating workload and target component/resource context. Their
+evidence must match the acknowledged intent and explicit workload caller policy;
+no synthetic customer or staff ownership is required or permitted.
 API validates the producer, context, correlation, and idempotency data, appends
 the intent to its restore-independent immutable S3 audit journal before
 committing the PostgreSQL audit row, and acknowledges only after both
@@ -1135,10 +1139,110 @@ Live reload is limited to mTLS certificates, CA bundles, and broker, storage,
 or service credentials. Invalid reloads retain the last-known-good value and
 emit an operational alert. All other configuration changes require deployment.
 
-Detailed roles, WorkOS behavior, credential lifecycle, PII handling, abuse
-controls, and compliance gates remain owned by issues #15 and #18. Canonical
+`docs/servers-watchtower-control-plane-contract.md` owns roles, WorkOS behavior,
+credential and recovery lifecycle, control-plane privacy, abuse controls, and
+security gates. Processing-payload privacy remains owned by #18. Canonical
 storage lifecycle, retention, deletion, restoration, and replay mechanics
-remain owned by #14.
+remain owned by the canonical telemetry and storage contract.
+
+API additionally owns restore-independent organization/account deletion intents
+and keyed tombstones under the control-plane contract. Its existing owner-scoped
+`ControlRegistrySnapshotV1` includes relevant fences for every affected owner,
+with the same complete snapshot, digest and final generation validation before
+readiness. API reconciles its own restored rows and audit identity context before
+accepting traffic; consumers enforce fences locally and never read API storage.
+Cleanup retains its original deadlines and tombstones survive every affected
+restorable-backup horizon, preventing restored authority or identifying context
+from reappearing after deletion.
+
+Separate deployment IAM owns environment-scoped bootstrap and staff-recovery
+operator permissions; API validates live authority and staff SSO/MFA, bound to
+stable staff-person identity, at each step and commit. API owns neither IAM grants
+nor their restoration. Missing authority verification blocks operational access,
+and an API restore rechecks current IAM permissions before resuming approvals.
+
+API owns StaffAdmin, Support, and Operator role assignments under
+`docs/servers-watchtower-control-plane-contract.md`; staff SSO/IdP groups do not
+supply authorization grants. API also owns the separately verified and approved
+last-StaffAdmin identity-reconnection procedure and its restore-independent binding
+intents/fences; it changes no role assignments and cannot reopen bootstrap.
+Recovery reconciles binding versions and revocations before staff access and
+fences old sessions, approvals and emergency capabilities before completion.
+API also owns restore-independent first-registration pending intents, their
+idempotent assignment/completion reconciliation, and monotonically versioned
+staff-revocation evidence. A pending bootstrap blocks competing registration
+but permits resuming its exact target; replay applies newer revocations first. Restored API and affected
+enforcement surfaces reconcile the latest records before allowing staff access;
+stale replay cannot restore withdrawn roles, sessions, approvals, emergency
+capabilities, or bootstrap eligibility. Revocation success requires fencing all
+affected role-dependent access. Consumers use owner-mediated interfaces, never
+API persistence, and missing or unverifiable evidence fails closed.
+
+API owns exclusive per-environment Watchtower-to-WorkOS organization mappings,
+external provisioning reconciliation, cleanup, and approved organization rebinding.
+Organization activation requires confirmed external provisioning. API validates
+portal targets, SSO proofs and external organization events against the current
+binding generation; external roles never grant Watchtower privileges. Replacement
+preserves the tenant UUID and authentication policy, with restore-independent
+immutable binding intents and retired-generation fences. API reconciles mappings
+and every affected owner installs relevant revocation fences through the existing
+snapshot boundary before readiness or completed replacement. Delayed events and
+restored rows cannot revive retired bindings or credentials. Consumers receive
+owner-mediated projections and never access API persistence directly.
+
+API also owns non-Owner account reconnection: pre-deletion verified-email and
+new-identity proof, current organization Owner approval, global exclusion of
+accounts with any Owner membership, and independent organization recovery gates.
+It retains restore-independent account-binding intents and monotonically versioned
+fences, revokes old sessions/tokens/MFA before completion, and reconciles bindings
+and organization gates before readiness. Consumers install affected authorization
+fences through existing owner-mediated handoffs. Recovery restores only approved,
+still-valid permissions and cannot revive deleted accounts or suspended access.
+
+API owns the narrow deletion-receipt status exception to native Query reads.
+It authenticates only the receipt bound to an account/organization deletion and
+returns minimal operation status after ordinary credentials are revoked. The
+control-plane contract defines its hash-only storage, lifetime, budgets and
+restore-independent operation evidence; it provides no general data read or
+mutation authority and is not an audit projection.
+
+Customer audit history uses Query's native public read boundary and an
+authenticated unary Protobuf-over-HTTP `/internal/v1` handoff to API, which reads
+its own authoritative audit rows and erasable context. Query forwards the exact
+requesting principal, credential and organization/action scope through the existing
+trusted workload boundary; API independently enforces current Owner/Admin authority,
+credential scope, resource state and context expiry/erasure. mTLS caller identity
+alone is insufficient. Requests use bounded pagination and filters; cursors bind
+to the original authorized scope and are rechecked on every page. API returns only
+customer-safe history with currently readable context; erased fragments stay
+anonymous. Query does not persist or cache audit rows, context or result payloads,
+and no direct API-store access or new audit projection is allowed. Before responding,
+Query also enforces current revocation/deletion fences. API unavailability or
+unverifiable erasure/authorization state returns 503, with no stale-cache fallback.
+Validate cross-tenant filters/cursors, role revocation between pages, account/project
+context erasure during reads, stale restore and dependency failure.
+
+API owns control-plane recovery state and external identity synchronization.
+External-membership reconciliation uses restricted Owner authorization or the
+existing Owner/Support recovery flow. API repairs provider state, rechecks current
+membership and policy, and clears only the matching blocked generation after
+durable completion. Restore-independent generations and existing owner fences
+prevent stale events or backups from unblocking newer revocations; provider repair
+alone never grants Watchtower access.
+Recovery-code consumption claims and bundle/contact generation fences are
+restore-independent authority, not merely audit evidence. API reconciles pending
+claims and replacements with immutable current invalidation records before any
+recovery hash check or recovery readiness; replay cannot revive consumed codes
+or obsolete bundles. Their minimal fences survive every affected backup horizon.
+API commits fetched event cursors atomically with a durable idempotent inbox and
+replays unapplied events after restart. Only the contiguous fully applied position,
+including required revocation fences, confirms external security synchronization;
+new successful polls cannot conceal pending security changes.
+Its consumers enforce security projections with a maximum freshness of 60
+seconds. WorkOS synchronization unconfirmed for more than five minutes blocks
+user-session and personal-token access independently of that internal window;
+DSNs and service tokens still require fresh Watchtower authorization. Neither
+window replaces immediate owner-acknowledged authorization-revocation fences.
 
 ## Deployment and Operations
 
@@ -1155,8 +1259,8 @@ Each component exposes separate liveness, readiness, and dependency
 diagnostics. Readiness reflects only capabilities required by the component's
 owned paths and does not transitively require unrelated downstream workers.
 Security-sensitive projections must have completed their initial snapshot and
-remain within the authorization PRD's maximum freshness boundary before they
-can authorize affected paths.
+remain within the control-plane contract's 60-second freshness boundary before
+they can authorize affected paths.
 
 Graceful shutdown removes readiness, stops new work, drains in-flight work to a
 configured deadline, persists checkpoints and outboxes, releases leases, and
