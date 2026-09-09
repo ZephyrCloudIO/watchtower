@@ -46,7 +46,7 @@ the component contract without updating it.
 | Decision area | Owning downstream contract |
 | --- | --- |
 | Canonical telemetry, authoritative data classes, and storage model | #14, [`canonical telemetry and storage model`](servers-watchtower-canonical-telemetry-storage-contract.md) |
-| Control plane, roles, authorization, WorkOS behavior, and credential lifecycle | #15, `control plane and authorization` |
+| Control plane, roles, authorization, WorkOS behavior, and credential lifecycle | #15, [`control plane and authorization`](servers-watchtower-control-plane-contract.md) |
 | Sentry routes, DTOs, request semantics, and compatibility matrix | #16, `Sentry compatibility contract` |
 | Ingestion admission and durable raw-to-processing handoff | #17, `ingestion admission and durable handoff` |
 | Normalization, privacy, enrichment, and processing policy | #18, `telemetry processing and privacy` |
@@ -77,9 +77,12 @@ route versions. Compatibility DTOs remain at external adapters and never
 become canonical Watchtower domain or persistence models.
 
 This project does not yet define the supported Sentry version, individual
-endpoint catalog, detailed authorization behavior, query semantics, UI state,
-or migration behavior. Each must be established in its owning downstream
+endpoint catalog, query semantics, UI state, or migration behavior. Each must be established in its owning downstream
 contract before implementation.
+
+`docs/servers-watchtower-control-plane-contract.md` defines native control-plane
+authorization and credential policy. Compatible adapters must apply that policy;
+#16 owns their external route, DTO, and error mappings.
 
 ## Current Status
 

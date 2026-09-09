@@ -87,10 +87,18 @@ limited to mTLS certificates, CA bundles, and broker, storage, or service
 credentials. An invalid reload retains the last-known-good value and emits an
 operational alert; all other configuration changes require deployment.
 
-Detailed roles, WorkOS behavior, credential lifecycle, PII handling, abuse
-controls, and compliance gates remain owned by issues #15 and #18. Canonical
+`docs/servers-watchtower-control-plane-contract.md` owns roles, WorkOS behavior,
+credential and recovery lifecycle, control-plane privacy, abuse controls, and
+security gates. Processing-payload privacy remains owned by #18. Canonical
 storage lifecycle, retention, deletion, restoration, and replay mechanics
-remain owned by #14.
+remain owned by the canonical telemetry and storage contract.
+
+API owns control-plane recovery state and external identity synchronization.
+Its consumers enforce security projections with a maximum freshness of 60
+seconds. WorkOS synchronization unconfirmed for more than five minutes blocks
+user-session and personal-token access independently of that internal window;
+DSNs and service tokens still require fresh Watchtower authorization. Neither
+window replaces immediate owner-acknowledged authorization-revocation fences.
 
 ## Health, Readiness, and Shutdown
 
@@ -101,8 +109,8 @@ external clients. Readiness covers only capabilities required for the
 component's owned paths and never transitively requires an unrelated worker.
 
 Security-sensitive local projections must complete an initial snapshot before
-readiness. If such a projection is unavailable or older than the maximum
-freshness established by the authorization contract, affected admission or
+readiness. If such a projection is unavailable or older than the 60-second maximum
+freshness established by the control-plane contract, affected admission or
 query behavior fails closed.
 
 Graceful shutdown removes readiness, stops new work, drains in-flight work to a

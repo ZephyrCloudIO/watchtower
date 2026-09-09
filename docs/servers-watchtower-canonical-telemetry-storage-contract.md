@@ -109,7 +109,7 @@ canonical telemetry.
 | Query export metadata | Query; authoritative for export materialization state and `snapshot_generation` | Query-owned PostgreSQL export-metadata boundary | Retained with the export lifecycle and purged with the project; it is not a second export authority and contains no raw telemetry |
 | Query cache | Query; never authoritative | Encrypted Query-owned cache | At most 15 minutes; immediately invalidated for retention, deletion, or authorization changes |
 | Export objects | Query; non-authoritative customer-download artifacts | Encrypted Query-owned project-scoped S3 export prefix | The earlier of seven days from API `completed_at` and the active export-object policy cutoff computed from `completed_at` for successful artifacts; artifacts from any attempt that terminates without successful `completed`, including failed or canceled attempts, are removed or made inaccessible at terminal transition, and Query's owner-side expiry fence removes or makes each successful artifact inaccessible at its exact cutoff even when API lifecycle reconciliation is delayed |
-| Audit events | API for contract-level lifecycle and access audit authority | API-owned append-only PostgreSQL audit boundary with erasable encrypted project-scoped context, plus a restore-independent immutable audit journal | Detailed history follows #15; every journaled event is replayable after an API database restore, and deleted projects retain only minimal anonymous evidence |
+| Audit events | API for contract-level lifecycle and access audit authority | API-owned append-only PostgreSQL audit boundary with erasable encrypted project-scoped context, plus a restore-independent immutable audit journal | Detailed history lasts 13 calendar months under the control-plane contract, subject to earlier identity-context erasure; every journaled event is replayable after an API database restore, and deleted projects retain only minimal anonymous evidence |
 | API restore audit intents | API; authoritative for pre-restore intent evidence until API records the outcome in its audit boundary | API-owned encrypted immutable S3 audit-intent prefix independent of API PostgreSQL backups | Retained through restore completion and evidence recording, then follows the applicable audit-retention policy; never stored only in the API restore target |
 | API export hold registry | API; authoritative for restore-independent export hold, terminal-release, completion/expiry scheduling evidence, immutable captured snapshot payloads for unexpired non-terminal held revisions, owner-scoped source-expiry fences for expired revisions, completed-export source-eligibility evidence, and recovery copies of completed materialization metadata | API-owned encrypted immutable S3 export-hold registry prefix independent of API PostgreSQL backups | Retained until every held revision and expiry schedule is terminally released or reconciled; source-dependent selection pages, derived revision pages, and source-set chunks carry their exact source-expiry deadline and are deleted or made irreversibly inaccessible by an independent storage-retention fence at that deadline even if API lifecycle reconciliation is unavailable, while a bounded owner-scoped source-expiry fence remains as non-payload recovery evidence through the applicable restorable-backup horizon; completed-materialization recovery copies and metadata-only source-eligibility inventories remain through the full accessible lifetime of their artifact and are not removable solely because they were reconciled or replayed; after artifact expiry or earlier durable invalidation/removal and terminal cleanup, a minimal terminal tombstone remains until no restorable API, Processor, Query, or Jobs backup can contain the pre-terminal state, then follows export and project-deletion cleanup |
 | Retention policy registry | API; authoritative for shortened-retention duration policies, their current-time effective cutoffs, and restore cleanup | API-owned encrypted immutable S3 control-registry prefix, independent of API PostgreSQL backups | The active policy persists until superseded and its effective cutoff is computed from that duration at enforcement time; superseded versioned policy records are retained for 13 months and the active policy is loaded before restored owners accept traffic |
@@ -1210,7 +1210,8 @@ lifecycle anchored at `completed_at`.
 Safe status and error responses expose no raw payload, secret, or unauthorized
 tenant/project information. The export-specific active-export and daily-request
 limits above are authoritative here; detailed authorization, roles,
-non-export quotas, and credential behavior remain owned by #15.
+non-export quotas, and credential behavior are defined in
+`docs/servers-watchtower-control-plane-contract.md`.
 
 ### Reconciliation digest encoding
 
@@ -1322,6 +1323,21 @@ Project-scoped audit context is erasable encrypted context:
 deletion destroys its project key while preserving the append-only event rows,
 journal replay records, and minimal anonymous deletion evidence.
 
+`docs/servers-watchtower-control-plane-contract.md` additionally governs
+organization and account erasure and the 13-calendar-month identifiable audit
+history. Organization deletion destroys identifiable organization audit context;
+account deletion removes or irreversibly anonymizes actor identity within 14
+days in active stores and 90 days in backups, without erasing unrelated
+organization data. Context must be independently erasable at these scopes,
+including journal and recovery copies, while audit rows remain append-only.
+Replay must not reconstruct erased context. These rules do not shorten the
+required non-identifying fence or recovery evidence retention horizons.
+
+Project disablement is reversible and continues existing-data reads, exports,
+and already accepted processing under the control-plane contract. It is distinct
+from final project deletion, which is neither cancelable nor restorable. A
+backup restore reapplies deletion fences; it does not restore a deleted project.
+
 Threat-model review is required before accepting this contract and before each
 implementation release. Customer-facing retention, deletion, export, and
 support documentation, including support limits, must exist before
@@ -1340,7 +1356,7 @@ issues:
 
 | Issue | Remaining authority |
 | --- | --- |
-| #15 | Control-plane resources, WorkOS authentication, authorization, roles, project lifecycle, credentials, non-export quotas, and detailed audit access |
+| #15 | [Control-plane resources, WorkOS authentication, authorization, roles, project lifecycle, credentials, non-export quotas, and detailed audit access](servers-watchtower-control-plane-contract.md) |
 | #16 | Sentry-compatible routes, DTOs, request semantics, and protocol compatibility mappings |
 | #17 | Ingestion admission, capacity behavior, and detailed durable raw-to-processing handoff |
 | #18 | Normalization, privacy processing, enrichment, and processing policy |

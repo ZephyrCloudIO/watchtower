@@ -71,8 +71,8 @@ They have no public business routes.
 An event producer remains authoritative for the data it changes, while the
 consumer owns and writes its local projection. Security-sensitive projections
 must complete an initial snapshot before readiness and must fail closed when
-unavailable or older than the maximum freshness established by the
-authorization PRD.
+unavailable or older than the 60-second maximum freshness established by
+`docs/servers-watchtower-control-plane-contract.md`.
 
 ## Scaling and Failure Matrix
 
@@ -1135,10 +1135,18 @@ Live reload is limited to mTLS certificates, CA bundles, and broker, storage,
 or service credentials. Invalid reloads retain the last-known-good value and
 emit an operational alert. All other configuration changes require deployment.
 
-Detailed roles, WorkOS behavior, credential lifecycle, PII handling, abuse
-controls, and compliance gates remain owned by issues #15 and #18. Canonical
+`docs/servers-watchtower-control-plane-contract.md` owns roles, WorkOS behavior,
+credential and recovery lifecycle, control-plane privacy, abuse controls, and
+security gates. Processing-payload privacy remains owned by #18. Canonical
 storage lifecycle, retention, deletion, restoration, and replay mechanics
-remain owned by #14.
+remain owned by the canonical telemetry and storage contract.
+
+API owns control-plane recovery state and external identity synchronization.
+Its consumers enforce security projections with a maximum freshness of 60
+seconds. WorkOS synchronization unconfirmed for more than five minutes blocks
+user-session and personal-token access independently of that internal window;
+DSNs and service tokens still require fresh Watchtower authorization. Neither
+window replaces immediate owner-acknowledged authorization-revocation fences.
 
 ## Deployment and Operations
 
@@ -1155,8 +1163,8 @@ Each component exposes separate liveness, readiness, and dependency
 diagnostics. Readiness reflects only capabilities required by the component's
 owned paths and does not transitively require unrelated downstream workers.
 Security-sensitive projections must have completed their initial snapshot and
-remain within the authorization PRD's maximum freshness boundary before they
-can authorize affected paths.
+remain within the control-plane contract's 60-second freshness boundary before
+they can authorize affected paths.
 
 Graceful shutdown removes readiness, stops new work, drains in-flight work to a
 configured deadline, persists checkpoints and outboxes, releases leases, and
