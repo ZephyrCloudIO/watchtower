@@ -44,6 +44,9 @@ it does not relax their safeguards. The project index owns downstream scope.
 - Owner/Admin may issue, resend, or revoke an organization invitation within their current membership-management authority. Direct Owner invitations remain forbidden.
 - Invitations expire seven days after issuance and are single-use. Acceptance requires an authenticated account with the verified target email; knowing the link alone grants no authority.
 - Store the organization, issuer, target email, proposed non-Owner role, and any explicitly proposed team/project grants with the invitation. The recipient cannot substitute or widen this scope at redemption. A changed offer requires a replacement invitation.
+- An organization may have at most 1,000 unexpired, unconsumed and unrevoked invitations. API reserves capacity atomically at issuance; acceptance, revocation or expiry releases it exactly once. Resending replaces the existing invitation without consuming another slot. Keep at most one live invitation per organization/normalized target address; repeated issuance resumes or explicitly replaces it rather than multiplying slots and mail. These limits do not grant membership or replace the acceptance-time member quota.
+- Issuance and resend share a rolling budget of 30 messages per organization over the preceding 60 seconds and five per normalized target address over the preceding 15 minutes, in addition to general management API limits. Reserve both budgets before persisting a new send intent; target counters aggregate across organizations. Duplicate idempotent requests and delivery retries resume the same send intent without issuing new links or bypassing budgets. Reject exhausted capacity/budgets with 429 and Retry-After; unavailable enforcement returns 503. Revocation remains available through its independent security budget.
+- Test concurrent issuance at 1,000, resends at capacity, duplicate targets, expiration/acceptance races, rolling-window boundaries, cross-organization target abuse and unavailable counters. Audit and mail intent remain durable and fail closed under existing rules.
 - Resending invalidates the previous link and issues a new seven-day invitation. Revocation and expiration prevent redemption; revoked or superseded links cannot be revived by retries.
 - At acceptance, recheck the issuer's current authority to grant the offered role and permissions, the target resources' organization and existence, current organization state and SSO/MFA policy, and the member quota. A stale grant or policy failure creates no membership or partial grant.
 - Commit acceptance, one-time consumption, membership, and allowed grants atomically with the quota decision. Concurrent redemption cannot consume the invitation twice or exceed the member limit. A retry after success returns the existing acceptance result without reapplying grants or undoing later permission changes.
@@ -261,6 +264,7 @@ Operational upper bounds are independent of billing. Operator sets upper bounds;
 | --- | ---: |
 | Organizations owned by one user | 10 |
 | Members per organization | 10,000 |
+| Pending invitations per organization | 1,000 |
 | Teams per organization | 1,000 |
 | Projects per organization | 1,000 |
 | Service accounts per organization | 1,000 |
