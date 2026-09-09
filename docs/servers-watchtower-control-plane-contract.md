@@ -264,6 +264,7 @@ network, authentication, resource-state, purpose, and audit requirements.
 | Approve verified customer recovery | Support; StaffAdmin alone is insufficient |
 | Change operational limits or suspend/reactivate organizations | Operator; StaffAdmin alone is insufficient |
 | Request or approve emergency customer-data reads | Operator with the existing distinct-approver, scope, audit, and expiry requirements |
+| Reconnect an inaccessible last StaffAdmin identity | Verified existing unrevoked assignment; deployment-operator verification and a distinct deployment-operator approval; no role changes |
 | Register the first StaffAdmin | Authorized deployment operator through the audited, first-registration-only bootstrap procedure |
 
 StaffAdmin carries no implicit customer recovery, suspension, impersonation, or
@@ -284,6 +285,60 @@ restored table is not proof of eligibility. Concurrent or repeated bootstrap
 attempts cannot create additional initial administrators. Existing or unavailable
 registry evidence prevents bootstrap. Subsequent assignments use the internal
 web and the current StaffAdmin policy, not the bootstrap path.
+
+### Inaccessible Last StaffAdmin Recovery
+
+Loss or deletion of the last StaffAdmin's external SSO identity permits a narrowly
+scoped identity-reconnection procedure, not bootstrap or a new role assignment.
+API must verify that the existing immutable staff identity still has an unrevoked
+StaffAdmin assignment and that no other StaffAdmin can currently administer roles.
+If another administrator is available, use ordinary staff administration.
+
+The affected staff member requests recovery. An authorized deployment operator
+verifies continuity with the existing staff identity using the independently
+maintained staff identity/employment record; control of a new email address or an
+IdP group claim alone is insufficient evidence. A different authorized deployment
+operator approves the request. Requester, recovery target, and approver identities
+must be compared using stable identities: the approver cannot be the requester,
+target, or verification operator. Neither operator obtains customer-data access
+or an unrestricted staff-role mutation capability through this procedure.
+
+Use the same restricted operational access boundary as bootstrap, with fresh
+operator authentication and mandatory staff IdP MFA, but a separate recovery
+operation. API owns the request and validates deployment authority independently
+of the inaccessible StaffAdmin login. Record the incident reason, target staff
+identity, evidence references, old/new external identity bindings, verifier,
+approver, expected staff-authorization version and outcome in the durable audit
+boundary; do not store secret identity-verification material in logs. Missing
+identity evidence, unavailable authority validation, or audit failure blocks
+reconnection without changing the existing assignment.
+
+Before committing a reconnection, verify the target controls the new staff SSO
+identity with IdP MFA and ensure that identity is not already bound to another
+staff member. Recheck the target's unrevoked assignment, current approver/verifier
+authority, and expected binding/authorization version. Approval is bound to this
+exact target and new identity; changing either requires a new verification and
+approval. Serialize completion so concurrent recovery or revocation cannot apply
+stale approval. An approval is single-use, and retry resumes the same operation
+without issuing another binding or role grant.
+
+Persist a restore-independent reconnection intent and fence the old identity's
+operating sessions, pending approvals and emergency capabilities before completing
+the binding change. Advance the staff-authorization version and retain the existing
+staff UUID and current unrevoked assignments only; never restore revoked roles,
+old sessions or prior emergency access. Recovery creates no new StaffAdmin and
+does not bypass the ban on self-role changes. The reconnected staff member must
+sign in through the normal staff SSO/MFA and current-role checks.
+
+Keep reconnection intents and completed binding/version fences outside restorable
+API state through every affected backup horizon. On restore, reconcile them with
+registration and revocation records before staff access; replay cannot reconnect
+the old identity or reuse an approval. Failed or interrupted execution remains
+restricted and retryable, never reopens bootstrap, and never reports success before
+required fences and audit evidence are durable. Record the recovery request and
+outcome in the staff audit trail for subsequent StaffAdmin review.
+
+### Staff Role Revocation and Restore
 
 Role revocation durably records a monotonically increasing staff-authorization
 version and a restore-independent revocation intent before acknowledging success.
@@ -443,6 +498,7 @@ provider integration validation, and another threat-model review before release.
 - Verify every quota boundary, lowered limits, hidden environments, rolling rate windows, independent security budgets, and unavailable enforcement dependencies.
 - Inject reordered/replayed internal changes and duplicate external events; verify cursor recovery, revocation fences, readiness gating, and no unauthorized privilege restoration.
 - Verify IdP group changes do not grant staff roles; deny role mutations by Support/Operator or customer administrators without StaffAdmin. Test self-assignment/removal, concurrent last-StaffAdmin removal, repeated bootstrap and bootstrap after an old backup restore. Revoke a role during a session, pending approval and emergency read; verify immediate role-dependent fencing and only independently permitted remaining-role actions. Reject role changes during audit failure and block restored staff access until current registration/revocation records are reconciled.
+- Delete or lose the sole StaffAdmin SSO identity and recover the same staff UUID through independently verified identity continuity and distinct deployment-operator approval. Deny self-approval, missing evidence, revoked assignment, a new identity bound to someone else, and stale/concurrent approvals. Inject audit/fence failure and a pre-recovery backup restore; verify no old identity, session, approval, emergency capability, or bootstrap eligibility returns, and no role is added.
 - Test staff-role separation, self-approval denial, emergency-access expiry, retention/deletion restrictions, suspension recovery, and customer-visible notifications.
 - Verify audit fail-closed behavior, journal recovery, privacy erasure, email retries/manual resend, and configured alert conditions.
 - Validate core web flows, keyboard and assistive-technology access, WCAG 2.2 AA requirements, and customer-safe error/progress/recovery guidance in isolated non-production environments.

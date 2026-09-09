@@ -1153,7 +1153,12 @@ from reappearing after deletion.
 
 API owns StaffAdmin, Support, and Operator role assignments under
 `docs/servers-watchtower-control-plane-contract.md`; staff SSO/IdP groups do not
-supply authorization grants. API also owns restore-independent first-registration
+supply authorization grants. API also owns the separately verified and approved
+last-StaffAdmin identity-reconnection procedure and its restore-independent binding
+intents/fences; it changes no role assignments and cannot reopen bootstrap.
+Recovery reconciles binding versions and revocations before staff access and
+fences old sessions, approvals and emergency capabilities before completion.
+API also owns restore-independent first-registration
 and monotonically versioned staff-revocation evidence. Restored API and affected
 enforcement surfaces reconcile the latest records before allowing staff access;
 stale replay cannot restore withdrawn roles, sessions, approvals, emergency
