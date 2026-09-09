@@ -153,6 +153,42 @@ Watchtower API owns recovery-code hashes, atomic consumption, code replacement, 
 - Users may delete their accounts after resolving every last-Owner constraint and reauthenticating. Immediately revoke memberships, sessions, and personal tokens while preserving organization data.
 - Account identity information and identifiable audit actor context are erased or irreversibly anonymized within 14 days in active stores and 90 days in backups. Non-identifying action evidence follows the audit lifecycle.
 
+## Organization and Account Deletion Recovery Fences
+
+API persists each authorized organization/account deletion intent in its encrypted,
+restore-independent control registry before acknowledging acceptance or committing
+the deletion in restorable PostgreSQL state. This is additional to project
+tombstones and authorization-revocation fences; neither alone protects restored
+account profiles, organization rows, or erased audit context.
+
+The record contains the target kind (organization or account), a keyed target
+identity that can match restored rows without retaining email/profile payload,
+monotonic deletion generation, original deletion timestamp, erasure deadlines,
+correlation/idempotency identity, integrity digest, and pending/completed owner
+acknowledgements. The registry holds unresolved intents through reconciliation;
+completion leaves a minimal deletion tombstone. Retain that tombstone until all
+required cleanup is acknowledged and no API or affected-owner restorable backup
+can predate the deletion, then purge it when no longer needed. Keep audit evidence
+under its independently defined policy, without retaining deleted identity context.
+
+Before API accepts traffic after any restore or replacement, it loads and
+verifies these records, reinstalls deletion fences, resumes incomplete cleanup,
+and prevents restored target rows, identity links, credentials, recovery codes,
+and identifying audit context from becoming accessible. Original erasure deadlines
+do not restart on restore. Account cleanup affects that account's identifying
+context and authority, not unrelated organization data. A recreated organization
+or user must have a new UUID and cannot inherit fenced authority.
+
+API includes relevant organization/account deletion fences in the existing
+owner-scoped `ControlRegistrySnapshotV1` recovery handoff. Every affected owner
+must reconcile and durably enforce its fences before readiness, including the
+component contract's paginated snapshot and final generation check; missing,
+conflicting, or unavailable registry state keeps affected paths unready. During
+normal deletion, retry owner acknowledgements durably and do not report cleanup
+complete early. Stale snapshots, delayed changes and replay may not erase or
+regress a deletion fence. Audit journal replay may restore anonymous event evidence
+but cannot restore destroyed organization/account identity context.
+
 ## Settings and interfaces
 
 - API owns control-plane state, versioned changes, authorization authority, and contract-level audit. Consumers own their projections; cross-component persistence access is forbidden.
@@ -328,6 +364,7 @@ provider integration validation, and another threat-model review before release.
 - Verify credential issuance response loss, expiry, emergency revocation, overlapping rotation, at-limit replacement, and concurrent in-flight requests.
 - Test MFA recovery, Owner recovery, consumed-code retries, approval expiry, privilege loss during recovery, contact changes, identity reconnection, and cross-organization reapproval.
 - Disable/reactivate projects while collection, processing, alerts, queries, exports, and retention are active.
+- Restore API and each affected owner from before organization/account deletion, including a crash after registry intent but before PostgreSQL commit and after partial cleanup. Verify reconciliation before readiness, original deadlines, erased audit-context protection, rejection of stale grants/recovery material, retention through the last usable backup, and preservation of unrelated organization data.
 - Delete projects, organizations, and accounts; verify deadlines, erasure, last-Owner constraints, no post-request project restoration, and no resurrection after backup restore or rollback.
 - Exercise optimistic conflicts, duplicate requests, mismatched idempotency payloads, operations lasting beyond 24 hours, delayed acknowledgements, and honest pending UI.
 - Verify every quota boundary, lowered limits, hidden environments, rolling rate windows, independent security budgets, and unavailable enforcement dependencies.

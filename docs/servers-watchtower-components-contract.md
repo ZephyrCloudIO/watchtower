@@ -1141,6 +1141,16 @@ security gates. Processing-payload privacy remains owned by #18. Canonical
 storage lifecycle, retention, deletion, restoration, and replay mechanics
 remain owned by the canonical telemetry and storage contract.
 
+API additionally owns restore-independent organization/account deletion intents
+and keyed tombstones under the control-plane contract. Its existing owner-scoped
+`ControlRegistrySnapshotV1` includes relevant fences for every affected owner,
+with the same complete snapshot, digest and final generation validation before
+readiness. API reconciles its own restored rows and audit identity context before
+accepting traffic; consumers enforce fences locally and never read API storage.
+Cleanup retains its original deadlines and tombstones survive every affected
+restorable-backup horizon, preventing restored authority or identifying context
+from reappearing after deletion.
+
 API owns control-plane recovery state and external identity synchronization.
 Its consumers enforce security projections with a maximum freshness of 60
 seconds. WorkOS synchronization unconfirmed for more than five minutes blocks
