@@ -236,7 +236,7 @@ to a native route.
 | `/api/<project_id>/envelope/` | `OPTIONS` | Collection-only DSN in the DSN query parameters or DSN URL, project alias, and request `Origin` | Supported only for a configured project-origin CORS preflight. The DSN authenticates and tenant-binds the project alias before the allowlist is read. Returns `204` with no persistence side effect; a missing, invalid, or disallowed origin receives `401`/`403` with no CORS allow headers. |
 | `/api/<project_id>/store/` | `POST` | Collection-only DSN | Supported legacy JSON error path required by a pinned client. The body is converted to one error event and follows Envelope admission semantics. Successful admission returns `200` with a zero-length body and request-ID headers. |
 | `/api/<project_id>/minidump/` | `POST` | Collection-only DSN | Supported for pinned crash workflows whose fixture specifies the non-Envelope minidump path. `multipart/form-data` and the pinned client field names are accepted. Successful admission returns `200` with a zero-length body and request-ID headers. |
-| `/api/<project_id>/upload/` | `POST` | Collection-only DSN | Supported pinned Native large-attachment TUS creation route. A valid integer `Upload-Length` from `0` through `20,000,000`, `Tus-Resumable: 1.0.0`, and `Upload-Metadata: sentry <base64({"attachment_type":"event.minidump"})>` request returns `201` with a project-bound `Location`, `Tus-Resumable: 1.0.0`, and `Upload-Offset: 0`; it creates a pending upload but no accepted attachment bytes. |
+| `/api/<project_id>/upload/` | `POST` | Collection-only DSN | Supported pinned Native large-attachment TUS creation route. A valid integer `Upload-Length` from `0` through `20,000,000`, `Tus-Resumable: 1.0.0`, and `Upload-Metadata: sentry <base64({"attachment_type":"event.minidump"})>` request returns `201` with a project-bound `Location`, `Tus-Resumable: 1.0.0`, and `Upload-Offset: 0`; a zero-length upload is created directly as `complete-unbound`, while a positive-length upload is pending. Neither creation path accepts attachment bytes. |
 | `/api/<project_id>/upload/<upload_id>` | `HEAD`, `PATCH` | Collection-only DSN bound to the upload | Supported pinned Native TUS offset and append workflow. `HEAD` requires request `Tus-Resumable: 1.0.0` and, on success, returns `200` with an empty body and `Tus-Resumable: 1.0.0`, `Upload-Offset`, and `Upload-Length` response headers. Missing or unsupported `Tus-Resumable` returns `412 precondition_failed`; a missing, expired, already-bound, or inaccessible upload returns `404 not_found`, and invalid authentication returns `401 invalid_authentication`. `PATCH` requires `Tus-Resumable: 1.0.0`, `Upload-Offset`, and `application/offset+octet-stream`, appends only at the expected offset, and returns `204` with an empty body, `Tus-Resumable: 1.0.0`, and the new `Upload-Offset`. A stale or mismatched offset returns `409 conflict` with the current `Upload-Offset`; bytes that would exceed `Upload-Length` return `413 payload_too_large` with the current `Upload-Offset`. Both failures use the standard JSON error body and atomically append no bytes. Reaching the declared length transitions the upload to `complete-unbound`; it remains subject to attachment and project limits and is not accepted until the subsequent Envelope binds it to an event. |
 | `/api/<project_id>/security-report/` | `POST` | Collection-only DSN | Explicitly unsupported in v1; returns `501 unsupported_capability` with no persistence side effect because security reports are not error telemetry. |
 | Any other `/api/<project_id>/...` ingestion route | Any | Any | `404` or `405` according to whether the path or method is unknown; no side effect. |
@@ -279,8 +279,9 @@ equal the decoded item payload length. For this reference attachment, it must
 equal the completed TUS upload's actual byte count and the declared
 `Upload-Length`; the small JSON reference payload itself is not measured
 against that value. The adapter requires that `Location`, project, DSN tenant,
-and event ID match the pending upload and accepted event; it atomically
-transitions `complete-unbound` to `bound` and retains the uploaded bytes only
+and event ID match the pending or `complete-unbound` upload and accepted event;
+it atomically transitions `complete-unbound` to `bound` and retains the
+uploaded bytes only
 as an attachment of that event. A completed upload never becomes a standalone
 event or attachment, and an unreferenced completed upload expires without
 durable customer-payload acceptance.
@@ -319,17 +320,22 @@ the allowlist, or a project with no configured allowlist, receives
 | `/api/0/projects/<organization>/<project>/releases/` | `GET` release list scoped to a project, as used by sentry-cli. Release creation remains organization-scoped. |
 | `/api/0/organizations/<organization>/releases/<version>/` | `GET` and `PUT` release metadata. Release deletion is unsupported. |
 | `/api/0/organizations/<organization>/releases/<version>/commits/` | `GET` a direct array of commit objects, each containing exactly `{ "id": string }`, required by `sentry-cli info`; commit association writes are unsupported. |
-| `/api/0/organizations/<organization>/releases/<version>/previous-with-commits/` | `GET` the fixed Release DTO below for the previous release, or `404 not_found` when no previous release is available, subject to project and tenant scope. |
+| `/api/0/organizations/<organization>/releases/<version>/previous-with-commits/` | `GET` the fixed Release DTO below for the deterministic previous release selected by the project-filter rules below, or `404 not_found` when no previous release is available, subject to project and tenant scope. |
 | `/api/0/projects/<organization>/<project>/releases/<version>/files/` | `GET` file listing and `POST` upload using the exact multipart protocol below. Source maps and debug files are handled by the artifact authority. |
 | `/api/0/projects/<organization>/<project>/releases/<version>/files/<file_id>/` | `GET` the one release file identified by `file_id`, returning its Artifact DTO and current strong `ETag`; `DELETE` performs idempotent failed-upload cleanup using that exact observed ETag. Deletion never bypasses lifecycle rules. |
 | `/api/0/organizations/<organization>/chunk-upload/` | `GET` organization-scoped artifact-bundle and DIF chunk capability for the pinned sentry-cli. The response supplies the upload URL, chunk size, request limits, concurrency, hash algorithm, and accepted compression. The returned `url` is itself an admitted organization-scoped multipart `POST` route valid for both workflows; its request carries no project field. |
 | `/api/0/projects/<organization>/<project>/chunk-upload/` | `GET` project-scoped DIF chunk capability for the pinned sentry-cli. The response supplies a project-bound upload URL, chunk size, request limits, concurrency, hash algorithm, and accepted compression. |
-| `/api/0/projects/<organization>/<project>/files/difs/chunks/` (or the exact project-bound upload URL returned by the DIF capability response) | `POST` multipart chunk upload using `file` or `file_gzip` parts keyed by SHA-1 checksum. A matching checksum is idempotent; conflicting bytes are `409`. |
+| `/api/0/projects/<organization>/<project>/files/difs/chunks/` (or the exact project-bound upload URL returned by the DIF capability response) | `POST` multipart chunk upload using `file` or `file_gzip` parts keyed by SHA-1 checksum. A valid new or matching checksum returns `200` with an empty body and the standard request-ID headers; a matching checksum is idempotent, while conflicting bytes are `409`. |
 | `/api/0/projects/<organization>/<project>/files/difs/assemble/` | `POST` DIF assembly with the pinned sentry-cli request map. The response reports each digest's `state`, `missingChunks`, bounded `detail`, and registered DIF when complete. Polling repeats this request with the same body and optional idempotency key. |
 | `/api/0/organizations/<organization>/artifactbundle/assemble/` | `POST` source-map/artifact-bundle assembly with `checksum`, ordered `chunks`, `projects`, optional `version`, and optional `dist`; repeated identical POSTs poll the same assembly and return the exact per-project artifact-bundle response defined below. `202` remains pending until artifact processing completes. `checksum` is the lowercase SHA-1 of the ordered decompressed chunk bytes defined below. |
 | `/api/0/operations/<operation_id>/` | `GET` Watchtower compatibility polling extension for project/lifecycle/artifact operations that return an operation ID and do not have an upstream polling request. The operation ID is canonical UUID v7, tenant-scoped, non-reusable, and returns the defined operation status DTO and state machine below. |
 | `/api/0/organizations/<organization>/releases/<version>/deploys/` | `GET` and `POST` deployment records. Deployment records are release metadata and do not schedule deployment work. |
 | Any other `/api/0/...` route | Any | An unknown path returns safe `404` with no persistence side effect; an unsupported method on a known supported path returns `405`; explicitly unsupported capabilities are listed below and return `501`. |
+
+Both organization-scoped and project-scoped chunk upload URLs accept the
+negotiated multipart request. A valid new or matching chunk upload returns
+`200` with an empty body and the standard request-ID headers; conflicting
+bytes return `409`.
 
 The following commonly probed upstream-shaped routes are explicitly
 unsupported and return `501 unsupported_capability` with no persistence side
@@ -939,7 +945,7 @@ codes while preserving the pinned client's expected HTTP status family.
 | `internal_error` | 500 | Internal, unknown, or data-loss failure; fixed safe message and request ID, with no original cause |
 | `unsupported_capability` | 501 | Explicitly unsupported route, format, workflow, or capability outside an Envelope; individually excluded Envelope items remain bounded exclusions in a `200` Envelope response |
 | `conflict` | 409 | Stale version, conflicting alias/digest, reused idempotency key, or lifecycle state |
-| `payload_too_large` | 413 | A protocol or owner limit was exceeded |
+| `payload_too_large` | 413 | A byte, decoded-payload, or explicit cardinality limit was exceeded |
 | `rate_limited` | 429 | A principal, organization, project, collection, or artifact quota was exhausted |
 | `unavailable` | 503 | Authorization, quota, owner, lifecycle, or processing dependency cannot be evaluated safely |
 | `deadline_exceeded` | 504 | A bounded synchronous operation exceeded its deadline without being reported complete |
@@ -1067,11 +1073,15 @@ request can be recovered safely.
 | Management response page | 100 records |
 | Management request filter values | 256 bytes each |
 
-The smaller applicable limit wins. A request over a limit returns `413` with a
-safe code and request ID; it is not partially accepted. Existing organization,
-project, collection, artifact, and API quotas remain authoritative in addition
-to these protocol limits. Rate-limit exhaustion returns `429` and
-`Retry-After`; inability to evaluate the relevant quota returns `503`.
+The smaller applicable limit wins. A request that exceeds a byte, decoded-
+payload, multipart-count, or explicit assembly-cardinality limit returns `413`
+with a safe code and request ID; it is not partially accepted. A scalar field
+that exceeds its own bounded length, such as an issue filter or browser origin,
+returns `400 invalid_request` with field-specific details instead of `413`.
+Existing organization, project, collection, artifact, and API quotas remain
+authoritative in addition to these protocol limits. Rate-limit exhaustion
+returns `429` and `Retry-After`; inability to evaluate the relevant quota
+returns `503`.
 
 For every multipart request, the decompressed byte total across all parts and
 multipart framing must remain at or below `100,000,000` bytes. The adapter
@@ -1553,12 +1563,14 @@ the pinned client supplies no filename, so the adapter derives the artifact's
 logical filename deterministically as `artifact-bundle-<checksum>` using the
 lowercase 40-character bundle checksum. Absent `version` selects the
 versionless identity above. `projects` is required and must contain one to
-100 unique project aliases, all within the authenticated organization. The
-adapter validates this cardinality, uniqueness, organization scope, and
-authorization before checksum verification, project lookup, operation
-creation, assembly, or persistence; an empty, duplicate, over-limit, or
-cross-organization list returns `400 invalid_request` or `403
-permission_denied` as applicable with no side effect. For an artifact bundle,
+100 unique project aliases. Each alias is resolved only within the
+authenticated organization. The adapter validates cardinality, uniqueness,
+tenant-scoped alias resolution, and authorization before checksum
+verification, project lookup, operation creation, assembly, or persistence;
+an empty or duplicate list returns `400 invalid_request`, an over-limit list
+returns `413 payload_too_large`, and an unknown, cross-organization, or
+otherwise inaccessible alias returns indistinguishable `404 not_found`, all
+with no side effect. For an artifact bundle,
 `chunks` is a non-empty ordered list of lowercase
 40-character SHA-1 chunk names, and `checksum` is the lowercase 40-character
 SHA-1 of the byte-for-byte concatenation of those chunks after each
@@ -1566,9 +1578,14 @@ SHA-1 of the byte-for-byte concatenation of those chunks after each
 separator, JSON wrapper, multipart framing, compressed bytes, or chunk-name
 text is included in the preimage. The adapter verifies this checksum before
 assembly or persistence; a mismatch returns `400 invalid_request` and does not
-create an artifact or operation. The same checksum with the same ordered
-content and ordered project list is an idempotent duplicate, while a conflicting
-ordered content, version, distribution, or project list is `409 conflict`.
+create an artifact or operation. A repeated normalized assembly request,
+including its checksum, ordered chunks, version, distribution, and ordered
+project list, is an idempotent duplicate. The same checksum and bytes may be
+registered under a different release, distribution, or project list; those
+are distinct artifact registrations rather than conflicts. A checksum
+conflict is reserved for a checksum-addressed value whose stored bytes
+differ, or for an existing artifact identity requested with different bytes;
+metadata differences alone never return `409 conflict`.
 
 The artifact-bundle assembly response is exactly an object with `state`,
 `missingChunks`, `detail`, and `projects` members. `state` is one of `pending`,
@@ -1599,11 +1616,13 @@ upload request intentionally carries no project field. A DIF upload through
 the project-scoped capability remains project-bound. At DIF assembly and
 artifact-bundle assembly, Watchtower verifies the target project(s) and the
 caller's authorization before exposing any result.
-The `projects` list is authoritative at assembly, where Watchtower verifies
-every target project and the caller's authorization. Same-organization reuse
-is allowed after those checks, while cross-organization reuse is rejected.
-Watchtower bounds every field and enforces required checksum, order, project,
-and applicable artifact identity. These are adapter DTOs only.
+The `projects` list is authoritative at assembly, where Watchtower resolves
+every alias only within the authenticated organization and verifies the
+caller's authorization. Unknown, cross-organization, or otherwise inaccessible
+aliases return the same indistinguishable `404 not_found`; same-organization
+reuse is allowed after those checks. Watchtower bounds every field and enforces
+required checksum, order, project, and applicable artifact identity. These are
+adapter DTOs only.
 The shared capability response advertises `maxFileSize: 50000000` for both
 artifact-bundle and DIF workflows, so a pinned client cannot submit a DIF
 larger than the 50 MB debug-file limit. The `1,000,000,000` assembled release
@@ -1651,6 +1670,21 @@ record creation are guaranteed only through the pinned CLI/plugin matrix. A
 release version remains the external release identifier scoped to one tenant;
 it is not a canonical UUID. The adapter maps it to the native release command
 and preserves the upstream version string as a bounded external field.
+
+The `previous-with-commits` route accepts only an optional repeated `project`
+query parameter. Each value is a unique, non-empty project alias resolved only
+within the authenticated organization; an unknown, cross-organization, or
+otherwise inaccessible alias returns the indistinguishable `404 not_found`,
+and any other query parameter returns `400 invalid_request`. When the filter is
+omitted, the candidate project scope is the current release's associated
+projects. A candidate release must be in the same organization, be associated
+with at least one project in that scope, differ from the requested release, and
+have both `commitCount > 0` and a non-null `lastCommit`; releases without
+commits are skipped. Candidates are ordered by `dateCreated ASC`, then
+`version ASC`, then `id ASC`. The route returns the candidate with the greatest
+ordering tuple strictly before the requested release's tuple, using the fixed
+Release DTO below. If no candidate matches, it returns the standard `404
+not_found` body without disclosing another release.
 
 Every `<version>` in a release path is one RFC 3986 URI path segment. Clients
 percent-encode the UTF-8 bytes of the version, including reserved bytes such as
@@ -1703,14 +1737,19 @@ metadata values, or values over the applicable field limits return
 
 The normalized body replaces omitted nullable values with `null`, omitted
 metadata with `{}`, NFC-normalizes strings, and is the RFC 8785 request digest
-preimage. Deployment writes do not require a client idempotency key; retries
-use `(tenant_id, operation, release_scope, canonical_request_body_digest)`.
-The first successful `POST` returns `201` with the fixed Deployment DTO;
-`dateFinished` equals `timestamp`, and `dateStarted` is `null` unless native
-deployment data supplies it. An identical retry returns `200` with the same
-DTO, while a conflicting digest returns `409 conflict`. Deployment records
-history only; they do not grant deployment authority, execute deployment work,
-or activate unsupported release-health behavior.
+preimage. Deployment writes do not require a client idempotency key; without
+one, retries use `(tenant_id, operation, release_scope,
+canonical_request_body_digest)`, so a new normalized body digest is a distinct
+deployment record. When a client key is supplied, it binds to the same release
+scope and normalized body digest; repeating that key with the same body returns
+the original successful result, while reusing it with a different body returns
+`409 conflict`.
+An identical no-key retry also returns the original Deployment DTO with `200`.
+The first successful `POST` for a new identity returns `201` with the fixed
+Deployment DTO; `dateFinished` equals `timestamp`, and `dateStarted` is `null`
+unless native deployment data supplies it. Deployment records history only;
+they do not grant deployment authority, execute deployment work, or activate
+unsupported release-health behavior.
 
 ## Identity, aliases, and storage ownership
 
@@ -1837,8 +1876,10 @@ exercise:
   the pinned `sentry-native` submodule commit, and no non-Envelope alternative;
 - legacy `store` uploads with the required JSON event fields and the successful
   `200` zero-length acknowledgement;
-- Native TUS large-attachment creation (`201` and `Location`) with the exact
-  `Upload-Metadata` value, `HEAD` requests with `Tus-Resumable: 1.0.0`,
+- Native TUS large-attachment creation (`201` and `Location`) for both zero-
+  and positive-length uploads, with zero-length uploads immediately
+  `complete-unbound`, the exact `Upload-Metadata` value, `HEAD` requests with
+  `Tus-Resumable: 1.0.0`,
   successful `200` empty responses with `Tus-Resumable`, `Upload-Offset`, and
   `Upload-Length`, `412` version-precondition failures, `401` authentication
   failures, and `404` missing/expired/bound/inaccessible uploads, followed by
@@ -1861,15 +1902,18 @@ exercise:
   acceptance-record retirement while the canonical event remains queryable and
   uniqueness-tombstone enforcement; equivalent payloads with different
   compression, JSON ordering, or excluded metadata;
-  duplicate chunks, interrupted assembly, optional and conflicting DIF
-  idempotency keys, retries, polling, and lost responses;
+  new and duplicate chunks with exact `200` empty responses, conflicting
+  chunks, interrupted assembly, optional and conflicting DIF idempotency keys,
+  retries, polling, and lost responses;
 - collection credentials in `X-Sentry-Auth`, DSN query parameters, and DSN
   URLs, including percent-decoding, duplicate parameters, missing/unknown
   members, route-project mismatches, and conflicting sources;
 - versioned and versionless artifact-bundle assembly, the deterministic
-  `artifact-bundle-<checksum>` name, release-artifact identity across
-  release-or-null, distribution, artifact type, and logical filename, plus
-  release-independent DIF duplicates and checksum/debug identity conflicts;
+  `artifact-bundle-<checksum>` name, reuse of identical bundle bytes across
+  release, distribution, and project-list identities, release-artifact
+  identity across release-or-null, distribution, artifact type, and logical
+  filename, plus release-independent DIF duplicates and checksum/debug
+  identity conflicts;
 - release versions containing percent-encoded reserved path bytes, literal
   plus signs, malformed escapes, invalid UTF-8, query delimiters, and
   double-decoding attempts;
@@ -1905,7 +1949,9 @@ exercise:
   scalar/query-only/unbounded updates;
 - release `/commits/` direct arrays containing exactly `{ "id": string }`,
   fixed Release DTO responses or `404 not_found` for
-  `/previous-with-commits/`, and the pinned sentry-cli parsing workflow;
+  `/previous-with-commits/`, including repeated project filters, skipped
+  no-commit releases, deterministic ordering/tie-breaking, no-match behavior,
+  and the pinned sentry-cli parsing workflow;
 - release creation, metadata update, and finalization with the exact request
   bodies, nullable fields, mutually exclusive combinations, canonical digests,
   and rejection of unknown or misplaced fields;
@@ -1935,11 +1981,11 @@ exercise:
   for rejected requests;
 - chunk requests at and over the advertised `maxRequestSize`, including
   duplicate and rejected parts, with `413` and no partial persistence for an
-  over-limit request, plus DIF/artifact-bundle assembly cardinality at and
-  over each explicit digest, chunk, and project limit before lookup, including
-  zero, one, 100, duplicate, cross-organization, and 101-project artifact
-  lists, and repeated identical assembly POST polling without a generic status
-  URL;
+  over-limit request, `400` for overlong scalar fields, plus
+  DIF/artifact-bundle assembly cardinality at and over each explicit digest,
+  chunk, and project limit before lookup, including zero, one, 100, duplicate,
+  cross-organization, and 101-project artifact lists, and repeated identical
+  assembly POST polling without a generic status URL;
 - valid, expired, revoked, insufficient-scope, cross-tenant, stale-projection,
   suspended, disabled, deleting, and deleted resources;
 - organization/project reads, creation, update, deletion, DSN issuance,
@@ -1958,7 +2004,8 @@ exercise:
   states, missing-chunk arrays, safe details, and nullability;
 - deployment writes with the closed JSON body, omitted/null normalization,
   metadata bounds, canonical digest, exact `201` initial and `200` duplicate
-  responses, and conflicting retry rejection;
+  responses, distinct no-key deployment bodies, and conflicting supplied-key
+  retry rejection;
 - owner outages, quota exhaustion, processing lag, symbolication lag, no
   excluded-payload persistence, and durable acceptance versus visibility.
 
