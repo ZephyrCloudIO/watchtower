@@ -177,7 +177,7 @@ examples or optional coverage.
 
 | Matrix entry | Required protocol path | Normative fixture IDs and scenario |
 | --- | --- | --- |
-| Android (`Android runtime`, `Kotlin/Java Android`, `Compose`) | `POST /api/<project_id>/envelope/`; native crash variant uses `POST /api/<project_id>/minidump/` when emitted by the pinned client | `sdk.android.{runtime,kotlin-java,compose}.ordinary`; `sdk.android.native-crash` captures the minidump or Envelope event, attachment, durable acknowledgement, and later processing state |
+| Android (`Android runtime`, `Kotlin/Java Android`, `Compose`) | `POST /api/<project_id>/envelope/`; the pinned Android `8.56.0` native-crash path also uses this Envelope route with a native event item | `sdk.android.{runtime,kotlin-java,compose}.ordinary`; `sdk.android.native-crash` sends the pinned native event Envelope, any emitted attachment items, durable acknowledgement, and later processing state; no minidump-route alternative is selected |
 | Apple (`iOS`, `macOS`, `tvOS`, `watchOS`, `visionOS`, Swift, Objective-C) | Envelope; pinned Cocoa native-crash integration uses the Envelope transport | `sdk.apple.{ios,macos,tvos,watchos,visionos,swift,objc}.ordinary`; `sdk.apple.native-crash` records the exact pinned Cocoa Envelope output |
 | Dart/Flutter (`Dart VM`, mobile, desktop, web) | Envelope | `sdk.dart.{vm,flutter-mobile,flutter-desktop,flutter-web}.ordinary` |
 | Elixir (`Elixir`, Plug/Phoenix) | Envelope | `sdk.elixir.{runtime,plug-phoenix}.ordinary` |
@@ -193,7 +193,7 @@ examples or optional coverage.
 | PHP (`PHP`, Laravel, Symfony) | Envelope; legacy `store` is covered by the legacy-transport fixture | `sdk.php.{php,laravel,symfony}.ordinary`; `sdk.php.legacy-store` |
 | PowerShell | Envelope | `sdk.powershell.ordinary` |
 | Python (each literal integration listed above) | Envelope | `sdk.python.<normalized-integration>.ordinary` for every listed integration |
-| React Native and Expo | Envelope; native crash variant uses the minidump route when emitted | `sdk.react-native.{react-native,expo}.ordinary`; `sdk.react-native.native-crash` |
+| React Native and Expo | `POST /api/<project_id>/envelope/`; the pinned native-crash path uses the native dependency's Envelope transport | `sdk.react-native.{react-native,expo}.ordinary`; `sdk.react-native.native-crash` sends a native event item and any emitted attachment items through the Envelope route, using `sentry-android 8.56.0` on Android and `sentry-cocoa 9.28.0` on Apple targets; there is no conditional minidump branch |
 | Ruby (`Rack`, Rails, Sidekiq, Resque, Delayed Job) | Envelope | `sdk.ruby.{rack,rails,sidekiq,resque,delayed-job}.ordinary` |
 | Rust (`Actix Web`, axum, `tracing`) | Envelope | `sdk.rust.{actix-web,axum,tracing}.ordinary` |
 | Unity | Envelope and pinned native crash/minidump upload | `sdk.unity.ordinary`; `sdk.unity.native-crash` |
@@ -236,8 +236,8 @@ to a native route.
 | `/api/<project_id>/envelope/` | `OPTIONS` | Collection-only DSN in the DSN query parameters or DSN URL, project alias, and request `Origin` | Supported only for a configured project-origin CORS preflight. The DSN authenticates and tenant-binds the project alias before the allowlist is read. Returns `204` with no persistence side effect; a missing, invalid, or disallowed origin receives `401`/`403` with no CORS allow headers. |
 | `/api/<project_id>/store/` | `POST` | Collection-only DSN | Supported legacy JSON error path required by a pinned client. The body is converted to one error event and follows Envelope admission semantics. Successful admission returns `200` with a zero-length body and request-ID headers. |
 | `/api/<project_id>/minidump/` | `POST` | Collection-only DSN | Supported for pinned crash workflows whose fixture specifies the non-Envelope minidump path. `multipart/form-data` and the pinned client field names are accepted. Successful admission returns `200` with a zero-length body and request-ID headers. |
-| `/api/<project_id>/upload/` | `POST` | Collection-only DSN | Supported pinned Native large-attachment TUS creation route. A valid `Upload-Length` and `Tus-Resumable: 1.0.0` request returns `201` with a project-bound `Location`, `Tus-Resumable: 1.0.0`, and `Upload-Offset: 0`; it creates no accepted attachment bytes. |
-| `/api/<project_id>/upload/<upload_id>` | `HEAD`, `PATCH` | Collection-only DSN bound to the upload | Supported pinned Native TUS offset and append workflow. `HEAD` reports the current offset; `PATCH` requires `Tus-Resumable: 1.0.0`, `Upload-Offset`, and `application/offset+octet-stream`, appends only at the expected offset, and returns `204` with the new offset. The upload is finalized only at the declared length and remains subject to attachment and project limits. |
+| `/api/<project_id>/upload/` | `POST` | Collection-only DSN | Supported pinned Native large-attachment TUS creation route. A valid `Upload-Length`, `Tus-Resumable: 1.0.0`, and `Upload-Metadata: sentry <base64({"attachment_type":"event.minidump"})>` request returns `201` with a project-bound `Location`, `Tus-Resumable: 1.0.0`, and `Upload-Offset: 0`; it creates a pending upload but no accepted attachment bytes. |
+| `/api/<project_id>/upload/<upload_id>` | `HEAD`, `PATCH` | Collection-only DSN bound to the upload | Supported pinned Native TUS offset and append workflow. `HEAD` reports the current offset; `PATCH` requires `Tus-Resumable: 1.0.0`, `Upload-Offset`, and `application/offset+octet-stream`, appends only at the expected offset, and returns `204` with the new offset. Reaching the declared length transitions the upload to `complete-unbound`; it remains subject to attachment and project limits and is not accepted until the subsequent Envelope binds it to an event. |
 | `/api/<project_id>/security-report/` | `POST` | Collection-only DSN | Explicitly unsupported in v1; returns `501 unsupported_capability` with no persistence side effect because security reports are not error telemetry. |
 | Any other `/api/<project_id>/...` ingestion route | Any | Any | `404` or `405` according to whether the path or method is unknown; no side effect. |
 
@@ -245,6 +245,19 @@ to a native route.
 It resolves to one canonical lowercase UUID v7 project identity within the
 authenticated tenant. It is never reused after deletion and is never accepted
 from an unrelated tenant.
+
+The pinned Native large-attachment flow binds a completed TUS upload through
+the subsequent Envelope, not through the TUS upload alone. The Envelope carries
+the event's `event_id` and an `attachment` item whose
+`content_type` is `application/vnd.sentry.attachment-ref+json`, whose
+`attachment_type` is `event.minidump`, whose `attachment_length` equals the
+declared upload length, and whose JSON payload contains the returned `Location`
+and a relative `path`. The adapter requires that `Location`, project, DSN
+tenant, and event ID match the pending upload and accepted event; it atomically
+transitions `complete-unbound` to `bound` and retains the bytes only as an
+attachment of that event. A completed upload never becomes a standalone event
+or attachment, and an unreferenced completed upload expires without durable
+customer-payload acceptance.
 
 Browser-origin requests to the Envelope route require an exact match against
 the project's configured browser-origin allowlist. A request without `Origin`
@@ -618,11 +631,14 @@ Every operation response body has exactly these fields:
 ```
 
 `status` is one of `pending`, `succeeded`, `failed`, or `expired`.
-`completed_at` is null only for `pending`; `result` is non-null only for
-`succeeded`; and `error` is non-null only for `failed` or `expired`. A result
-contains only the bounded resource or artifact DTO for the originating
-operation. An error contains only a stable code, safe message, and bounded
-field errors; it never contains owner diagnostics, secrets, or payload data.
+`completed_at` is null only for `pending`; `result` is non-null for a succeeded
+non-destructive operation but is `null` for a succeeded destructive operation
+(currently project deletion); and `error` is non-null only for `failed` or
+`expired`. A non-null result contains only the bounded resource or artifact DTO
+for the originating operation. A successful destructive operation is terminal
+by `status: "succeeded"` and never returns a deleted resource DTO. An error
+contains only a stable code, safe message, and bounded field errors; it never
+contains owner diagnostics, secrets, or payload data.
 
 The status URL returns `202` for `pending` with `Retry-After`, `200` for
 `succeeded` and `failed`, and `410 operation_expired` for `expired` while the
@@ -968,9 +984,14 @@ semantic failures can reject the request.
   Ingest-owned acceptance record containing the payload digest and original
   acceptance remains retained. The same tuple returns the original
   acceptance; the same event ID with a different digest returns `409` and is
-  not merged. After the acceptance record is retired following handoff or
-  expiry, this compatibility contract makes no historical deduplication or
-  conflicting-digest guarantee for a retry.
+  not merged. If the acceptance record retires while the canonical event
+  remains queryable, a payload-free uniqueness tombstone retains the scoped
+  event ID, digest, and canonical event reference for at least the full query-
+  retention horizon. During that horizon, a matching retry returns the original
+  acceptance without creating another event, while a different digest returns
+  `409 conflict`; the event-detail route resolves the one retained canonical
+  event. Only after the tombstone and query-retention horizon expire does this
+  contract make no historical deduplication or conflicting-digest guarantee.
 - An accepted Envelope with no `external_event_id` uses a separate retry
   identity only when the caller supplied a valid canonical `X-Request-ID`:
   `(tenant_id, project_id, client_request_id, payload_digest)`. The same client
@@ -1088,7 +1109,10 @@ debug files, Android ProGuard/R8 mappings, and the artifact metadata required by
 the pinned clients. Artifact-bundle assembly accepts an optional release
 `version`; when absent, the artifact has `release: null` and uses the explicit
 versionless identity `(project, null release, dist, artifact type, logical
-filename)`. Release-associated artifacts are content-addressed and idempotent
+filename)`. Because the pinned artifact-bundle request has no filename field,
+the adapter uses the deterministic synthetic name
+`artifact-bundle-<checksum>` (the lowercase 40-character bundle SHA-1) for the
+Artifact DTO and this identity. Release-associated artifacts are content-addressed and idempotent
 within `(project, release-or-null, dist, artifact type, logical filename)`; an
 absent `dist` is a distinct identity value from any supplied distribution.
 Identical content within the same identity is a successful duplicate, while
@@ -1124,8 +1148,11 @@ both artifact-bundle and DIF uploads and returns JSON with `url`,
 `chunksPerRequest`, `maxRequestSize`, `maxFileSize`, `maxWait`,
 `hashAlgorithm`, `chunkSize`, `concurrency`, and `compression`. Its required
 values are `chunksPerRequest: 4`, `maxRequestSize: 100000000`,
-`maxFileSize: 1000000000`, `hashAlgorithm: "sha1"`, `chunkSize: 20000000`,
-and `compression: ["gzip"]`; the positive batch size and four 20 MB chunks keep
+`maxFileSize: 1000000000`, `maxWait: 0`, `hashAlgorithm: "sha1"`,
+`chunkSize: 20000000`, `concurrency: 8`, and `compression: ["gzip"]`.
+`maxWait` is a non-negative integer number of seconds and zero means that the
+server imposes no smaller polling cap; `concurrency` is a positive integer and
+is fixed at eight workers. The positive batch size and four 20 MB chunks keep
 each advertised request below the decompressed request limit including framing.
 The project-scoped DIF capability remains available with the same bounded
 values and a project-bound `url`. A chunk request is multipart: each `file` or
@@ -1139,7 +1166,10 @@ assembly produces `assembling`, successful creation/completion produces
 `created`/`ok`, and terminal owner failure produces `error`. An optional `dif`
 uses the exact pinned `DebugInfoFile` fields defined above. An artifact-bundle
 assembly request contains `{checksum, chunks, projects, version?, dist?}`;
-absent `version` selects the versionless identity above. For an artifact
+the pinned client supplies no filename, so the adapter derives the artifact's
+logical filename deterministically as `artifact-bundle-<checksum>` using the
+lowercase 40-character bundle checksum. Absent `version` selects the
+versionless identity above. For an artifact
 bundle, `chunks` is a non-empty ordered list of lowercase
 40-character SHA-1 chunk names, and `checksum` is the lowercase 40-character
 SHA-1 of the byte-for-byte concatenation of those chunks after each
@@ -1203,6 +1233,15 @@ release version remains the external release identifier scoped to one tenant;
 it is not a canonical UUID. The adapter maps it to the native release command
 and preserves the upstream version string as a bounded external field.
 
+Every `<version>` in a release path is one RFC 3986 URI path segment. Clients
+percent-encode the UTF-8 bytes of the version, including reserved bytes such as
+`/`, `?`, `#`, and `%`; `+` is a literal plus in a path and is not decoded as a
+space. The adapter segments the raw path before decoding exactly once, rejects
+malformed escapes, invalid UTF-8, controls, and an empty decoded version with
+`400 invalid_request`, and then uses the decoded string for the scoped release
+lookup. Query-string bytes and a second decode can never alter the release
+alias.
+
 Release-file cleanup uses only
 `DELETE /api/0/projects/<organization>/<project>/releases/<version>/files/<file_id>/`.
 `file_id` is the opaque release-file alias returned by file listing or upload
@@ -1238,7 +1277,10 @@ execute deployment work, or activate unsupported release-health behavior.
   identifiers are never reused across generations.
 - SDK event IDs are retained as `(tenant_id, project_id, external_event_id)`
   identifiers. Two projects may use the same event ID without collision or
-  disclosure. An SDK event ID is never a canonical Watchtower primary key.
+  disclosure. A payload-free uniqueness tombstone prevents reuse while the
+  canonical event remains queryable, and the scoped event alias resolves to at
+  most that one canonical event. An SDK event ID is never a canonical
+  Watchtower primary key.
 - API owns control-plane, project, DSN, release, artifact, operation, and audit
   authority. Ingest owns raw accepted records and recoverable handoff. Processor
   owns processing, canonical telemetry, symbolication, and derived issue data.
@@ -1336,22 +1378,29 @@ exercise:
   the successful `200` zero-length acknowledgement;
 - legacy `store` uploads with the required JSON event fields and the successful
   `200` zero-length acknowledgement;
-- Native TUS large-attachment creation (`201` and `Location`), `HEAD` offset
-  reads, expected-offset `PATCH` appends, incomplete-upload retention, and
-  finalization at the declared length;
+- Native TUS large-attachment creation (`201` and `Location`) with the exact
+  `Upload-Metadata` value, `HEAD` offset reads, expected-offset `PATCH`
+  appends, incomplete-upload retention, finalization at the declared length,
+  and subsequent Envelope `attachment-ref` binding to the event ID;
 - empty, unsupported-only, supported-only, and mixed Envelopes, including an
   envelope-level event ID on an excluded-only Envelope, all expecting `200`
   with a zero-length response body, plus eventless empty/client-report retries
   with the same client `X-Request-ID`, different client IDs, and no client ID;
 - nested identity/gzip item payloads at and over the decoded 20,000,000-byte
   item and 50,000,000-byte aggregate limits, with no partial persistence;
-- duplicate, case-variant, malformed, and conflicting event IDs; equivalent
-  payloads with different compression, JSON ordering, or excluded metadata;
+- duplicate, case-variant, malformed, and conflicting event IDs, including
+  acceptance-record retirement while the canonical event remains queryable and
+  uniqueness-tombstone enforcement; equivalent payloads with different
+  compression, JSON ordering, or excluded metadata;
   duplicate chunks, interrupted assembly, optional and conflicting DIF
   idempotency keys, retries, polling, and lost responses;
-- versioned and versionless artifact-bundle assembly, release-artifact identity
-  across release-or-null, distribution, artifact type, and logical filename,
-  plus release-independent DIF duplicates and checksum/debug identity conflicts;
+- versioned and versionless artifact-bundle assembly, the deterministic
+  `artifact-bundle-<checksum>` name, release-artifact identity across
+  release-or-null, distribution, artifact type, and logical filename, plus
+  release-independent DIF duplicates and checksum/debug identity conflicts;
+- release versions containing percent-encoded reserved path bytes, literal
+  plus signs, malformed escapes, invalid UTF-8, query delimiters, and
+  double-decoding attempts;
 - allowlisted and disallowed browser origins, Envelope CORS preflight and
   actual responses, DSN tenant binding, exact origin reflection, exposed
   request and rate-limit headers, and no persistence for a disallowed origin,
@@ -1371,10 +1420,10 @@ exercise:
 - project deletion with missing/mismatched confirmation, release-file deletion
   without `If-Match` or idempotency key, by exact `file_id`, repeated deletion,
   wrong-scope `404`, stale-version and idempotency-key conflicts, and owner
-  outage;
+  outage, including a terminal successful deletion poll with `result: null`;
 - organization-scoped capability probes for both DIF and artifact bundles,
   project-scoped DIF compatibility, exact SHA-1/hash/compression/chunk values,
-  and positive `chunksPerRequest`;
+  exact `maxWait: 0` and `concurrency: 8`, and positive `chunksPerRequest`;
 - chunk requests at and over the advertised `maxRequestSize`, including
   duplicate and rejected parts, with `413` and no partial persistence for an
   over-limit request, plus DIF/artifact-bundle assembly cardinality at and
