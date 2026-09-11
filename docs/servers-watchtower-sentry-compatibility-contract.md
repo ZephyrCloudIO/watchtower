@@ -331,7 +331,8 @@ credential material nor unrestricted customer payloads into internal messages.
 | DSN issue/rotate/revoke | Project scope, requested DSN name/platform where supplied, current Manage authority, and idempotency for mutation | Public DSN and non-secret metadata; management-token plaintext is never returned by a compatibility route |
 | Issue/event read or status transition | Tenant/project-scoped issue or event alias, bounded filters or status, and current credential | Upstream-compatible DTO with current readable fields, request ID, and cursor link when paginated |
 | Release mutation | Organization/project scope, release version, bounded metadata, and idempotency for create/finalize | Release alias/version, operation state, and request ID |
-| File/chunk upload | Release scope, logical filename or checksum, bounded bytes, artifact type, and management credential | Artifact/checksum identity, upload or assembly operation ID, and `202` pending state when asynchronous |
+| Release artifact upload | Project/release scope, logical filename, optional distribution, bounded bytes, artifact type, and management credential | Artifact/checksum identity, upload or assembly operation ID, and `202` pending state when asynchronous |
+| DIF chunk/assembly upload | Project scope, full-file checksum, name, optional `debug_id`, ordered chunks, bounded bytes, and management credential | DIF checksum/debug identity, assembly operation ID, and `202` pending state when asynchronous |
 | Deployment record | Organization scope, release version, environment/name/timestamp, bounded metadata, and idempotency key | Deployment identity, release reference, timestamp, and request ID |
 
 Responses never expose internal component names, database identifiers, raw
@@ -372,22 +373,28 @@ operation state; the owner-specific failure is recovered asynchronously.
 | Legacy store | `application/json` | identity and gzip |
 | Minidump | `multipart/form-data` with a boundary, or `application/octet-stream` for a pinned raw-minidump path | identity and gzip |
 | Release/file/chunk upload | `multipart/form-data` or the exact sentry-cli JSON/multipart form for that operation | identity and gzip |
-| Management API | `application/json` | identity and gzip |
+| Management API with a JSON entity body | `application/json` | identity and gzip |
+| Bodyless management API | an absent `Content-Type` or `application/json` | identity and gzip |
 
 Unsupported encodings, invalid gzip streams, decompressed bodies over the
 applicable limit, invalid multipart boundaries, and mismatched content types
-are rejected without persisting any payload. Response bodies are JSON for
-management routes and empty or JSON-safe acknowledgement bodies for ingestion.
+are rejected without persisting any payload. A management request with an
+entity body must use `application/json`; a bodyless management read, probe, or
+poll may omit `Content-Type`. Response bodies are JSON for management routes
+and empty or JSON-safe acknowledgement bodies for ingestion.
 
 For a non-Envelope crash path whose fixture specifies minidump upload, the
 pinned native uploader sends a bounded `upload_file_minidump` binary multipart
-part and may send a `sentry` JSON metadata part containing the scoped event ID,
-release, distribution, and platform context. A raw-minidump request uses the
-same crash payload with the project DSN authentication. No other multipart
-part is treated as an event or attachment; unknown parts are rejected before
-acceptance. The legacy `store` body is JSON and must contain the pinned
-error-event fields needed to construct one event; it cannot carry an arbitrary
-batch.
+part, the bounded scalar Crashpad annotation fields emitted by that pinned
+fixture (`prod`, `ver`, `ptype`, `plat`, and `guid` where present), and may
+send a `sentry` JSON metadata part containing the scoped event ID, release,
+distribution, and platform context. The annotation allowlist is fixture-
+specific and does not accept arbitrary scalar keys; annotations are metadata,
+not event or attachment parts. A raw-minidump request uses the same crash
+payload with the project DSN authentication. Unlisted multipart file parts are
+rejected before acceptance. The legacy `store` body is JSON and must contain
+the pinned error-event fields needed to construct one event; it cannot carry
+an arbitrary batch.
 
 ### Explicit limits
 
@@ -584,12 +591,20 @@ The CLI and every listed build plugin use the configured Watchtower URL and
 Watchtower management credential. SDK DSNs are not used for artifact writes.
 The contract supports JavaScript source maps, native dSYMs and Breakpad/Crashpad
 debug files, Android ProGuard/R8 mappings, and the artifact metadata required by
-the pinned clients. Uploads are content-addressed and idempotent within the
-identity `(project, release, dist, artifact type, logical filename)`; an absent
-`dist` is a distinct identity value from any supplied distribution. Identical
-content within the same identity is a successful duplicate, while conflicting
-content within that identity is `409`. Different distributions may therefore
-reuse a logical filename within one release.
+the pinned clients. Release-associated artifacts are content-addressed and
+idempotent within the identity `(project, release, dist, artifact type, logical
+filename)`; an absent `dist` is a distinct identity value from any supplied
+distribution. Identical content within the same release-artifact identity is a
+successful duplicate, while conflicting content within that identity is `409`.
+Different distributions may therefore reuse a logical filename within one
+release.
+
+Standalone DIF uploads are independent of release and distribution. Their
+primary idempotency identity is `(project, full-file checksum)`; when a
+`debug_id` is supplied, `(project, debug_id)` is also unique. A matching
+checksum/debug identity with the same name and ordered chunks is a successful
+duplicate. Conflicting bytes, debug identity, name, or chunk ordering returns
+`409`.
 
 Artifact upload, symbolication, and event enrichment are asynchronous. A
 successful upload means the artifact authority durably accepted the artifact
@@ -605,10 +620,12 @@ response is JSON with `url`, `chunksPerRequest`, `maxRequestSize`,
 `compression`. A chunk request is multipart: each `file` or `file_gzip` part
 is named by its lowercase SHA-1 checksum. A DIF assembly request is a JSON map
 from the full-file SHA-1 checksum to `{name, debug_id?, chunks}`; its response
-is the same checksum map with `{state, missingChunks, detail?, dif?}`. An
-artifact-bundle assembly request contains `{checksum, chunks, projects,
-version?, dist?}`. Watchtower bounds every field and ignores no required
-checksum, order, project, or release identity. These are adapter DTOs only.
+is the same checksum map with `{state, missingChunks, detail?, dif?}` and does
+not require release or distribution fields. An artifact-bundle assembly request
+contains `{checksum, chunks, projects, version?, dist?}` and uses release
+identity where supplied. Watchtower bounds every field and enforces required
+checksum, order, project, and applicable artifact identity. These are adapter
+DTOs only.
 The capability response advertises `maxRequestSize: 100000000`, which is the
 decompressed multipart/request limit above. The adapter rejects a chunk request
 when the aggregate decompressed request exceeds that value, even when every
@@ -617,10 +634,12 @@ individual part and the total part count are within their separate limits.
 The pinned sentry-cli chunk workflow is:
 
 1. Probe the project/organization chunk capability with a read-only request.
-2. Upload each content-addressed chunk with its checksum and release scope.
+2. Upload each content-addressed chunk with its checksum and project scope.
 3. Retry a chunk safely by checksum; a matching existing chunk is success.
-4. Submit the bounded assembly request containing the ordered checksum list,
-   release, logical filenames, and idempotency key.
+4. Submit the bounded DIF assembly request containing the ordered checksum
+   list, logical filename, optional debug ID, and idempotency key; artifact
+   bundle assembly additionally carries its project list, version, and
+   optional distribution.
 5. Poll the returned operation/status identity with bounded backoff.
 6. Expose terminal artifact registration only after API and artifact authority
    have completed their durable lifecycle checks.
@@ -746,9 +765,17 @@ exercise:
 
 - malformed Envelope framing, length, JSON, content type, compression, and
   oversized requests;
+- bodyless management reads, capability probes, release reads, and polling
+  without `Content-Type`, plus body-bearing management requests with accepted
+  and mismatched content types;
+- minidump uploads with the exact fixture-emitted Crashpad scalar annotations,
+  optional Sentry metadata, rejected unlisted file parts, and bounded fields;
 - empty, unsupported-only, supported-only, and mixed Envelopes;
 - duplicate event IDs, conflicting event IDs, duplicate chunks, interrupted
   assembly, retries, polling, and lost responses;
+- release-artifact identity across release, distribution, artifact type, and
+  logical filename, plus release-independent DIF duplicates and checksum/debug
+  identity conflicts;
 - pagination, cursor binding, malformed and expired cursor `400` results, stale
   and cross-tenant cursor `403` results, rate-limit headers, unknown fields, and
   every safe error class;
