@@ -183,7 +183,7 @@ examples or optional coverage.
 | Elixir (`Elixir`, Plug/Phoenix) | Envelope | `sdk.elixir.{runtime,plug-phoenix}.ordinary` |
 | Go (`net/http`, Echo, fasthttp, Fiber, Fiber v3, Gin, gRPC, Iris, Negroni) | Envelope | `sdk.go.{net-http,echo,fasthttp,fiber,fiber-v3,gin,grpc,iris,negroni}.ordinary` |
 | Godot Engine | Envelope; native crash variant uses the minidump route when emitted | `sdk.godot.ordinary`; `sdk.godot.native-crash` |
-| Java (`Servlet`, Spring, Spring Boot, JUL, Log4j2, Logback) | Envelope; native crash variant only where the pinned integration emits a minidump | `sdk.java.{servlet,spring,spring-boot,jul,log4j2,logback}.ordinary`; applicable `sdk.java.native-crash` |
+| Java (`Servlet`, Spring, Spring Boot, JUL, Log4j2, Logback) | Envelope | `sdk.java.{servlet,spring,spring-boot,jul,log4j2,logback}.ordinary`; `sdk.java.native-crash` is not applicable to pinned non-Android Java `8.56.0` (Android Java native coverage is in `sdk.android.native-crash`) |
 | JavaScript (each literal `@sentry/*` package in the base row above) | Envelope | `sdk.javascript.<normalized-package>.ordinary` for every base-row package; the fixture sends an exception through that integration's default transport |
 | Separately distributed JavaScript (`@sentry/capacitor`, `@sentry/electron`) | Envelope | `sdk.javascript.capacitor.ordinary` and `sdk.javascript.electron.ordinary`; each fixture installs its exact pinned package and sends an exception through its default transport |
 | JavaScript WebAssembly | Envelope | `sdk.javascript.webassembly.ordinary` runs a deterministic WebAssembly module through the pinned JavaScript SDK family and asserts the default transport's ordinary error admission |
@@ -206,6 +206,10 @@ record the exact non-Envelope request or Envelope item the SDK emits. Each
 fixture asserts the expected status, request/correlation ID shape, durable
 acceptance state, and asynchronous owner outcome; it fails if an excluded
 payload is persisted or if acceptance is reported as processing completion.
+Browser-facing JavaScript fixtures additionally send the Envelope from an
+origin different from the Watchtower DSN host, exercise the allowlisted CORS
+response and preflight behavior, and verify that a disallowed origin is
+rejected before acceptance.
 
 ### Explicit v1 exclusions
 
@@ -229,6 +233,7 @@ to a native route.
 | Route | Methods | Authentication | v1 behavior |
 | --- | --- | --- | --- |
 | `/api/<project_id>/envelope/` | `POST` | Collection-only DSN in `X-Sentry-Auth`, DSN query parameters, or the DSN URL used by the pinned SDK | Supported for error events, attachments, client reports, and native crash items. Durable acceptance is returned before asynchronous processing/query visibility. |
+| `/api/<project_id>/envelope/` | `OPTIONS` | Project alias and request `Origin` | Supported only for a configured project-origin CORS preflight. Returns `204` with no persistence side effect; a disallowed origin receives `403` with no CORS allow headers. |
 | `/api/<project_id>/store/` | `POST` | Collection-only DSN | Supported legacy JSON error path required by a pinned client. The body is converted to one error event and follows Envelope admission semantics. |
 | `/api/<project_id>/minidump/` | `POST` | Collection-only DSN | Supported for pinned crash workflows whose fixture specifies the non-Envelope minidump path. `multipart/form-data` and the pinned client field names are accepted. |
 | `/api/<project_id>/security-report/` | `POST` | Collection-only DSN | Rejected in v1; security reports are not error telemetry. |
@@ -238,6 +243,19 @@ to a native route.
 It resolves to one canonical lowercase UUID v7 project identity within the
 authenticated tenant. It is never reused after deletion and is never accepted
 from an unrelated tenant.
+
+Browser-origin requests to the Envelope route require an exact match against
+the project's configured browser-origin allowlist. A request without `Origin`
+uses the ordinary non-browser contract. For an allowlisted origin, every
+preflight and actual response, including safe errors, contains
+`Access-Control-Allow-Origin` set to that exact origin and `Vary: Origin`; it
+never uses `*` and never enables credentials. The preflight response also
+contains `Access-Control-Allow-Methods: POST, OPTIONS`,
+`Access-Control-Allow-Headers: Content-Type, X-Sentry-Auth, Sentry-Trace,
+Baggage, X-Request-ID`, and `Access-Control-Max-Age: 600`. Actual responses
+expose only `X-Request-ID` and `X-Watchtower-Request-ID`. An origin absent from
+the allowlist, or a project with no configured allowlist, receives
+`403 permission_denied` before payload acceptance and no CORS allow headers.
 
 ### Management and release routes
 
@@ -331,7 +349,7 @@ credential material nor unrestricted customer payloads into internal messages.
 | DSN issue/rotate/revoke | Project scope, requested DSN name/platform where supplied, current Manage authority, and idempotency for mutation | Public DSN and non-secret metadata; management-token plaintext is never returned by a compatibility route |
 | Issue/event read or status transition | Tenant/project-scoped issue or event alias, bounded filters or status, and current credential | Upstream-compatible DTO with current readable fields, request ID, and cursor link when paginated |
 | Release mutation | Organization/project scope, release version, bounded metadata, and idempotency for create/finalize | Release alias/version, operation state, and request ID |
-| Release artifact upload | Project/release scope, logical filename, optional distribution, bounded bytes, artifact type, and management credential | Artifact/checksum identity, upload or assembly operation ID, and `202` pending state when asynchronous |
+| Release artifact upload | Project/release version scope, logical filename, optional distribution, bounded bytes, artifact type, and management credential | Artifact/checksum identity, upload or assembly operation ID, and `202` pending state when asynchronous |
 | DIF chunk/assembly upload | Project scope, full-file checksum, name, optional `debug_id`, ordered chunks, bounded bytes, and management credential | DIF checksum/debug identity, assembly operation ID, and `202` pending state when asynchronous |
 | Deployment record | Organization scope, release version, environment/name/timestamp, bounded metadata, and idempotency key | Deployment identity, release reference, timestamp, and request ID |
 
@@ -353,7 +371,10 @@ names and safe validation reasons only.
 | `not_found` | 404 | Unknown or inaccessible tenant, project, issue, event, release, or artifact |
 | `method_not_allowed` | 405 | Known route with an unsupported method |
 | `invalid_request` | 400 | Invalid JSON, field, alias, cursor, checksum, or operation input |
-| `invalid_envelope` | 400 | Invalid framing, length, header, compression, or supported item |
+| `unsupported_media_type` | 415 | Content type or content encoding is not accepted for the addressed route |
+| `invalid_compression` | 400 | The declared gzip content encoding is malformed or cannot be decompressed |
+| `invalid_multipart` | 400 | Multipart framing or boundary syntax is malformed |
+| `invalid_envelope` | 400 | Invalid framing, length, header, or supported item after transport decoding |
 | `unsupported_capability` | 501 | Explicitly unsupported route, format, item, workflow, or capability |
 | `conflict` | 409 | Stale version, conflicting alias/digest, reused idempotency key, or lifecycle state |
 | `payload_too_large` | 413 | A protocol or owner limit was exceeded |
@@ -376,9 +397,18 @@ operation state; the owner-specific failure is recovered asynchronously.
 | Management API with a JSON entity body | `application/json` | identity and gzip |
 | Bodyless management API | an absent `Content-Type` or `application/json` | identity and gzip |
 
-Unsupported encodings, invalid gzip streams, decompressed bodies over the
-applicable limit, invalid multipart boundaries, and mismatched content types
-are rejected without persisting any payload. A management request with an
+Transport-level content failures have deterministic results and never persist a
+payload:
+
+| Condition | Result |
+| --- | --- |
+| Unsupported `Content-Encoding` | `415 unsupported_media_type` |
+| Invalid gzip stream | `400 invalid_compression` |
+| Invalid multipart boundary | `400 invalid_multipart` |
+| Mismatched or unsupported `Content-Type` | `415 unsupported_media_type` |
+
+Malformed content after successful decompression, including invalid Envelope
+framing or JSON, uses `400 invalid_envelope`. A management request with an
 entity body must use `application/json`; a bodyless management read, probe, or
 poll may omit `Content-Type`. Response bodies are JSON for management routes
 and empty or JSON-safe acknowledgement bodies for ingestion.
@@ -438,8 +468,11 @@ header is required, and each item uses either length-delimited or
 newline-delimited framing. When `length` is present it is authoritative,
 payload bytes must match the declared length, and trailing bytes other than the
 permitted final newline are invalid. When `length` is omitted, the item payload
-uses the permitted newline-delimited framing. The envelope's `event_id`, when
-present, must match its supported error event item. Empty Envelopes are
+uses the permitted newline-delimited framing. When a supported error event item
+is present, the envelope's `event_id`, when present, must match that item. If no
+supported error event item is present, a present envelope `event_id` is still
+syntax- and DSN-validated but is not required to match an excluded item and is
+retained only as bounded request/no-op metadata. Empty Envelopes are
 structurally valid but have no accepted item.
 
 The adapter counts every item header, including unknown and individually
@@ -591,13 +624,15 @@ The CLI and every listed build plugin use the configured Watchtower URL and
 Watchtower management credential. SDK DSNs are not used for artifact writes.
 The contract supports JavaScript source maps, native dSYMs and Breakpad/Crashpad
 debug files, Android ProGuard/R8 mappings, and the artifact metadata required by
-the pinned clients. Release-associated artifacts are content-addressed and
+the pinned clients. Every artifact-bundle assembly requires a non-empty release
+`version`; a missing version returns `400 invalid_request` before an assembled
+artifact is admitted. Release-associated artifacts are content-addressed and
 idempotent within the identity `(project, release, dist, artifact type, logical
 filename)`; an absent `dist` is a distinct identity value from any supplied
-distribution. Identical content within the same release-artifact identity is a
-successful duplicate, while conflicting content within that identity is `409`.
-Different distributions may therefore reuse a logical filename within one
-release.
+distribution. There is no versionless artifact identity. Identical content
+within the same release-artifact identity is a successful duplicate, while
+conflicting content within that identity is `409`. Different distributions may
+therefore reuse a logical filename within one release.
 
 Standalone DIF uploads are independent of release and distribution. Their
 primary idempotency identity is `(project, full-file checksum)`; when a
@@ -622,10 +657,16 @@ is named by its lowercase SHA-1 checksum. A DIF assembly request is a JSON map
 from the full-file SHA-1 checksum to `{name, debug_id?, chunks}`; its response
 is the same checksum map with `{state, missingChunks, detail?, dif?}` and does
 not require release or distribution fields. An artifact-bundle assembly request
-contains `{checksum, chunks, projects, version?, dist?}` and uses release
-identity where supplied. Watchtower bounds every field and enforces required
-checksum, order, project, and applicable artifact identity. These are adapter
-DTOs only.
+contains `{checksum, chunks, projects, version, dist?}` and requires release
+identity. Artifact-bundle chunks negotiated by the organization capability are
+organization-scoped transient records keyed by organization and lowercase
+chunk checksum; their upload request intentionally carries no project field.
+The `projects` list is authoritative at assembly, where Watchtower verifies
+every target project and the caller's authorization. Same-organization reuse
+is allowed after those checks, while cross-organization reuse is rejected.
+DIF chunks remain scoped by their project route. Watchtower bounds every field
+and enforces required checksum, order, project, and applicable artifact
+identity. These are adapter DTOs only.
 The capability response advertises `maxRequestSize: 100000000`, which is the
 decompressed multipart/request limit above. The adapter rejects a chunk request
 when the aggregate decompressed request exceeds that value, even when every
@@ -634,7 +675,9 @@ individual part and the total part count are within their separate limits.
 The pinned sentry-cli chunk workflow is:
 
 1. Probe the project/organization chunk capability with a read-only request.
-2. Upload each content-addressed chunk with its checksum and project scope.
+2. Upload each content-addressed chunk with its checksum; artifact-bundle
+   uploads are organization-scoped and carry no project field, while DIF
+   uploads use their project route.
 3. Retry a chunk safely by checksum; a matching existing chunk is success.
 4. Submit the bounded DIF assembly request containing the ordered checksum
    list, logical filename, optional debug ID, and idempotency key; artifact
@@ -646,10 +689,12 @@ The pinned sentry-cli chunk workflow is:
 
 An interrupted upload leaves recoverable chunk state until its retention fence;
 it does not create a release file. Missing chunks, checksum mismatch, ordering
-conflicts, expired upload state, quota exhaustion, and cross-project reuse are
-explicit errors. Assembly returns `202` while pending and `409` for conflicting
-content or an already terminal operation with incompatible input. A dependency
-outage returns `503` and does not report completed success.
+conflicts, expired upload state, quota exhaustion, unauthorized project lists,
+and cross-organization reuse are explicit errors. Same-organization reuse of an
+organization-scoped artifact-bundle chunk is allowed when assembly
+authorization passes. Assembly returns `202` while pending and `409` for
+conflicting content or an already terminal operation with incompatible input. A
+dependency outage returns `503` and does not report completed success.
 
 ### Releases and deployments
 
@@ -770,12 +815,16 @@ exercise:
   and mismatched content types;
 - minidump uploads with the exact fixture-emitted Crashpad scalar annotations,
   optional Sentry metadata, rejected unlisted file parts, and bounded fields;
-- empty, unsupported-only, supported-only, and mixed Envelopes;
+- empty, unsupported-only, supported-only, and mixed Envelopes, including an
+  envelope-level event ID on an excluded-only Envelope;
 - duplicate event IDs, conflicting event IDs, duplicate chunks, interrupted
   assembly, retries, polling, and lost responses;
-- release-artifact identity across release, distribution, artifact type, and
-  logical filename, plus release-independent DIF duplicates and checksum/debug
-  identity conflicts;
+- required release-version rejection and release-artifact identity across
+  release, distribution, artifact type, and logical filename, plus
+  release-independent DIF duplicates and checksum/debug identity conflicts;
+- allowlisted and disallowed browser origins, Envelope CORS preflight and
+  actual responses, exact origin reflection, exposed request IDs, and no
+  persistence for a disallowed origin;
 - pagination, cursor binding, malformed and expired cursor `400` results, stale
   and cross-tenant cursor `403` results, rate-limit headers, unknown fields, and
   every safe error class;
