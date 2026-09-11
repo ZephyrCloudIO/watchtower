@@ -258,7 +258,7 @@ but cannot restore destroyed organization/account identity context.
 
 - API owns control-plane state, versioned changes, authorization authority, and contract-level audit. Consumers own their projections; cross-component persistence access is forbidden.
 - Define native `/api/v1` operations for the selected resource, membership/grant, credential, settings, quota, lifecycle, audit, and recovery flows.
-- Define consumer-facing application contracts for Ingest, Query, Processor, Jobs, Web, and the Sentry adapter using existing internal `/internal/v1` unary Protobuf-over-HTTP and versioned-message boundaries.
+- Define consumer-facing application contracts for Ingest, Query, Processor, Jobs, Web, and the [Sentry adapter](servers-watchtower-sentry-compatibility-contract.md) using existing internal `/internal/v1` unary Protobuf-over-HTTP and versioned-message boundaries.
 - Settings mutations submit the observed resource version. Reject stale versions as conflicts.
 - Expose the stored version separately from each relevant service’s application status, including pending and failed application. Retry durable delivery. Security revocation, deletion, and retention shortening retain their stronger barriers.
 - Incomplete multi-owner operations return HTTP 202 and a UUID v7 operation ID with status lookup. The web must not display them as completed successes.
@@ -498,7 +498,7 @@ audit boundary without granting consumers direct access to API persistence.
 - Before implementation, record numeric latency, availability, throughput, capacity, and cost targets in the follow-up operating contract. Do not imply an agreed numeric SLO here.
 - Before release, complete non-production verification, threat-model review, operator/support runbooks, and customer authentication, credential, retention, deletion, and recovery documentation.
 - Follow the existing six-unit release train, bounded N/N-1 compatibility, and expand/contract changes. Rollback must not restore revoked authorization, deleted resources, erased context, or obsolete recovery secrets.
-- #16 owns Sentry routes/DTOs and compatible error mapping; #17 owns admission details; #18–#20 own processing, grouping, and artifact behavior; #21 and #23–#27 own query and signal semantics; #22 owns detailed web design; #28/#29 own notification execution and background orchestration.
+- [#16](servers-watchtower-sentry-compatibility-contract.md) owns Sentry routes/DTOs and compatible error mapping; #17 owns admission details; #18–#20 own processing, grouping, and artifact behavior; #21 and #23–#27 own query and signal semantics; #22 owns detailed web design; #28/#29 own notification execution and background orchestration.
 
 ## Interface Responsibility Matrix
 

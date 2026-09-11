@@ -47,7 +47,7 @@ the component contract without updating it.
 | --- | --- |
 | Canonical telemetry, authoritative data classes, and storage model | #14, [`canonical telemetry and storage model`](servers-watchtower-canonical-telemetry-storage-contract.md) |
 | Control plane, roles, authorization, WorkOS behavior, and credential lifecycle | #15, [`control plane and authorization`](servers-watchtower-control-plane-contract.md) |
-| Sentry routes, DTOs, request semantics, and compatibility matrix | #16, `Sentry compatibility contract` |
+| Sentry routes, DTOs, request semantics, and compatibility matrix | #16, [`Sentry compatibility contract`](servers-watchtower-sentry-compatibility-contract.md) |
 | Ingestion admission and durable raw-to-processing handoff | #17, `ingestion admission and durable handoff` |
 | Normalization, privacy, enrichment, and processing policy | #18, `telemetry processing and privacy` |
 | Error intelligence, grouping, and issue lifecycle | #19, `error intelligence and issue lifecycle` |
@@ -76,9 +76,11 @@ supported compatible interface. Native Watchtower HTTP APIs use explicit major
 route versions. Compatibility DTOs remain at external adapters and never
 become canonical Watchtower domain or persistence models.
 
-This project does not yet define the supported Sentry version, individual
-endpoint catalog, query semantics, UI state, or migration behavior. Each must be established in its owning downstream
-contract before implementation.
+The [Sentry compatibility contract](servers-watchtower-sentry-compatibility-contract.md)
+defines the supported upstream baseline, client and workflow matrix, endpoint
+catalog, wire semantics, deviations, conformance fixtures, and troubleshooting
+guidance. Query semantics, issue lifecycle, processing, artifacts, and native
+storage remain owned by their downstream contracts.
 
 `docs/servers-watchtower-control-plane-contract.md` defines native control-plane
 authorization and credential policy. Compatible adapters must apply that policy;

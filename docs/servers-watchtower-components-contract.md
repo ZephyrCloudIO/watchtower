@@ -406,9 +406,10 @@ it is production-ready.
 ## Interface Contracts
 
 Native public business routes use `/api/v1`. Sentry-compatible routes retain
-the upstream route and request behavior required by the supported compatibility
-contract. The exact endpoint and compatibility matrices remain downstream
-decisions.
+the upstream route and request behavior required by the
+[`Sentry compatibility contract`](servers-watchtower-sentry-compatibility-contract.md).
+That contract owns the exact endpoint, wire, and client compatibility matrices;
+this contract continues to own component routing and data boundaries.
 
 Initial synchronous component calls use unary Protobuf-over-HTTP under
 `/internal/v1`. Internal streaming, gRPC, and Connect RPC are not part of
