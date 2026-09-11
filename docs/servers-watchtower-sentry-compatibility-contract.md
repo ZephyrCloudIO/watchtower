@@ -85,7 +85,7 @@ family pin and is still tested as a separate integration path.
 | JavaScript | Base `@sentry/* 10.74.0` | Browser, Node, Angular, Astro, AWS Serverless, Bun, Cloudflare, Deno, Effect, Elysia, Ember, Gatsby, Google Cloud Serverless, Hono, NestJS, Next.js, Nitro, Nuxt, React, React Router, Remix, Solid, SolidStart, Svelte, SvelteKit, TanStack Start React, Vue, and WebAssembly | [sentry-javascript 10.74.0](https://github.com/getsentry/sentry-javascript/releases/tag/10.74.0), [npm](https://www.npmjs.com/org/sentry) |
 | Kotlin Multiplatform | `io.sentry:sentry-kotlin-multiplatform:0.27.0` | Kotlin Multiplatform targets | [sentry-kotlin-multiplatform 0.27.0](https://github.com/getsentry/sentry-kotlin-multiplatform/releases/tag/0.27.0), [Maven Central 0.27.0](https://repo1.maven.org/maven2/io/sentry/sentry-kotlin-multiplatform/0.27.0/) |
 | Native | `0.16.6` | C/C++, Crashpad, Breakpad, minidumps, Qt and native WebAssembly | [sentry-native 0.16.6](https://github.com/getsentry/sentry-native/releases/tag/0.16.6) |
-| .NET | Base `Sentry 6.11.0` | ASP.NET Core, Azure Functions Worker, Entity Framework, Microsoft.Extensions.Logging, log4net, MAUI, NLog, Serilog, WinForms, WinUI, WPF and Xamarin | [sentry-dotnet 6.11.0](https://github.com/getsentry/sentry-dotnet/releases/tag/6.11.0), [NuGet](https://www.nuget.org/packages/Sentry/6.11.0) |
+| .NET | Base `Sentry 6.11.0` | ASP.NET Core, Azure Functions Worker, Entity Framework, Microsoft.Extensions.Logging, log4net, MAUI, NLog, Serilog, WinForms, WinUI, WPF and Xamarin; .NET 8+ NativeAOT through the bundled `Sentry.Native` integration | [sentry-dotnet 6.11.0](https://github.com/getsentry/sentry-dotnet/releases/tag/6.11.0), [NuGet](https://www.nuget.org/packages/Sentry/6.11.0) |
 | PHP | `sentry/sentry 4.31.0` | PHP, Laravel and Symfony | [sentry-php 4.31.0](https://github.com/getsentry/sentry-php/releases/tag/4.31.0), [Packagist metadata](https://repo.packagist.org/p2/sentry/sentry.json) |
 | PowerShell | `Sentry 6.11.0` | Official .NET PowerShell integration | [Sentry NuGet 6.11.0](https://www.nuget.org/packages/Sentry/6.11.0), [PowerShell platform docs](https://docs.sentry.io/platforms/powershell/) |
 | Python | `sentry-sdk 2.69.1` | AIOHTTP, aiomysql, Airflow, Apache Beam, Apache Spark, Ariadne, arq, ASGI, asyncio, asyncpg, AWS Lambda, Boto3, Bottle, Celery, Chalice, ClickHouse driver, Cloud Resource Context, Django, Dramatiq, Falcon, FastAPI, Flask, GNU Backtrace, Google Cloud Functions, GQL, Graphene, gRPC, HTTPX, HTTPX2, Huey, LaunchDarkly, Litestar, logging, Loguru, MCP, OpenFeature, OTLP, pure_eval, PyMongo, Pyramid, pyreqwest, Quart, Ray, Redis, RQ, Sanic, Serverless, Socket, SQLAlchemy, Starlette, Starlite, Statsig, Strawberry, `sys.exit`, Tornado, Tryton, Typer, Unleash and WSGI | [sentry-python 2.69.1](https://github.com/getsentry/sentry-python/releases/tag/2.69.1), [PyPI](https://pypi.org/project/sentry-sdk/2.69.1/) |
@@ -189,7 +189,7 @@ examples or optional coverage.
 | JavaScript WebAssembly | Envelope | `sdk.javascript.webassembly.ordinary` runs a deterministic WebAssembly module through the pinned JavaScript SDK family and asserts the default transport's ordinary error admission |
 | Kotlin Multiplatform | Envelope | `sdk.kotlin-multiplatform.ordinary` |
 | Native (C/C++, Crashpad, Breakpad, minidump, Qt, native WebAssembly) | Envelope and pinned non-Envelope minidump upload | `sdk.native.{c-cpp,crashpad,breakpad,minidump,qt,wasm}.ordinary`; `sdk.native.crash` |
-| .NET (each literal ASP.NET Core, Azure Functions Worker, Entity Framework, logging, log4net, MAUI, NLog, Serilog, WinForms, WinUI, WPF, Xamarin integration) | Envelope; minidump only where emitted by the pinned integration | `sdk.dotnet.<normalized-integration>.ordinary`; applicable `sdk.dotnet.native-crash` |
+| .NET (each literal ASP.NET Core, Azure Functions Worker, Entity Framework, logging, log4net, MAUI, NLog, Serilog, WinForms, WinUI, WPF, Xamarin integration) | Envelope; the pinned .NET 8+ NativeAOT `Sentry.Native` integration emits its native crash through the Envelope route | `sdk.dotnet.<normalized-integration>.ordinary`; `sdk.dotnet.native-crash` uses `Sentry 6.11.0` NativeAOT and `POST /api/<project_id>/envelope/` |
 | PHP (`PHP`, Laravel, Symfony) | Envelope; legacy `store` is covered by the legacy-transport fixture | `sdk.php.{php,laravel,symfony}.ordinary`; `sdk.php.legacy-store` |
 | PowerShell | Envelope | `sdk.powershell.ordinary` |
 | Python (each literal integration listed above) | Envelope | `sdk.python.<normalized-integration>.ordinary` for every listed integration |
@@ -285,7 +285,7 @@ the allowlist, or a project with no configured allowlist, receives
 | `/api/0/projects/<organization>/<project>/files/difs/chunks/` (or the exact project-bound upload URL returned by the DIF capability response) | `POST` multipart chunk upload using `file` or `file_gzip` parts keyed by SHA-1 checksum. A matching checksum is idempotent; conflicting bytes are `409`. |
 | `/api/0/projects/<organization>/<project>/files/difs/assemble/` | `POST` DIF assembly with the pinned sentry-cli request map. The response reports each digest's `state`, `missingChunks`, bounded `detail`, and registered DIF when complete. Polling repeats this request with the same body and optional idempotency key. |
 | `/api/0/organizations/<organization>/artifactbundle/assemble/` | `POST` source-map/artifact-bundle assembly with `checksum`, ordered `chunks`, `projects`, `version`, and optional `dist`; `202` remains pending until artifact processing completes. |
-| `/api/0/operations/<operation_id>/` | `GET` Watchtower compatibility polling extension for project/lifecycle/artifact operations that return an operation ID and do not have an upstream polling request. The operation ID is canonical UUID v7, tenant-scoped, non-reusable, and exposes only safe state. |
+| `/api/0/operations/<operation_id>/` | `GET` Watchtower compatibility polling extension for project/lifecycle/artifact operations that return an operation ID and do not have an upstream polling request. The operation ID is canonical UUID v7, tenant-scoped, non-reusable, and returns the defined operation status DTO and state machine below. |
 | `/api/0/organizations/<organization>/releases/<version>/deploys/` | `GET` and `POST` deployment records. Deployment records are release metadata and do not schedule deployment work. |
 | Any other `/api/0/...` route | Any | An unknown path returns safe `404` with no persistence side effect; an unsupported method on a known supported path returns `405`; explicitly unsupported capabilities are listed below and return `501`. |
 
@@ -366,11 +366,11 @@ credential material nor unrestricted customer payloads into internal messages.
 | Organization/project read | Organization/project compatibility alias and current management credential | Upstream-compatible resource DTO containing only currently readable fields, canonical-safe pagination link, and request ID |
 | Project create/update/delete | Organization scope, project name/platform or changed settings, current authorization, observed version for settings, and idempotency key for create/delete | Resource alias and canonical-safe DTO, or `202` operation ID while lifecycle barriers remain pending |
 | DSN issue/rotate/revoke | Project scope, requested DSN name/platform where supplied, current Manage authority, and idempotency for mutation | Public DSN and non-secret metadata; management-token plaintext is never returned by a compatibility route |
-| Issue/event read or status transition | Tenant/project-scoped issue or event alias, bounded filters or status, and current credential | Upstream-compatible DTO with current readable fields, request ID, and cursor link when paginated |
+| Issue/event read or status transition | Tenant/project-scoped issue or event alias, bounded filters or status, and current credential | The fixed Issue or Event DTO below, request ID, and cursor link when paginated |
 | Release mutation | Organization/project scope, release version, bounded metadata, and idempotency for create/finalize | Release alias/version, operation state, and request ID |
 | Release artifact upload | Project/release version scope, logical filename, optional distribution, bounded bytes, artifact type, and management credential | Artifact/file/checksum identity, upload or assembly operation ID, and `202` pending state when asynchronous |
 | DIF chunk/assembly upload | Project scope, full-file checksum, name, optional `debug_id`, ordered chunks, bounded bytes, and management credential | DIF checksum/debug identity, assembly operation ID, and `202` pending state when asynchronous |
-| Release file deletion | Exact project/release scope, required `file_id`, current Manage authority, observed resource version when supplied, and optional idempotency key | `204` with an empty body after durable deletion; repeating the same target is the same successful no-op |
+| Release file deletion | Exact project/release scope, required `file_id`, current Manage authority, observed resource version when supplied, and a required idempotency key | `204` with an empty body after durable deletion; repeating the same target is the same successful no-op |
 | Deployment record | Organization scope, release version, environment/name/timestamp, bounded metadata, and idempotency key | Deployment identity, release reference, timestamp, and request ID |
 
 ### Organization and project DTOs
@@ -401,10 +401,95 @@ The organization object nested in a project DTO intentionally omits status and
 creation metadata. The exact response body is therefore stable across detail
 and list reads, and it exposes no secrets, internal IDs, or raw storage data.
 
+### Issue and event DTOs
+
+Issue and event list routes return direct arrays of the fixed DTOs below. Detail
+routes and issue status transitions return one DTO. Pagination remains in the
+`Link` header and request ID headers; it is never wrapped in an additional JSON
+object. Every field listed below is present unless it is explicitly nullable.
+Unknown upstream fields are omitted, not emitted as `null`, and do not become
+an extension surface.
+
+| DTO | Field | Type and rule |
+| --- | --- | --- |
+| Issue | `id` | Required non-empty string compatibility alias; never a Watchtower canonical ID |
+| Issue | `shortId` | Required string compatibility alias |
+| Issue | `title` | Required string |
+| Issue | `culprit` | Nullable string |
+| Issue | `permalink` | Required string URL |
+| Issue | `level` | Required enum: `sample`, `debug`, `info`, `warning`, `error`, `fatal`, or `unknown` |
+| Issue | `status` | Required enum: `resolved`, `ignored`, `pending_deletion`, `pending_merge`, `reprocessing`, or `unresolved` |
+| Issue | `statusDetails` | Required object whose only allowed keys are optional `ignoreCount`, `ignoreUntil`, `ignoreUserCount`, `ignoreUserWindow`, `ignoreWindow`, `actor`, `inNextRelease`, `inRelease`, `inCommit`, `pendingEvents`, and `info`; counts are non-negative integers, dates are RFC 3339 UTC strings, release flags/values use their pinned scalar types, and non-applicable keys are omitted |
+| Issue | `substatus` | Nullable enum: `archived_until_escalating`, `archived_until_condition_met`, `archived_forever`, `escalating`, `ongoing`, `regressed`, or `new` |
+| Issue | `isPublic` | Required boolean |
+| Issue | `platform` | Nullable string |
+| Issue | `project` | Required object containing exactly `id`, `slug`, `name`, and nullable `platform` |
+| Issue | `type` | Required enum: `error` or `default` |
+| Issue | `metadata` | Required object containing exactly nullable string fields `type`, `value`, `filename`, and `function` |
+| Issue | `numComments` | Required non-negative integer |
+| Issue | `assignedTo` | Nullable object containing required `type`, `id`, and `name` strings plus optional `email` |
+| Issue | `firstSeen` | Required RFC 3339 UTC string |
+| Issue | `lastSeen` | Required RFC 3339 UTC string |
+| Issue | `count` | Required non-negative decimal string, preserving the pinned Sentry representation |
+| Issue | `userCount` | Required non-negative integer |
+| Event | `id` | Required lowercase 32-character external event ID |
+| Event | `eventID` | Required lowercase 32-character external event ID equal to `id` |
+| Event | `groupID` | Nullable issue compatibility alias |
+| Event | `message` | Nullable string |
+| Event | `title` | Required string |
+| Event | `culprit` | Nullable string |
+| Event | `dateCreated` | Required RFC 3339 UTC string |
+| Event | `dateReceived` | Required RFC 3339 UTC string |
+| Event | `platform` | Nullable string |
+| Event | `tags` | Required array of objects containing required string fields `key` and `value`, plus optional string `query` |
+| Event | `contexts` | Required bounded JSON object; values are JSON scalars, arrays, or objects subject to the event limits above |
+| Event | `user` | Nullable object containing only the safe readable string fields `id`, `username`, and `name` |
+| Event | `sdk` | Nullable object containing exactly nullable string fields `name` and `version` |
+| Event | `release` | Nullable string |
+| Event | `dist` | Nullable string |
+| Event | `entries` | Required array of objects containing exactly string `type` and bounded JSON `data` |
+| Event | `metadata` | Required object containing exactly nullable string fields `type`, `value`, `filename`, and `function` |
+
+The issue `project` object uses the same field types as the project DTO but
+contains no organization or lifecycle metadata. `PUT` status transitions return
+the updated Issue DTO; a requested status outside the listed enum is
+`400 invalid_request`. Event reads never expose raw storage references,
+unbounded request data, credentials, or private user fields omitted above.
+
+### Operation status DTO and state machine
+
+Every operation response body has exactly these fields:
+
+```json
+{
+  "operation_id": "canonical-lowercase-uuid-v7",
+  "status": "pending",
+  "status_url": "/api/0/operations/<operation_id>/",
+  "created_at": "RFC-3339-UTC",
+  "completed_at": null,
+  "result": null,
+  "error": null
+}
+```
+
+`status` is one of `pending`, `succeeded`, `failed`, or `expired`.
+`completed_at` is null only for `pending`; `result` is non-null only for
+`succeeded`; and `error` is non-null only for `failed` or `expired`. A result
+contains only the bounded resource or artifact DTO for the originating
+operation. An error contains only a stable code, safe message, and bounded
+field errors; it never contains owner diagnostics, secrets, or payload data.
+
+The status URL returns `202` for `pending` with `Retry-After`, `200` for
+`succeeded` and `failed`, and `410 operation_expired` for `expired` while the
+minimal operation tombstone is retained. Unknown or inaccessible operation IDs
+return indistinguishable `404 not_found`; an unavailable owner returns
+`503 unavailable` without reporting a terminal state. A `202` creation response
+uses the same `pending` body and never claims lifecycle or artifact completion.
+
 Responses never expose internal component names, database identifiers, raw
 storage references, secrets, or unrestricted payloads. A `202` response includes
-`operation_id`, `status=pending`, and a status URL only when the pinned client
-requires polling; it never claims processing completion.
+the operation status DTO with `status=pending` and a status URL when the pinned
+client requires polling; it never claims processing completion.
 
 ### Error mapping
 
@@ -419,6 +504,7 @@ names and safe validation reasons only.
 | `not_found` | 404 | Unknown or inaccessible tenant, project, issue, event, release, or artifact |
 | `method_not_allowed` | 405 | Known route with an unsupported method |
 | `invalid_request` | 400 | Invalid JSON, field, alias, cursor, checksum, or operation input |
+| `operation_expired` | 410 | A retained operation tombstone no longer has a retrievable result |
 | `unsupported_media_type` | 415 | Content type or content encoding is not accepted for the addressed route |
 | `invalid_compression` | 400 | The declared gzip content encoding is malformed or cannot be decompressed |
 | `invalid_multipart` | 400 | Multipart framing or boundary syntax is malformed |
@@ -462,10 +548,12 @@ payload:
 | Invalid multipart boundary | `400 invalid_multipart` |
 | Mismatched or unsupported `Content-Type` | `415 unsupported_media_type` |
 
-Malformed content after successful decompression, including invalid Envelope
-framing or JSON, uses `400 invalid_envelope`. A management request with an
-entity body must use `application/json`; a bodyless management read, probe, or
-poll may omit `Content-Type`. Response bodies are JSON for management routes;
+After successful decompression, Envelope framing, Envelope headers, and
+Envelope item JSON use `400 invalid_envelope`. Malformed JSON in a project,
+release, deployment, or artifact assembly management request uses
+`400 invalid_request`. A management request with an entity body must use
+`application/json`; a bodyless management read, probe, or poll may omit
+`Content-Type`. Response bodies are JSON for management routes;
 Envelope, legacy `store`, and `minidump` ingestion `POST`s return `200` with a
 zero-length body and request-ID headers, while `OPTIONS` returns `204` without
 a body. Other ingestion failures use the stable JSON error shape.
@@ -687,10 +775,10 @@ cross-field identity checks remain enforced.
   expiry, this compatibility contract makes no historical deduplication or
   conflicting-digest guarantee for a retry.
 - Creation, deletion, rotation, release finalization, chunk assembly, and
-  deployment writes use the control-plane idempotency tuple and the client
-  idempotency key where supplied. Reusing a key with different content returns
-  `409`; a lost response resumes the original operation without returning a
-  secret a second time.
+  deployment writes use the control-plane idempotency tuple. Operations that
+  require a client idempotency key reject a missing key before mutation;
+  reusing a key with different content returns `409`, and a lost response
+  resumes the original operation without returning a secret a second time.
 - Duplicate or out-of-order asynchronous messages are handled by the owning
   component's idempotent command/reconciliation contract. The adapter never
   invents a second canonical event or bypasses a lifecycle fence.
@@ -737,10 +825,12 @@ captures a minimal error event, an event ID, tags/context, and one bounded
 attachment where that SDK supports attachments.
 
 Native scenarios cover the pinned Cocoa, Android, Native, React Native, Unity,
-Unreal, Godot, and applicable Java/.NET integrations. Each uses the exact
-transport named in its fixture row: the Cocoa native-crash fixture exercises
-the pinned Envelope output, while applicable other clients may use a supported
-minidump multipart upload or another exact pinned non-Envelope crash request.
+Unreal, Godot, and the .NET 6.11.0 NativeAOT `Sentry.Native` integration. Each
+uses the exact transport named in its fixture row: the Cocoa native-crash
+fixture exercises the pinned Envelope output, the .NET native-crash fixture
+exercises its pinned Envelope output, and other clients use the exact supported
+minidump multipart upload or other non-Envelope crash request named by their
+fixture row.
 Watchtower stores no raw crash payload outside the Ingest-owned accepted record
 and handoff; Processor owns normalization and symbolication execution, and
 Query visibility is asynchronous.
@@ -848,8 +938,9 @@ Release-file cleanup uses only
 `file_id` is the opaque release-file alias returned by file listing or upload
 and is resolved only within the authenticated tenant, project, and release
 version; the collection route never accepts deletion by filename or an
-implicit selector. The caller needs current `Manage` authority and may supply
+implicit selector. The caller needs current `Manage` authority and must supply
 an idempotency key bound to the exact file target and observed version. A
+missing key returns `400 invalid_request` before artifact authority is called.
 successful delete returns `204` with an empty body only after durable artifact
 authority deletion. Repeating the same target, including with the same key,
 returns the same `204` no-op; an unknown or inaccessible target returns
@@ -991,8 +1082,11 @@ exercise:
 - exact organization/project DTO bodies, including nullable platform,
   canonical aliases, origin arrays, omitted unknown fields, and list/detail
   consistency;
-- release-file deletion by exact `file_id`, repeated deletion, wrong-scope
-  `404`, stale-version and idempotency-key conflicts, and owner outage;
+- exact issue/event DTO bodies, nullable fields, omitted unknown fields,
+  list/detail/status-transition consistency, and bounded nested values;
+- release-file deletion without an idempotency key, by exact `file_id`, repeated
+  deletion, wrong-scope `404`, stale-version and idempotency-key conflicts, and
+  owner outage;
 - project-scoped DIF and organization-scoped artifact-bundle capability probes;
 - chunk requests at and over the advertised `maxRequestSize`, including
   duplicate and rejected parts, with `413` and no partial persistence for an
@@ -1003,6 +1097,10 @@ exercise:
 - organization/project reads, creation, update, deletion, DSN issuance,
   rotation/revocation, issue/event reads, resolve/reopen/ignore, release and
   deployment workflows; and
+- operation polling with `202 pending`, `200 succeeded`, `200 failed`,
+  `410 expired`, unknown-operation `404`, and owner-outage `503` responses;
+- malformed management JSON versus malformed Envelope JSON, with
+  `invalid_request` and `invalid_envelope` respectively;
 - owner outages, quota exhaustion, processing lag, symbolication lag, no
   excluded-payload persistence, and durable acceptance versus visibility.
 
