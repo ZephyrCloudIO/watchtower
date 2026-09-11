@@ -167,23 +167,25 @@ only and no execution guarantee.
 
 ### Required SDK and framework fixture registry
 
-Every integration named in an SDK-family row is a separate release-gate
-fixture, even when it shares the family package and transport. The following
-registry makes the required route and scenario explicit; a brace list expands
-to one fixture per literal integration name in the corresponding matrix row.
+Every integration named in an SDK-family row or the separately distributed
+integration table is a separate release-gate fixture, even when it shares the
+family package and transport. The following registry makes the required route
+and scenario explicit; a brace list expands to one fixture per literal
+integration name in the corresponding matrix row.
 Fixture IDs are stable identifiers for the executable conformance harness, not
 examples or optional coverage.
 
 | Matrix entry | Required protocol path | Normative fixture IDs and scenario |
 | --- | --- | --- |
 | Android (`Android runtime`, `Kotlin/Java Android`, `Compose`) | `POST /api/<project_id>/envelope/`; native crash variant uses `POST /api/<project_id>/minidump/` when emitted by the pinned client | `sdk.android.{runtime,kotlin-java,compose}.ordinary`; `sdk.android.native-crash` captures the minidump or Envelope event, attachment, durable acknowledgement, and later processing state |
-| Apple (`iOS`, `macOS`, `tvOS`, `watchOS`, `visionOS`, Swift, Objective-C) | Envelope; pinned native crash uploader uses the minidump route and multipart fields below | `sdk.apple.{ios,macos,tvos,watchos,visionos,swift,objc}.ordinary`; `sdk.apple.native-crash` |
+| Apple (`iOS`, `macOS`, `tvOS`, `watchOS`, `visionOS`, Swift, Objective-C) | Envelope; pinned Cocoa native-crash integration uses the Envelope transport | `sdk.apple.{ios,macos,tvos,watchos,visionos,swift,objc}.ordinary`; `sdk.apple.native-crash` records the exact pinned Cocoa Envelope output |
 | Dart/Flutter (`Dart VM`, mobile, desktop, web) | Envelope | `sdk.dart.{vm,flutter-mobile,flutter-desktop,flutter-web}.ordinary` |
 | Elixir (`Elixir`, Plug/Phoenix) | Envelope | `sdk.elixir.{runtime,plug-phoenix}.ordinary` |
 | Go (`net/http`, Echo, fasthttp, Fiber, Fiber v3, Gin, gRPC, Iris, Negroni) | Envelope | `sdk.go.{net-http,echo,fasthttp,fiber,fiber-v3,gin,grpc,iris,negroni}.ordinary` |
 | Godot Engine | Envelope; native crash variant uses the minidump route when emitted | `sdk.godot.ordinary`; `sdk.godot.native-crash` |
 | Java (`Servlet`, Spring, Spring Boot, JUL, Log4j2, Logback) | Envelope; native crash variant only where the pinned integration emits a minidump | `sdk.java.{servlet,spring,spring-boot,jul,log4j2,logback}.ordinary`; applicable `sdk.java.native-crash` |
-| JavaScript (each literal `@sentry/*` package listed above) | Envelope | `sdk.javascript.<normalized-package>.ordinary` for every listed package; the fixture sends an exception through that integration's default transport |
+| JavaScript (each literal `@sentry/*` package in the base row above) | Envelope | `sdk.javascript.<normalized-package>.ordinary` for every base-row package; the fixture sends an exception through that integration's default transport |
+| Separately distributed JavaScript (`@sentry/capacitor`, `@sentry/electron`) | Envelope | `sdk.javascript.capacitor.ordinary` and `sdk.javascript.electron.ordinary`; each fixture installs its exact pinned package and sends an exception through its default transport |
 | JavaScript WebAssembly | Envelope | `sdk.javascript.webassembly.ordinary` runs a deterministic WebAssembly module through the pinned JavaScript SDK family and asserts the default transport's ordinary error admission |
 | Kotlin Multiplatform | Envelope | `sdk.kotlin-multiplatform.ordinary` |
 | Native (C/C++, Crashpad, Breakpad, minidump, Qt, native WebAssembly) | Envelope and pinned non-Envelope minidump upload | `sdk.native.{c-cpp,crashpad,breakpad,minidump,qt,wasm}.ordinary`; `sdk.native.crash` |
@@ -228,7 +230,7 @@ to a native route.
 | --- | --- | --- | --- |
 | `/api/<project_id>/envelope/` | `POST` | Collection-only DSN in `X-Sentry-Auth`, DSN query parameters, or the DSN URL used by the pinned SDK | Supported for error events, attachments, client reports, and native crash items. Durable acceptance is returned before asynchronous processing/query visibility. |
 | `/api/<project_id>/store/` | `POST` | Collection-only DSN | Supported legacy JSON error path required by a pinned client. The body is converted to one error event and follows Envelope admission semantics. |
-| `/api/<project_id>/minidump/` | `POST` | Collection-only DSN | Supported for pinned Native, Apple, Android, Unity, and Unreal crash workflows when the client uses the non-Envelope minidump path. `multipart/form-data` and the pinned client field names are accepted. |
+| `/api/<project_id>/minidump/` | `POST` | Collection-only DSN | Supported for pinned crash workflows whose fixture specifies the non-Envelope minidump path. `multipart/form-data` and the pinned client field names are accepted. |
 | `/api/<project_id>/security-report/` | `POST` | Collection-only DSN | Rejected in v1; security reports are not error telemetry. |
 | Any other `/api/<project_id>/...` ingestion route | Any | Any | `404` or `405` according to whether the path or method is unknown; no side effect. |
 
@@ -245,7 +247,7 @@ from an unrelated tenant.
 | `/api/0/organizations/` | `GET` organization reads for the authenticated principal; pagination and current authorization apply. Organization creation, deletion, membership, team, SSO, and broad settings administration are not exposed through Sentry compatibility. |
 | `/api/0/organizations/<organization>/` | `GET` organization read. Unknown or unauthorized organizations return indistinguishable `404`. |
 | `/api/0/organizations/<organization>/projects/` | `GET` project list and `POST` project creation. Creation uses the native lifecycle barrier and returns `202` plus an operation ID until all required owners and Jobs acknowledge enablement. |
-| `/api/0/projects/<organization>/<project>/` | `GET` project read, `PUT` supported project settings, and `DELETE` project deletion. Destructive changes require native recent reauthentication, exact confirmation, idempotency, lifecycle fences, and never report success before authoritative completion. |
+| `/api/0/projects/<organization>/<project>/` | `GET` project read, `PUT` supported project settings, and `DELETE` project deletion. Project deletion requires a current Owner/Admin user session recently reauthenticated within five minutes under applicable organization SSO/MFA conditions, exact confirmation, idempotency, lifecycle fences, and never reports success before authoritative completion. |
 | `/api/0/projects/<organization>/<project>/keys/` | `GET` DSN metadata/public DSNs and `POST` issuance. The request may contain only bounded DSN name/platform metadata; plaintext management tokens are never returned. |
 | `/api/0/projects/<organization>/<project>/keys/<key_id>/` | `PUT` rotation and `DELETE` revocation for the scoped DSN key. Rotation returns the new public DSN only after the native credential fence is durable; revocation never returns a secret. |
 | `/api/0/projects/<organization>/<project>/issues/` | `GET` issue list with bounded filters and cursor pagination, and `PUT` only for the pinned bulk status operation with a bounded filter and supported status change. `POST`, `DELETE`, and unbounded bulk operations are unsupported. |
@@ -293,13 +295,18 @@ and credentials.
   does not grant management, query, artifact, release, issue, or event-read
   authority. Environment names are data, not authorization boundaries.
 - Management routes accept a current Watchtower personal token or explicitly
-  scoped organization service token. Sentry token strings are not Watchtower
-  credentials and are not imported or persisted.
+  scoped organization service token except where the native control-plane
+  action requires a user session. Project deletion accepts only a current
+  Owner/Admin user session recently reauthenticated within five minutes under
+  applicable organization SSO/MFA conditions; personal and service tokens
+  cannot delete projects. Sentry token strings are not Watchtower credentials
+  and are not imported or persisted.
 - The adapter accepts the pinned clients' `X-Sentry-Auth`, DSN query parameters,
-  `Authorization: Bearer`, and `X-Sentry-Token` spellings only when they carry
-  a valid Watchtower credential of the correct kind. Credentials are never
-  logged, returned, copied into internal messages, or used to bypass current
-  authorization.
+  `Authorization: Bearer`, and `X-Sentry-Token` spellings, plus the native
+  authenticated user session required for project deletion, only when they
+  carry a valid Watchtower credential of the correct kind. Credentials are
+  never logged, returned, copied into internal messages, or used to bypass
+  current authorization.
 - Authentication failure is `401`; an inaccessible resource is `404`; an
   authenticated but unauthorized visible action is `403`; stale observed
   versions and lifecycle conflicts are `409`; exhausted quota is `429`; an
@@ -361,7 +368,7 @@ operation state; the owner-specific failure is recovered asynchronously.
 
 | Request | Accepted content type | Accepted content encoding |
 | --- | --- | --- |
-| Envelope | `application/x-sentry-envelope`, with `application/octet-stream` accepted only for a pinned client that sends that type | identity and gzip |
+| Envelope | `application/x-sentry-envelope`; `text/plain;charset=UTF-8` for browser SDK string Envelopes; `application/octet-stream` or an absent `Content-Type` only for a pinned binary Envelope transport | identity and gzip |
 | Legacy store | `application/json` | identity and gzip |
 | Minidump | `multipart/form-data` with a boundary, or `application/octet-stream` for a pinned raw-minidump path | identity and gzip |
 | Release/file/chunk upload | `multipart/form-data` or the exact sentry-cli JSON/multipart form for that operation | identity and gzip |
@@ -372,14 +379,15 @@ applicable limit, invalid multipart boundaries, and mismatched content types
 are rejected without persisting any payload. Response bodies are JSON for
 management routes and empty or JSON-safe acknowledgement bodies for ingestion.
 
-For the non-Envelope crash path, the pinned native uploader sends a bounded
-`upload_file_minidump` binary multipart part and may send a `sentry` JSON
-metadata part containing the scoped event ID, release, distribution, and
-platform context. A raw-minidump request uses the same crash payload with the
-project DSN authentication. No other multipart part is treated as an event or
-attachment; unknown parts are rejected before acceptance. The legacy `store`
-body is JSON and must contain the pinned error-event fields needed to construct
-one event; it cannot carry an arbitrary batch.
+For a non-Envelope crash path whose fixture specifies minidump upload, the
+pinned native uploader sends a bounded `upload_file_minidump` binary multipart
+part and may send a `sentry` JSON metadata part containing the scoped event ID,
+release, distribution, and platform context. A raw-minidump request uses the
+same crash payload with the project DSN authentication. No other multipart
+part is treated as an event or attachment; unknown parts are rejected before
+acceptance. The legacy `store` body is JSON and must contain the pinned
+error-event fields needed to construct one event; it cannot carry an arbitrary
+batch.
 
 ### Explicit limits
 
@@ -542,11 +550,13 @@ captures a minimal error event, an event ID, tags/context, and one bounded
 attachment where that SDK supports attachments.
 
 Native scenarios cover the pinned Cocoa, Android, Native, React Native, Unity,
-Unreal, Godot, and applicable Java/.NET integrations. A crash may arrive as an
-Envelope event, a supported minidump multipart upload, or the exact pinned
-non-Envelope crash request. Watchtower stores no raw crash payload outside the
-Ingest-owned accepted record and handoff; Processor owns normalization and
-symbolication execution, and Query visibility is asynchronous.
+Unreal, Godot, and applicable Java/.NET integrations. Each uses the exact
+transport named in its fixture row: the Cocoa native-crash fixture exercises
+the pinned Envelope output, while applicable other clients may use a supported
+minidump multipart upload or another exact pinned non-Envelope crash request.
+Watchtower stores no raw crash payload outside the Ingest-owned accepted record
+and handoff; Processor owns normalization and symbolication execution, and
+Query visibility is asynchronous.
 
 ### Source maps and debug files
 
