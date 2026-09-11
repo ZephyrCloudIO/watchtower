@@ -405,6 +405,7 @@ request can be recovered safely.
 | One attachment or native crash item | 20,000,000 bytes |
 | One source-map or debug-file artifact | 50,000,000 bytes |
 | One chunk | 20,000,000 bytes |
+| Decompressed multipart/request | 100,000,000 bytes |
 | One assembled release artifact | 1,000,000,000 bytes |
 | Multipart part count | 1,024 |
 | Management response page | 100 records |
@@ -415,6 +416,13 @@ safe code and request ID; it is not partially accepted. Existing organization,
 project, collection, artifact, and API quotas remain authoritative in addition
 to these protocol limits. Rate-limit exhaustion returns `429` and
 `Retry-After`; inability to evaluate the relevant quota returns `503`.
+
+For every multipart request, the decompressed byte total across all parts and
+multipart framing must remain at or below `100,000,000` bytes. The adapter
+enforces this aggregate limit while streaming, before persisting any part, and
+counts duplicate, conflicting, unknown, and otherwise rejected parts toward
+the total. The part-count and per-part limits do not permit a request to exceed
+the aggregate limit.
 
 ### Envelope framing and item behavior
 
@@ -529,8 +537,10 @@ header and opaque cursor parameters when the pinned client expects them. A
 cursor binds to the original tenant, project, principal, filters, sort order,
 and authorization revision. Each page rechecks current authorization,
 revocation, lifecycle, retention, and security-projection freshness. A stale,
-cross-tenant, malformed, or expired cursor returns `400` or `403` without
-disclosing data.
+cross-tenant, malformed, or expired cursor is rejected without disclosing data:
+malformed and expired cursors return `400` with `invalid_request`, while stale
+cursors whose bound authorization or security revision is no longer valid and
+cross-tenant cursors return `403` with `permission_denied`.
 
 Management responses include `Retry-After` for `429` and `503`. Where the
 upstream client consumes them, the adapter also returns `X-Sentry-Rate-Limit-*`
@@ -599,6 +609,10 @@ is the same checksum map with `{state, missingChunks, detail?, dif?}`. An
 artifact-bundle assembly request contains `{checksum, chunks, projects,
 version?, dist?}`. Watchtower bounds every field and ignores no required
 checksum, order, project, or release identity. These are adapter DTOs only.
+The capability response advertises `maxRequestSize: 100000000`, which is the
+decompressed multipart/request limit above. The adapter rejects a chunk request
+when the aggregate decompressed request exceeds that value, even when every
+individual part and the total part count are within their separate limits.
 
 The pinned sentry-cli chunk workflow is:
 
@@ -735,8 +749,12 @@ exercise:
 - empty, unsupported-only, supported-only, and mixed Envelopes;
 - duplicate event IDs, conflicting event IDs, duplicate chunks, interrupted
   assembly, retries, polling, and lost responses;
-- pagination, cursor binding, rate-limit headers, unknown fields, and every
-  safe error class;
+- pagination, cursor binding, malformed and expired cursor `400` results, stale
+  and cross-tenant cursor `403` results, rate-limit headers, unknown fields, and
+  every safe error class;
+- chunk requests at and over the advertised `maxRequestSize`, including
+  duplicate and rejected parts, with `413` and no partial persistence for an
+  over-limit request;
 - valid, expired, revoked, insufficient-scope, cross-tenant, stale-projection,
   suspended, disabled, deleting, and deleted resources;
 - organization/project reads, creation, update, deletion, DSN issuance,
