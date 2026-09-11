@@ -128,7 +128,8 @@ separate package pin is shown.
 
 | Plugin or upload integration | Stable pin | Required workflow | Source |
 | --- | --- | --- | --- |
-| `sentry-cli` and `@sentry/cli` | `3.7.0` | Releases, source maps, debug files, chunks, deployments | [sentry-cli 3.7.0](https://github.com/getsentry/sentry-cli/releases/tag/3.7.0) |
+| `sentry-cli` | `3.7.0` | Releases, source maps, debug files, chunks, deployments | [sentry-cli 3.7.0](https://github.com/getsentry/sentry-cli/releases/tag/3.7.0) |
+| `@sentry/cli` | `3.7.0` | Releases, source maps, debug files, chunks, deployments | [sentry-cli 3.7.0](https://github.com/getsentry/sentry-cli/releases/tag/3.7.0) |
 | `@sentry/webpack-plugin` | `5.4.0` | JavaScript source maps and release metadata | [npm](https://www.npmjs.com/package/@sentry/webpack-plugin/v/5.4.0) |
 | `@sentry/vite-plugin` | `5.4.0` | Vite source maps and release metadata | [npm](https://www.npmjs.com/package/@sentry/vite-plugin/v/5.4.0) |
 | `@sentry/rollup-plugin` | `5.4.0` | Rollup source maps and release metadata | [npm](https://www.npmjs.com/package/@sentry/rollup-plugin/v/5.4.0) |
@@ -142,13 +143,14 @@ separate package pin is shown.
 | `fastlane-plugin-sentry` | `2.6.3` | Apple dSYM and source-map upload | [RubyGems](https://rubygems.org/gems/fastlane-plugin-sentry/versions/2.6.3), [source](https://github.com/getsentry/sentry-fastlane-plugin) |
 | `@sentry/babel-plugin-component-annotate` | `5.3.0` | Component annotation only; the resulting SDK request remains covered by its SDK/plugin fixture | [npm](https://www.npmjs.com/package/@sentry/babel-plugin-component-annotate/v/5.3.0) |
 
-Each plugin row has the following release-blocking fixture. `plugin.<name>`
-uses the normalized package name and is expanded once per package, not once
-per shared implementation:
+Each plugin row has its own release-blocking fixture. `plugin.<name>` uses the
+normalized package name and is expanded once per package or distribution, not
+once per shared implementation:
 
 | Plugin class | Required protocol path | Fixture and assertion |
 | --- | --- | --- |
-| `sentry-cli`/`@sentry/cli` | `GET /api/0/`; release routes; source-map/debug-file file or chunk routes; deployment route | `plugin.sentry-cli.release-artifact-deploy` creates/reads/updates/finalizes a release, uploads one source map and one debug file, exercises chunk negotiation/assembly/polling, and records a deployment |
+| `sentry-cli` | `GET /api/0/`; release routes; source-map/debug-file file or chunk routes; deployment route | `plugin.sentry-cli.release-artifact-deploy` creates/reads/updates/finalizes a release, uploads one source map and one debug file, exercises chunk negotiation/assembly/polling, and records a deployment |
+| `@sentry/cli` | `GET /api/0/`; release routes; source-map/debug-file file or chunk routes; deployment route | `plugin.sentry-cli-npm.release-artifact-deploy` independently exercises the package distribution through the same release, artifact, chunk, assembly, polling, and deployment assertions |
 | Webpack, Vite, Rollup, esbuild, bundler, Next.js, Nuxt, Gatsby, Astro, SvelteKit, Netlify | Artifact bundle or release-file upload route selected by the pinned plugin | `plugin.<normalized-name>.source-map` verifies release association, checksum idempotency, bounded upload, asynchronous symbolication, and safe polling |
 | Expo upload | Artifact bundle/release-file route with React Native release and dist fields | `plugin.expo-upload-sourcemaps.source-map` verifies the Expo bundle, source map, release, dist, and processing state |
 | Android Gradle | DIF chunk capability, chunk upload, and DIF assembly routes | `plugin.android-gradle.debug-file` verifies ProGuard/R8 mapping and native symbol registration, duplicate chunks, assembly, and polling |
@@ -182,6 +184,7 @@ examples or optional coverage.
 | Godot Engine | Envelope; native crash variant uses the minidump route when emitted | `sdk.godot.ordinary`; `sdk.godot.native-crash` |
 | Java (`Servlet`, Spring, Spring Boot, JUL, Log4j2, Logback) | Envelope; native crash variant only where the pinned integration emits a minidump | `sdk.java.{servlet,spring,spring-boot,jul,log4j2,logback}.ordinary`; applicable `sdk.java.native-crash` |
 | JavaScript (each literal `@sentry/*` package listed above) | Envelope | `sdk.javascript.<normalized-package>.ordinary` for every listed package; the fixture sends an exception through that integration's default transport |
+| JavaScript WebAssembly | Envelope | `sdk.javascript.webassembly.ordinary` runs a deterministic WebAssembly module through the pinned JavaScript SDK family and asserts the default transport's ordinary error admission |
 | Kotlin Multiplatform | Envelope | `sdk.kotlin-multiplatform.ordinary` |
 | Native (C/C++, Crashpad, Breakpad, minidump, Qt, native WebAssembly) | Envelope and pinned non-Envelope minidump upload | `sdk.native.{c-cpp,crashpad,breakpad,minidump,qt,wasm}.ordinary`; `sdk.native.crash` |
 | .NET (each literal ASP.NET Core, Azure Functions Worker, Entity Framework, logging, log4net, MAUI, NLog, Serilog, WinForms, WinUI, WPF, Xamarin integration) | Envelope; minidump only where emitted by the pinned integration | `sdk.dotnet.<normalized-integration>.ordinary`; applicable `sdk.dotnet.native-crash` |
@@ -262,23 +265,25 @@ from an unrelated tenant.
 | `/api/0/organizations/<organization>/artifactbundle/assemble/` | `POST` source-map/artifact-bundle assembly with `checksum`, ordered `chunks`, `projects`, `version`, and optional `dist`; `202` remains pending until artifact processing completes. |
 | `/api/0/operations/<operation_id>/` | `GET` Watchtower compatibility polling extension for project/lifecycle/artifact operations that return an operation ID and do not have an upstream polling request. The operation ID is canonical UUID v7, tenant-scoped, non-reusable, and exposes only safe state. |
 | `/api/0/organizations/<organization>/releases/<version>/deploys/` | `GET` and `POST` deployment records. Deployment records are release metadata and do not schedule deployment work. |
-| Any other `/api/0/...` route | Any | Rejected as unsupported with a safe `404`, `405`, or `501` response and no persistence side effect. |
+| Any other `/api/0/...` route | Any | An unknown path returns safe `404` with no persistence side effect; an unsupported method on a known supported path returns `405`; explicitly unsupported capabilities are listed below and return `501`. |
 
 The following commonly probed upstream-shaped routes are explicitly
-unsupported: `POST /api/0/organizations/<organization>/releases/<version>/finalize/`
+unsupported and return `501 unsupported_capability` with no persistence side
+effect: `POST /api/0/organizations/<organization>/releases/<version>/finalize/`
 (the pinned CLI finalizes with `PUT` on the release resource),
-`/api/0/events/<event>/` (the project-scoped event route is required), and
-`/api/0/projects/<organization>/<project>/chunk-upload/` (capability is
-organization-scoped and upload/assembly use the files routes above). They
-return `404`, `405`, or `501` as appropriate and have no persistence side
-effect.
+`GET /api/0/events/<event>/` (the project-scoped event route is required), and
+`GET /api/0/projects/<organization>/<project>/chunk-upload/` (capability is
+organization-scoped and upload/assembly use the files routes above). Any
+method addressed to one of these explicitly unsupported paths has the same
+`501` result. Unknown paths return `404`, while an unsupported method on a
+known supported path returns `405`.
 
 Organization and project path slugs are compatibility aliases only. The
 adapter resolves them under the canonical tenant UUID and expected resource
 generation; a slug cannot select a resource in another tenant. A deleted
-resource's slug is permanently reserved and cannot be reused for a different
-resource generation. A replacement receives a new canonical UUID, alias, and
-credentials.
+resource's slug may be reused only after deletion completes and only by a new
+resource generation. A replacement receives a new canonical UUID, generation,
+and credentials.
 
 ## Wire contract
 
@@ -404,18 +409,21 @@ to these protocol limits. Rate-limit exhaustion returns `429` and
 
 ### Envelope framing and item behavior
 
-An Envelope is newline-delimited JSON headers followed by length-delimited
-items. The envelope header is required, the item length is authoritative,
+An Envelope is newline-delimited JSON headers followed by items. The envelope
+header is required, and each item uses either length-delimited or
+newline-delimited framing. When `length` is present it is authoritative,
 payload bytes must match the declared length, and trailing bytes other than the
-permitted final newline are invalid. The envelope's `event_id`, when present,
-must match its supported error event item. Empty Envelopes are structurally
-valid but have no accepted item.
+permitted final newline are invalid. When `length` is omitted, the item payload
+uses the permitted newline-delimited framing. The envelope's `event_id`, when
+present, must match its supported error event item. Empty Envelopes are
+structurally valid but have no accepted item.
 
 The adapter recognizes these bounded request fields. For the envelope header,
 `event_id`, `dsn`, `sent_at`, `sdk`, and `trace` are optional upstream fields;
 the DSN and event ID are checked against the authenticated project and the
 event ID is retained only as a scoped external identifier. Every item header
-requires `type` and `length`; `content_type`, `filename`, `attachment_type`,
+requires `type`; `length` is optional and selects length-delimited framing when
+present. `content_type`, `filename`, `attachment_type`,
 `content_encoding`, `item_count`, and `item_headers` are accepted only for the
 item types that define them. An `event` payload may contain the pinned
 client's `event_id`, `timestamp`, `platform`, `level`, `message`, `exception`,
@@ -447,10 +455,11 @@ Malformed framing, invalid JSON headers, invalid lengths, invalid compression,
 or an invalid supported item rejects the entire request. A structurally valid
 Envelope retains supported error/attachment items and individually excludes
 unsupported non-error items. An unsupported-only Envelope is durably accepted
-only as a bounded no-op when its framing is valid; it persists no payload and
-returns the normal ingestion acknowledgement. An empty Envelope follows the
-same no-op behavior. Exclusion diagnostics contain only item type, reason,
-count, project, request ID, and correlation ID.
+only as a bounded no-op when its framing is valid; it records bounded
+acceptance and handoff metadata, persists no payload bytes, and returns the
+normal ingestion acknowledgement. An empty Envelope follows the same no-op
+behavior. Exclusion diagnostics contain only item type, reason, count, project,
+request ID, and correlation ID.
 
 Unknown fields in known headers or payload DTOs are ignored at the adapter
 boundary unless the pinned upstream parser requires rejection for structural
@@ -460,9 +469,13 @@ cross-field identity checks remain enforced.
 
 ### Acknowledgement, errors, retries, and idempotency
 
-- A successful ingestion response means raw bytes, acceptance metadata, and a
-  recoverable processing handoff/outbox are durable. It does not mean canonical
-  storage, issue grouping, symbolication, or Query visibility.
+- A successful ingestion response for one or more accepted items means raw
+  bytes, acceptance metadata, and a recoverable processing handoff/outbox are
+  durable. It does not mean canonical storage, issue grouping, symbolication,
+  or Query visibility.
+- A successful no-op acknowledgement for an empty or unsupported-only Envelope
+  means only that bounded acceptance metadata and the no-op handoff are durable;
+  it does not imply that raw payload bytes were retained or accepted.
 - Management `202` means an operation is durably accepted and pending. A
   response is not rendered as completed until the owning lifecycle or artifact
   authority reports terminal success.
@@ -472,7 +485,9 @@ cross-field identity checks remain enforced.
   is provided for diagnostics.
 - Safe errors use the upstream-compatible status and shape required by the
   pinned client while including a stable Watchtower code and request ID.
-  Original causes and unrestricted payloads remain only in structured logs.
+  Original causes are represented only by bounded, redacted structured
+  diagnostics; raw and unrestricted customer payloads remain in owner-
+  controlled storage and are never logged.
 - Clients may retry `408`, `429`, `500`, `502`, `503`, and `504` according to
   `Retry-After` and bounded exponential backoff. The adapter does not retry a
   non-idempotent operation automatically after an unknown outcome.
@@ -598,11 +613,12 @@ execute deployment work, or activate unsupported release-health behavior.
 - Organization, project, operation, artifact, release-operation, and internal
   resource identities are canonical lowercase UUID v7 values at Watchtower
   boundaries and PostgreSQL `uuid` when persisted by their owner.
-- Sentry project IDs, organization slugs, project slugs, DSN key IDs, release
-  versions, issue IDs, and event IDs are compatibility aliases or scoped
-  external identifiers. They are resolved only after authentication and tenant
-  scope are known. Aliases are never globally unique primary keys and are
-  never reused across a deleted resource generation.
+- Sentry project IDs, DSN key IDs, release versions, issue IDs, and event IDs
+  are compatibility aliases or scoped external identifiers. Organization and
+  project slugs are scoped compatibility aliases. All are resolved only after
+  authentication and tenant scope are known; slugs may be reused only after
+  deletion completes for a new resource generation, while canonical IDs and
+  other scoped external identifiers are never reused across generations.
 - SDK event IDs are retained as `(tenant_id, project_id, external_event_id)`
   identifiers. Two projects may use the same event ID without collision or
   disclosure. An SDK event ID is never a canonical Watchtower primary key.
@@ -622,8 +638,9 @@ The following differences are intentional and are part of v1 compatibility:
    recent reauthentication, audit, and lifecycle fences override any Sentry
    token or permission interpretation.
 2. Watchtower canonical UUID v7 identities and tenant predicates override
-   Sentry's integer/string resource IDs. Compatibility aliases are scoped and
-   non-reusable.
+   Sentry's integer/string resource IDs. Canonical IDs and non-slug
+   compatibility aliases are scoped and non-reusable; organization and project
+   slugs may be reused only after deletion completes.
 3. Durable acceptance is earlier than processing completion and query
    visibility. Clients must not interpret a successful `POST` as symbolication,
    grouping, issue creation, or read availability.
