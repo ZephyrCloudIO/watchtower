@@ -140,7 +140,7 @@ separate package pin is shown.
 | `@sentry/expo-upload-sourcemaps` | `8.26.0` | Expo/React Native source maps | [npm](https://www.npmjs.com/package/@sentry/expo-upload-sourcemaps/v/8.26.0) |
 | `io.sentry:sentry-android-gradle-plugin` | `6.22.0` | Android ProGuard/R8 mapping and native symbol upload | [Maven Central 6.22.0](https://repo1.maven.org/maven2/io/sentry/sentry-android-gradle-plugin/6.22.0/) |
 | `sentry_dart_plugin` | `3.4.0` | Flutter symbol/source-map upload | [pub.dev](https://pub.dev/packages/sentry_dart_plugin/versions/3.4.0) |
-| `fastlane-plugin-sentry` | `2.6.3` | Apple dSYM and source-map upload | [RubyGems](https://rubygems.org/gems/fastlane-plugin-sentry/versions/2.6.3), [source](https://github.com/getsentry/sentry-fastlane-plugin) |
+| `fastlane-plugin-sentry` | `2.6.3` | Apple dSYM through standalone DIF upload and source maps through release-artifact upload | [RubyGems](https://rubygems.org/gems/fastlane-plugin-sentry/versions/2.6.3), [source](https://github.com/getsentry/sentry-fastlane-plugin) |
 | `@sentry/babel-plugin-component-annotate` | `5.3.0` | Component annotation only; the resulting SDK request remains covered by its SDK/plugin fixture | [npm](https://www.npmjs.com/package/@sentry/babel-plugin-component-annotate/v/5.3.0) |
 
 Each plugin row has its own release-blocking fixture. `plugin.<name>` uses the
@@ -155,7 +155,7 @@ once per shared implementation:
 | Expo upload | Artifact bundle/release-file route with React Native release and dist fields | `plugin.expo-upload-sourcemaps.source-map` verifies the Expo bundle, source map, release, dist, and processing state |
 | Android Gradle | DIF chunk capability, chunk upload, and DIF assembly routes | `plugin.android-gradle.debug-file` verifies ProGuard/R8 mapping and native symbol registration, duplicate chunks, assembly, and polling |
 | `sentry_dart_plugin` | Artifact bundle/release-file route | `plugin.dart.source-map` verifies Flutter symbol/source-map upload and asynchronous completion |
-| Fastlane Sentry | Artifact bundle/release-file route | `plugin.fastlane.debug-file` verifies dSYM/source-map upload, release association, and asynchronous completion |
+| Fastlane Sentry | DIF chunk capability, project-scoped DIF chunk upload, and DIF assembly for dSYMs; release artifact/bundle route for source maps | `plugin.fastlane.debug-file` verifies release-independent dSYM upload through DIF assembly and `plugin.fastlane.source-map` verifies source-map upload through the release-artifact path |
 | Component annotation and SDK-bundled upload scripts | No standalone server route; the resulting SDK or artifact request uses the row's ordinary or artifact path | `plugin.bundled-script.<normalized-name>` verifies the generated request only; annotation is not granted a separate capability |
 
 The official catalog also lists `@sentry/babel-plugin-component-annotate` and
@@ -232,7 +232,7 @@ to a native route.
 
 | Route | Methods | Authentication | v1 behavior |
 | --- | --- | --- | --- |
-| `/api/<project_id>/envelope/` | `POST` | Collection-only DSN in `X-Sentry-Auth`, DSN query parameters, or the DSN URL used by the pinned SDK | Supported for error events, attachments, client reports, and native crash items. Durable acceptance is returned before asynchronous processing/query visibility. |
+| `/api/<project_id>/envelope/` | `POST` | Collection-only DSN in `X-Sentry-Auth`, DSN query parameters, or the DSN URL used by the pinned SDK | Supported for error events, attachments, client reports, and native crash items. Every structurally valid Envelope returns `200` with an empty response body, including accepted, mixed, empty, and unsupported-only Envelopes; durable acceptance is returned before asynchronous processing/query visibility. |
 | `/api/<project_id>/envelope/` | `OPTIONS` | Project alias and request `Origin` | Supported only for a configured project-origin CORS preflight. Returns `204` with no persistence side effect; a disallowed origin receives `403` with no CORS allow headers. |
 | `/api/<project_id>/store/` | `POST` | Collection-only DSN | Supported legacy JSON error path required by a pinned client. The body is converted to one error event and follows Envelope admission semantics. |
 | `/api/<project_id>/minidump/` | `POST` | Collection-only DSN | Supported for pinned crash workflows whose fixture specifies the non-Envelope minidump path. `multipart/form-data` and the pinned client field names are accepted. |
@@ -279,9 +279,10 @@ the allowlist, or a project with no configured allowlist, receives
 | `/api/0/organizations/<organization>/releases/<version>/commits/` | `GET` bounded release commit metadata required by `sentry-cli info`; commit association writes are unsupported. |
 | `/api/0/organizations/<organization>/releases/<version>/previous-with-commits/` | `GET` previous release summary required by `sentry-cli info`, subject to project and tenant scope. |
 | `/api/0/projects/<organization>/<project>/releases/<version>/files/` | `GET` file listing, `POST` upload, and `DELETE` only where required for an idempotent failed upload cleanup. Source maps and debug files are handled by the artifact authority; deletion never bypasses lifecycle rules. |
-| `/api/0/organizations/<organization>/chunk-upload/` | `GET` chunk capability for the pinned sentry-cli. The response supplies the upload URL, chunk size, request limits, concurrency, hash algorithm, and accepted compression. |
-| `/api/0/projects/<organization>/<project>/files/difs/chunks/` (or the exact upload URL returned by the capability response) | `POST` multipart chunk upload using `file` or `file_gzip` parts keyed by SHA-1 checksum. A matching checksum is idempotent; conflicting bytes are `409`. |
-| `/api/0/projects/<organization>/<project>/files/difs/assemble/` | `POST` DIF assembly with the pinned sentry-cli request map. The response reports each digest's `state`, `missingChunks`, bounded `detail`, and registered DIF when complete. Polling repeats this request with the same body and idempotency key. |
+| `/api/0/organizations/<organization>/chunk-upload/` | `GET` organization-scoped artifact-bundle chunk capability for the pinned sentry-cli. The response supplies the upload URL, chunk size, request limits, concurrency, hash algorithm, and accepted compression. |
+| `/api/0/projects/<organization>/<project>/chunk-upload/` | `GET` project-scoped DIF chunk capability for the pinned sentry-cli. The response supplies a project-bound upload URL, chunk size, request limits, concurrency, hash algorithm, and accepted compression. |
+| `/api/0/projects/<organization>/<project>/files/difs/chunks/` (or the exact project-bound upload URL returned by the DIF capability response) | `POST` multipart chunk upload using `file` or `file_gzip` parts keyed by SHA-1 checksum. A matching checksum is idempotent; conflicting bytes are `409`. |
+| `/api/0/projects/<organization>/<project>/files/difs/assemble/` | `POST` DIF assembly with the pinned sentry-cli request map. The response reports each digest's `state`, `missingChunks`, bounded `detail`, and registered DIF when complete. Polling repeats this request with the same body and optional idempotency key. |
 | `/api/0/organizations/<organization>/artifactbundle/assemble/` | `POST` source-map/artifact-bundle assembly with `checksum`, ordered `chunks`, `projects`, `version`, and optional `dist`; `202` remains pending until artifact processing completes. |
 | `/api/0/operations/<operation_id>/` | `GET` Watchtower compatibility polling extension for project/lifecycle/artifact operations that return an operation ID and do not have an upstream polling request. The operation ID is canonical UUID v7, tenant-scoped, non-reusable, and exposes only safe state. |
 | `/api/0/organizations/<organization>/releases/<version>/deploys/` | `GET` and `POST` deployment records. Deployment records are release metadata and do not schedule deployment work. |
@@ -290,10 +291,8 @@ the allowlist, or a project with no configured allowlist, receives
 The following commonly probed upstream-shaped routes are explicitly
 unsupported and return `501 unsupported_capability` with no persistence side
 effect: `POST /api/0/organizations/<organization>/releases/<version>/finalize/`
-(the pinned CLI finalizes with `PUT` on the release resource),
-`GET /api/0/events/<event>/` (the project-scoped event route is required), and
-`GET /api/0/projects/<organization>/<project>/chunk-upload/` (capability is
-organization-scoped and upload/assembly use the files routes above). Any
+(the pinned CLI finalizes with `PUT` on the release resource) and
+`GET /api/0/events/<event>/` (the project-scoped event route is required). Any
 method addressed to one of these explicitly unsupported paths has the same
 `501` result. Unknown paths return `404`, while an unsupported method on a
 known supported path returns `405`.
@@ -343,7 +342,7 @@ credential material nor unrestricted customer payloads into internal messages.
 
 | Operation | Required request fields | Successful response fields |
 | --- | --- | --- |
-| Envelope/event admission | Project DSN, project alias, Envelope headers, item headers/payloads, and a supported event ID for event items | HTTP status, request ID, and the preserved scoped external event ID when the client expects a body |
+| Envelope/event admission | Project DSN, project alias, Envelope headers, item headers/payloads, and a supported event ID for event items | Envelope `POST` returns `200` with an empty body and request ID headers; legacy or client-specific body expectations retain the preserved scoped external event ID |
 | Organization/project read | Organization/project compatibility alias and current management credential | Upstream-compatible resource DTO containing only currently readable fields, canonical-safe pagination link, and request ID |
 | Project create/update/delete | Organization scope, project name/platform or changed settings, current authorization, observed version for settings, and idempotency key for create/delete | Resource alias and canonical-safe DTO, or `202` operation ID while lifecycle barriers remain pending |
 | DSN issue/rotate/revoke | Project scope, requested DSN name/platform where supplied, current Manage authority, and idempotency for mutation | Public DSN and non-secret metadata; management-token plaintext is never returned by a compatibility route |
@@ -375,12 +374,19 @@ names and safe validation reasons only.
 | `invalid_compression` | 400 | The declared gzip content encoding is malformed or cannot be decompressed |
 | `invalid_multipart` | 400 | Multipart framing or boundary syntax is malformed |
 | `invalid_envelope` | 400 | Invalid framing, length, header, or supported item after transport decoding |
+| `internal_error` | 500 | Internal, unknown, or data-loss failure; fixed safe message and request ID, with no original cause |
 | `unsupported_capability` | 501 | Explicitly unsupported route, format, item, workflow, or capability |
 | `conflict` | 409 | Stale version, conflicting alias/digest, reused idempotency key, or lifecycle state |
 | `payload_too_large` | 413 | A protocol or owner limit was exceeded |
 | `rate_limited` | 429 | A principal, organization, project, collection, or artifact quota was exhausted |
 | `unavailable` | 503 | Authorization, quota, owner, lifecycle, or processing dependency cannot be evaluated safely |
 | `deadline_exceeded` | 504 | A bounded synchronous operation exceeded its deadline without being reported complete |
+
+Runtime boundary codes `unknown`, `internal`, and `data_loss` map to the
+deterministic `500 internal_error` response. Its pinned-client error shape
+contains only the stable code, the fixed message `Internal server error`, the
+request ID, and applicable retry metadata; the original cause and unrestricted
+diagnostics remain outside the response.
 
 An accepted request is never converted into a synchronous `500` merely because
 processing is delayed. The response identifies durable acceptance or pending
@@ -410,8 +416,10 @@ payload:
 Malformed content after successful decompression, including invalid Envelope
 framing or JSON, uses `400 invalid_envelope`. A management request with an
 entity body must use `application/json`; a bodyless management read, probe, or
-poll may omit `Content-Type`. Response bodies are JSON for management routes
-and empty or JSON-safe acknowledgement bodies for ingestion.
+poll may omit `Content-Type`. Response bodies are JSON for management routes;
+an Envelope ingestion `POST` is always `200` with a zero-length body, while
+other ingestion routes use their pinned empty or JSON-safe acknowledgement
+body.
 
 For a non-Envelope crash path whose fixture specifies minidump upload, the
 pinned native uploader sends a bounded `upload_file_minidump` binary multipart
@@ -443,8 +451,14 @@ request can be recovered safely.
 | One source-map or debug-file artifact | 50,000,000 bytes |
 | One chunk | 20,000,000 bytes |
 | Decompressed multipart/request | 100,000,000 bytes |
+| Decompressed management JSON request | 10,000,000 bytes |
 | One assembled release artifact | 1,000,000,000 bytes |
 | Multipart part count | 1,024 |
+| DIF assembly map entries | 256 digests |
+| DIF chunks per assembled file | 256 checksums |
+| DIF assembly project scope | 1 project, selected by the route |
+| Artifact-bundle assembly chunks | 1,024 checksums |
+| Artifact-bundle assembly project IDs | 100 project IDs |
 | Management response page | 100 records |
 | Management request filter values | 256 bytes each |
 
@@ -460,6 +474,19 @@ enforces this aggregate limit while streaming, before persisting any part, and
 counts duplicate, conflicting, unknown, and otherwise rejected parts toward
 the total. The part-count and per-part limits do not permit a request to exceed
 the aggregate limit.
+
+For every management request with a JSON entity body, including mutation and
+assembly routes, the adapter counts decompressed bytes while streaming identity
+or gzip content and stops at `10,000,000` bytes before JSON parsing, field
+validation, lookup, or persistence. Exceeding that limit returns
+`413 payload_too_large` without a side effect; bodyless management requests are not
+subject to this limit.
+
+Assembly cardinality is checked before checksum or project lookup. Every
+submitted digest, checksum reference, and project ID counts toward its
+applicable limit, including repeated, missing, or zero-byte chunk references.
+An over-limit DIF or artifact-bundle assembly returns `413 payload_too_large`
+without persisting or looking up any entry.
 
 ### Envelope framing and item behavior
 
@@ -518,9 +545,9 @@ or an invalid supported item rejects the entire request. A structurally valid
 Envelope retains supported error/attachment items and individually excludes
 unsupported non-error items. An unsupported-only Envelope is durably accepted
 only as a bounded no-op when its framing is valid; it records bounded
-acceptance and handoff metadata, persists no payload bytes, and returns the
-normal ingestion acknowledgement. An empty Envelope follows the same no-op
-behavior. Exclusion diagnostics contain only item type, reason, count, project,
+acceptance and handoff metadata, persists no payload bytes, and returns `200`
+with an empty response body. An empty Envelope follows the same no-op behavior.
+Exclusion diagnostics contain only item type, reason, count, project,
 request ID, and correlation ID.
 
 Unknown fields in known headers or payload DTOs are ignored at the adapter
@@ -531,6 +558,10 @@ cross-field identity checks remain enforced.
 
 ### Acknowledgement, errors, retries, and idempotency
 
+- Every structurally valid Envelope `POST`, whether it retains supported items
+  or is an empty/unsupported-only no-op, returns HTTP `200` with a zero-length
+  response body. Request IDs remain response headers, and no `202` or `204`
+  success is used for Envelope admission.
 - A successful ingestion response for one or more accepted items means raw
   bytes, acceptance metadata, and a recoverable processing handoff/outbox are
   durable. It does not mean canonical storage, issue grouping, symbolication,
@@ -641,6 +672,14 @@ checksum/debug identity with the same name and ordered chunks is a successful
 duplicate. Conflicting bytes, debug identity, name, or chunk ordering returns
 `409`.
 
+DIF assembly does not require a client idempotency key. When absent, the
+adapter derives the operation identity from `(tenant_id, project_id,
+full_file_checksum, canonical_request_body_digest)` where the digest excludes
+the optional key; a matching retry resumes the same operation. When supplied,
+the client key is bound to that canonical
+body digest and a reuse with different content returns `409`; key-conflict
+behavior is not applied when no key was supplied.
+
 Artifact upload, symbolication, and event enrichment are asynchronous. A
 successful upload means the artifact authority durably accepted the artifact
 or an idempotent equivalent; it does not mean a prior event has been
@@ -649,16 +688,19 @@ failure. Artifact references remain subject to project retention and deletion.
 
 ### Chunk upload, assembly, and polling
 
-The pinned sentry-cli `GET /api/0/organizations/<organization>/chunk-upload/`
-response is JSON with `url`, `chunksPerRequest`, `maxRequestSize`,
-`maxFileSize`, `maxWait`, `hashAlgorithm`, `chunkSize`, `concurrency`, and
-`compression`. A chunk request is multipart: each `file` or `file_gzip` part
-is named by its lowercase SHA-1 checksum. A DIF assembly request is a JSON map
-from the full-file SHA-1 checksum to `{name, debug_id?, chunks}`; its response
-is the same checksum map with `{state, missingChunks, detail?, dif?}` and does
-not require release or distribution fields. An artifact-bundle assembly request
-contains `{checksum, chunks, projects, version, dist?}` and requires release
-identity. Artifact-bundle chunks negotiated by the organization capability are
+The organization-scoped sentry-cli capability at
+`GET /api/0/organizations/<organization>/chunk-upload/` returns JSON with
+`url`, `chunksPerRequest`, `maxRequestSize`, `maxFileSize`, `maxWait`,
+`hashAlgorithm`, `chunkSize`, `concurrency`, and `compression` for
+artifact-bundle uploads. The project-scoped DIF capability returns the same
+bounded capability shape with a project-bound `url`. A chunk request is
+multipart: each `file` or `file_gzip` part is named by its lowercase SHA-1
+checksum. A DIF assembly request is a JSON map from the full-file SHA-1
+checksum to `{name, debug_id?, chunks}`; its response is the same checksum map
+with `{state, missingChunks, detail?, dif?}` and does not require release or
+distribution fields. An artifact-bundle assembly request contains `{checksum,
+chunks, projects, version, dist?}` and requires release identity.
+Artifact-bundle chunks negotiated by the organization capability are
 organization-scoped transient records keyed by organization and lowercase
 chunk checksum; their upload request intentionally carries no project field.
 The `projects` list is authoritative at assembly, where Watchtower verifies
@@ -674,14 +716,15 @@ individual part and the total part count are within their separate limits.
 
 The pinned sentry-cli chunk workflow is:
 
-1. Probe the project/organization chunk capability with a read-only request.
+1. Probe the project-scoped DIF capability or organization-scoped
+   artifact-bundle capability with a read-only request.
 2. Upload each content-addressed chunk with its checksum; artifact-bundle
    uploads are organization-scoped and carry no project field, while DIF
    uploads use their project route.
 3. Retry a chunk safely by checksum; a matching existing chunk is success.
 4. Submit the bounded DIF assembly request containing the ordered checksum
-   list, logical filename, optional debug ID, and idempotency key; artifact
-   bundle assembly additionally carries its project list, version, and
+   list, logical filename, optional debug ID, and optional idempotency key;
+   artifact-bundle assembly additionally carries its project list, version, and
    optional distribution.
 5. Poll the returned operation/status identity with bounded backoff.
 6. Expose terminal artifact registration only after API and artifact authority
@@ -776,7 +819,7 @@ Customer-facing troubleshooting is English Markdown and must explain:
 
 - configure the SDK DSN for collection and the Watchtower URL plus management
   credential separately for CLI/plugins;
-- distinguish `401`, `403`, `404`, `409`, `413`, `429`, and `503`;
+- distinguish `401`, `403`, `404`, `409`, `413`, `429`, `500`, and `503`;
 - use the returned request ID when reporting a failure;
 - wait for asynchronous symbolication, grouping, and Query projection after a
   durable acceptance;
@@ -812,13 +855,16 @@ exercise:
   oversized requests;
 - bodyless management reads, capability probes, release reads, and polling
   without `Content-Type`, plus body-bearing management requests with accepted
-  and mismatched content types;
+  and mismatched content types, including identity/gzip JSON bodies at and over
+  the `10,000,000`-byte decompressed limit;
 - minidump uploads with the exact fixture-emitted Crashpad scalar annotations,
   optional Sentry metadata, rejected unlisted file parts, and bounded fields;
 - empty, unsupported-only, supported-only, and mixed Envelopes, including an
-  envelope-level event ID on an excluded-only Envelope;
+  envelope-level event ID on an excluded-only Envelope, all expecting `200`
+  with a zero-length response body;
 - duplicate event IDs, conflicting event IDs, duplicate chunks, interrupted
-  assembly, retries, polling, and lost responses;
+  assembly, optional and conflicting DIF idempotency keys, retries, polling,
+  and lost responses;
 - required release-version rejection and release-artifact identity across
   release, distribution, artifact type, and logical filename, plus
   release-independent DIF duplicates and checksum/debug identity conflicts;
@@ -828,9 +874,11 @@ exercise:
 - pagination, cursor binding, malformed and expired cursor `400` results, stale
   and cross-tenant cursor `403` results, rate-limit headers, unknown fields, and
   every safe error class;
+- project-scoped DIF and organization-scoped artifact-bundle capability probes;
 - chunk requests at and over the advertised `maxRequestSize`, including
   duplicate and rejected parts, with `413` and no partial persistence for an
-  over-limit request;
+  over-limit request, plus DIF/artifact-bundle assembly cardinality at and
+  over each explicit digest, chunk, and project limit before lookup;
 - valid, expired, revoked, insufficient-scope, cross-tenant, stale-projection,
   suspended, disabled, deleting, and deleted resources;
 - organization/project reads, creation, update, deletion, DSN issuance,
