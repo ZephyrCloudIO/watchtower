@@ -399,6 +399,7 @@ request can be recovered safely.
 | Resource | Limit |
 | --- | ---: |
 | Decompressed Envelope or legacy event request | 50,000,000 bytes |
+| Envelope item count | 1,024 items |
 | One Envelope item payload | 20,000,000 bytes |
 | One JSON error event | 1,000,000 bytes |
 | One attachment or native crash item | 20,000,000 bytes |
@@ -425,6 +426,11 @@ permitted final newline are invalid. When `length` is omitted, the item payload
 uses the permitted newline-delimited framing. The envelope's `event_id`, when
 present, must match its supported error event item. Empty Envelopes are
 structurally valid but have no accepted item.
+
+The adapter counts every item header, including unknown and individually
+excluded items, against the Envelope item-count limit. An Envelope with more
+than 1,024 items is rejected with `413` before any item payload is allocated or
+processed.
 
 The adapter recognizes these bounded request fields. For the envelope header,
 `event_id`, `dsn`, `sent_at`, `sdk`, and `trace` are optional upstream fields;
@@ -500,9 +506,13 @@ cross-field identity checks remain enforced.
   `Retry-After` and bounded exponential backoff. The adapter does not retry a
   non-idempotent operation automatically after an unknown outcome.
 - Envelope and event submissions are idempotent by the tuple
-  `(tenant_id, project_id, external_event_id, payload_digest)` within the
-  event retention horizon. The same tuple returns the original acceptance;
-  the same event ID with a different digest returns `409` and is not merged.
+  `(tenant_id, project_id, external_event_id, payload_digest)` while the
+  Ingest-owned acceptance record containing the payload digest and original
+  acceptance remains retained. The same tuple returns the original
+  acceptance; the same event ID with a different digest returns `409` and is
+  not merged. After the acceptance record is retired following handoff or
+  expiry, this compatibility contract makes no historical deduplication or
+  conflicting-digest guarantee for a retry.
 - Creation, deletion, rotation, release finalization, chunk assembly, and
   deployment writes use the control-plane idempotency tuple and the client
   idempotency key where supplied. Reusing a key with different content returns
@@ -564,9 +574,12 @@ The CLI and every listed build plugin use the configured Watchtower URL and
 Watchtower management credential. SDK DSNs are not used for artifact writes.
 The contract supports JavaScript source maps, native dSYMs and Breakpad/Crashpad
 debug files, Android ProGuard/R8 mappings, and the artifact metadata required by
-the pinned clients. Uploads are content-addressed and idempotent; identical
-content is a successful duplicate, conflicting content at the same release
-and logical filename is `409`.
+the pinned clients. Uploads are content-addressed and idempotent within the
+identity `(project, release, dist, artifact type, logical filename)`; an absent
+`dist` is a distinct identity value from any supplied distribution. Identical
+content within the same identity is a successful duplicate, while conflicting
+content within that identity is `409`. Different distributions may therefore
+reuse a logical filename within one release.
 
 Artifact upload, symbolication, and event enrichment are asynchronous. A
 successful upload means the artifact authority durably accepted the artifact
