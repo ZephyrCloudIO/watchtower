@@ -232,7 +232,7 @@ to a native route.
 
 | Route | Methods | Authentication | v1 behavior |
 | --- | --- | --- | --- |
-| `/api/<project_id>/envelope/` | `POST` | Collection-only DSN in `X-Sentry-Auth`, DSN query parameters, or the DSN URL used by the pinned SDK | Supported for an active project for error events, attachments, client reports, and native crash items. Every structurally valid, non-conflicting Envelope returns `200` with an empty response body, including accepted, mixed, empty, and unsupported-only Envelopes; durable acceptance is returned before asynchronous processing/query visibility. An idempotency or digest conflict returns the `409 conflict` response defined below instead of the blanket `200`. Disabled, deleting, and deleted projects use the lifecycle admission responses below before payload acceptance. |
+| `/api/<project_id>/envelope/` | `POST` | Collection-only DSN in `X-Sentry-Auth`, DSN query parameters, or the DSN URL used by the pinned SDK | Supported for an active project for error events, attachments, client reports, and native crash items. Every structurally valid, non-conflicting Envelope returns `200` with an empty response body, including accepted, mixed, empty, and unsupported-only Envelopes; durable acceptance is returned before asynchronous processing/query visibility. An idempotency or digest conflict returns the `409 conflict` response defined below instead of the blanket `200`. Disabled and deleting projects use the lifecycle admission responses below before payload acceptance. A deleted project's pre-deletion DSN is no longer current and returns `401 invalid_authentication` before project lookup. |
 | `/api/<project_id>/envelope/` | `OPTIONS` | Collection-only DSN in the DSN query parameters or DSN URL, project alias, and request `Origin` | Supported only for a configured project-origin CORS preflight. The DSN authenticates and tenant-binds the project alias before the allowlist is read. Returns `204` with no persistence side effect; missing or invalid DSN authentication receives `401 invalid_authentication`, while a missing, malformed, or disallowed origin, including a project with no configured allowlist, receives `403 permission_denied` with no CORS allow headers. |
 | `/api/<project_id>/store/` | `POST` | Collection-only DSN | Supported legacy JSON error path required by a pinned client. The body is converted to one error event and follows Envelope admission semantics. Successful admission returns `200` with a zero-length body and request-ID headers. |
 | `/api/<project_id>/minidump/` | `POST` | Collection-only DSN | Supported for pinned crash workflows whose fixture specifies the non-Envelope minidump path. `multipart/form-data` and the pinned client field names are accepted. Successful admission returns `200` with a zero-length body and request-ID headers. |
@@ -269,18 +269,22 @@ canonical UUID rule.
 
 ### Project lifecycle admission
 
-Collection admission evaluates the project lifecycle state before parsing a new
-request. After bounded transport decoding and event parsing, Ingest evaluates
-the environment retirement fence before persisting or durably accepting it. An `active`
-project follows the route-specific behavior above, including `200` with an
-empty body for a structurally valid, non-conflicting Envelope. A `disabled`
-project returns `403 permission_denied` with detail `Permission denied.`; a
-`deleting` project returns `409 conflict` with detail `The request conflicts
-with the current resource state.`; and a `deleted` project returns `404
+Collection admission authenticates the collection credential before evaluating
+the project lifecycle or parsing a new request. Project deletion revokes every
+project DSN, so a collection request using a pre-deletion DSN is no longer
+authenticated and returns `401 invalid_authentication` before project lookup.
+For an authenticated current DSN, an `active` project follows the route-specific
+behavior above, including `200` with an empty body for a structurally valid,
+non-conflicting Envelope. A `disabled` project returns `403
+permission_denied` with detail `Permission denied.`; a `deleting` project
+returns `409 conflict` with detail `The request conflicts with the current
+resource state.`. Project-bound upload or assembly requests authenticated with
+management credentials evaluate the lifecycle after authentication: an `active`
+project follows the route-specific behavior, a `disabled` project returns `403`,
+a `deleting` project returns `409`, and a `deleted` project returns `404
 not_found`.
-These lifecycle responses apply to collection admission and every
-project-bound upload or assembly request, and every rejected request persists
-no payload, acceptance record, attachment bytes, or operation state.
+These lifecycle responses and authentication failures persist no payload,
+acceptance record, attachment bytes, or operation state.
 Organization-scoped chunk staging is project-neutral because its request carries
 no project identity, but it is not available to every organization member. Both
 the organization capability `GET` and the multipart `POST` at its returned URL
@@ -688,7 +692,9 @@ read receives the ordinary suspension response.
 
 - Collection routes accept only a current project-scoped collection DSN. A DSN
   does not grant management, query, artifact, release, issue, or event-read
-  authority. Environment names are data, not authorization boundaries.
+  authority. Project deletion revokes every project DSN; a pre-deletion DSN is
+  not a tombstoned credential and cannot select a deleted project. Environment
+  names are data, not authorization boundaries.
 - Management routes accept a current Watchtower personal token or explicitly
   scoped organization service token except where the native control-plane
   action requires a user session. Project deletion accepts only a current
@@ -808,6 +814,13 @@ payloads into internal messages.
 
 ### Organization and project DTOs
 
+Every non-null timestamp string emitted in a compatibility DTO is serialized in
+UTC with exactly nine fractional decimal digits as
+`YYYY-MM-DDTHH:mm:ss.sssssssssZ`. Nullable timestamp fields use JSON `null`
+when absent. Request timestamp inputs may accept the field-specific RFC 3339
+grammar below, but are normalized to this representation before storage,
+digest construction, and response serialization.
+
 Organization and project reads use the following minimal safe schemas. Every
 listed field is present; `platform` is the only nullable project field. List routes
 return arrays of the same objects, and pagination remains in the `Link` header
@@ -820,7 +833,7 @@ are omitted, never emitted as `null`, and never become an extension surface.
 | Organization | `slug` | Required string compatibility alias |
 | Organization | `name` | Required string |
 | Organization | `status` | Required enum: `active`, `suspended`, or `deleting` |
-| Organization | `dateCreated` | Required RFC 3339 UTC string |
+| Organization | `dateCreated` | Required UTC timestamp serialized exactly as `YYYY-MM-DDTHH:mm:ss.sssssssssZ` |
 | Organization | `isEarlyAdopter` | Required boolean, always `false` in the compatibility representation |
 | Organization | `require2FA` | Required boolean, always `false` in the compatibility representation |
 | Project | `id` | Required non-empty string compatibility alias; never a Watchtower canonical ID |
@@ -828,7 +841,7 @@ are omitted, never emitted as `null`, and never become an extension surface.
 | Project | `name` | Required string |
 | Project | `platform` | Nullable string; `null` means no platform is configured |
 | Project | `status` | Required enum: `active`, `disabled`, or `deleting` |
-| Project | `dateCreated` | Required RFC 3339 UTC string |
+| Project | `dateCreated` | Required UTC timestamp serialized exactly as `YYYY-MM-DDTHH:mm:ss.sssssssssZ` |
 | Project | `organization` | Required object containing exactly `id`, `slug`, and `name` using the Organization field types above |
 | Project | `browser_origins` | Required array of canonical serialized origin strings; an empty array means no browser origin is allowed |
 
@@ -880,7 +893,7 @@ only representation of an absent nullable Release timestamp.
 | Artifact | `release` | Nullable release version string |
 | Artifact | `dist` | Nullable distribution string |
 | Artifact | `project` | Nullable project compatibility alias string |
-| Artifact | `dateCreated` | Required RFC 3339 UTC string |
+| Artifact | `dateCreated` | Required UTC timestamp serialized exactly as `YYYY-MM-DDTHH:mm:ss.sssssssssZ` |
 | Artifact | `state` | Required enum: `accepted`, `processing`, `processed`, or `failed` |
 | DIF | `id` | Required non-empty string compatibility alias; never a Watchtower canonical ID |
 | DIF | `debugId` | Nullable lowercase canonical hyphenated UUID string; `null` when no upstream `debug_id` is supplied |
@@ -895,23 +908,23 @@ only representation of an absent nullable Release timestamp.
 | DIF | `state` | Required sentry-cli enum: `not_found`, `created`, `assembling`, `ok`, or `error` |
 | DIF | `missingChunks` | Required array of lowercase 40-character hexadecimal SHA-1 values; empty when complete |
 | DIF | `detail` | Nullable bounded safe processing detail |
-| DIF | `dateCreated` | Required RFC 3339 UTC string |
+| DIF | `dateCreated` | Required UTC timestamp serialized exactly as `YYYY-MM-DDTHH:mm:ss.sssssssssZ` |
 | DSN | `id` | Required non-empty string compatibility alias; never a Watchtower canonical ID |
 | DSN | `name` | Required string |
 | DSN | `public` | Required public DSN key string |
 | DSN | `projectId` | Required project compatibility alias string |
 | DSN | `projectSlug` | Required project slug string |
 | DSN | `isActive` | Required boolean |
-| DSN | `dateCreated` | Required RFC 3339 UTC string |
+| DSN | `dateCreated` | Required UTC timestamp serialized exactly as `YYYY-MM-DDTHH:mm:ss.sssssssssZ` |
 | DSN | `dsn` | Required public DSN URL; it contains no management credential |
 | DSN | `browserOrigins` | Required array of canonical serialized origin strings |
 | Deployment | `id` | Required non-empty string compatibility alias; never a Watchtower canonical ID |
 | Deployment | `environment` | Required string |
 | Deployment | `name` | Nullable string |
 | Deployment | `url` | Nullable HTTP(S) URL |
-| Deployment | `dateStarted` | Nullable RFC 3339 UTC string |
-| Deployment | `dateFinished` | Required RFC 3339 UTC string; the deployment request `timestamp` is the completion time |
-| Deployment | `dateCreated` | Required RFC 3339 UTC string; equal to the deployment request `timestamp` and `dateFinished` |
+| Deployment | `dateStarted` | Nullable UTC timestamp serialized exactly as `YYYY-MM-DDTHH:mm:ss.sssssssssZ`; always `null` in v1 |
+| Deployment | `dateFinished` | Required UTC timestamp serialized exactly as `YYYY-MM-DDTHH:mm:ss.sssssssssZ`; the deployment request `timestamp` is the completion time |
+| Deployment | `dateCreated` | Required UTC timestamp serialized exactly as `YYYY-MM-DDTHH:mm:ss.sssssssssZ`; equal to the deployment request `timestamp` and `dateFinished` |
 | Deployment | `release` | Required object containing exactly the non-empty release version string `version` |
 
 ### DSN mutation request and response bodies
@@ -1117,8 +1130,8 @@ surface.
 | Issue | `metadata` | Required object containing exactly nullable string fields `type`, `value`, `filename`, and `function` |
 | Issue | `numComments` | Required non-negative integer |
 | Issue | `assignedTo` | Nullable object containing required `type`, `id`, and `name` strings plus optional `email` |
-| Issue | `firstSeen` | Required RFC 3339 UTC string |
-| Issue | `lastSeen` | Required RFC 3339 UTC string |
+| Issue | `firstSeen` | Required UTC timestamp serialized exactly as `YYYY-MM-DDTHH:mm:ss.sssssssssZ` |
+| Issue | `lastSeen` | Required UTC timestamp serialized exactly as `YYYY-MM-DDTHH:mm:ss.sssssssssZ` |
 | Issue | `count` | Required non-negative decimal string, preserving the pinned Sentry representation |
 | Issue | `userCount` | Required non-negative integer |
 | Event | `id` | Required lowercase 32-character external event ID |
@@ -1127,8 +1140,8 @@ surface.
 | Event | `message` | Nullable string |
 | Event | `title` | Required string derived from the normalized event by the deterministic rule below |
 | Event | `culprit` | Nullable string derived by the deterministic projection below |
-| Event | `dateCreated` | Required RFC 3339 UTC string derived from the accepted event `timestamp`; when `timestamp` is omitted, this equals `dateReceived` |
-| Event | `dateReceived` | Required RFC 3339 UTC string derived from the canonical `accepted_at` instant; this field is authoritative for event-list ordering |
+| Event | `dateCreated` | Required UTC timestamp serialized exactly as `YYYY-MM-DDTHH:mm:ss.sssssssssZ`, derived from the accepted event `timestamp`; when `timestamp` is omitted, this equals `dateReceived` |
+| Event | `dateReceived` | Required UTC timestamp serialized exactly as `YYYY-MM-DDTHH:mm:ss.sssssssssZ`, derived from the canonical `accepted_at` instant; this field is authoritative for event-list ordering |
 | Event | `platform` | Nullable string |
 | Event | `level` | Nullable enum: `fatal`, `error`, `warning`, `info`, or `debug`; emitted as `null` when the normalized event omitted `level` |
 | Event | `tags` | Required array of objects containing required string fields `key` and `value`, plus optional string `query`; one object is emitted per normalized tag in RFC 8785 canonical key order, `key` and `value` use the normalized tag member, `query` is always omitted because normalized tags have no query metadata, and the array is empty when no tags are present |
@@ -1198,7 +1211,8 @@ Event lists order by `dateReceived DESC`, then external event ID, regardless of
 `dateCreated`.
 
 `Issue.statusDetails` is a closed object. A valid ignore contributes the
-non-negative integer `ignoreCount`, RFC 3339 UTC `ignoreUntil`, non-negative
+non-negative integer `ignoreCount`, `ignoreUntil` serialized exactly as
+`YYYY-MM-DDTHH:mm:ss.sssssssssZ`, non-negative
 integer `ignoreUserCount`, non-negative integer `ignoreUserWindow`, and
 non-negative integer `ignoreWindow`; these five members are present only for a
 valid ignore condition. An applicable ignore or release/commit resolution may
@@ -1209,8 +1223,8 @@ issue; `inRelease` is a non-empty release-version string only for a
 resolved-in-release issue; and `inCommit` is a non-empty commit identifier
 string only for a commit resolution. A reprocessing issue contributes the
 non-negative integer `pendingEvents` and nullable `info`; when non-null,
-`info` is exactly `{dateCreated: RFC-3339-UTC string, syncCount: non-negative
-integer, totalEvents: non-negative integer}`. All other members are omitted,
+`info` is exactly `{dateCreated: YYYY-MM-DDTHH:mm:ss.sssssssssZ, syncCount:
+non-negative integer, totalEvents: non-negative integer}`. All other members are omitted,
 and no member is emitted as `null` except `actor` and `info` under those
 applicable conditions.
 
@@ -1315,12 +1329,16 @@ Every operation response body has exactly these fields:
   "operation_id": "canonical-lowercase-uuid-v7",
   "status": "pending",
   "status_url": "/api/0/operations/<operation_id>/",
-  "created_at": "RFC-3339-UTC",
+  "created_at": "YYYY-MM-DDTHH:mm:ss.sssssssssZ",
   "completed_at": null,
   "result": null,
   "error": null
 }
 ```
+
+Non-null `created_at` and `completed_at` values use the canonical nine-digit
+UTC timestamp representation above; `completed_at` is `null` only while the
+operation is pending.
 
 `status` in a serialized Operation DTO is one of `pending`, `succeeded`, or
 `failed`; an expired tombstone is a retained internal state and is never
@@ -2079,11 +2097,16 @@ exact deterministic fallback `Retry-After: 5`.
 When a quota is safely evaluated, the adapter emits these concrete headers (HTTP
 header-name casing is insignificant):
 
-- `X-Sentry-Rate-Limit-Limit` is the decimal capacity of the most restrictive
+- `X-Sentry-Rate-Limit-Limit` is the decimal capacity of the selected
   applicable bucket.
-- `X-Sentry-Rate-Limit-Remaining` is its non-negative decimal remaining count.
-- `X-Sentry-Rate-Limit-Reset` is its reset time as whole Unix epoch seconds
-  UTC.
+- `X-Sentry-Rate-Limit-Remaining` is that bucket's non-negative decimal
+  remaining count.
+- `X-Sentry-Rate-Limit-Reset` is that bucket's reset time as whole Unix epoch
+  seconds UTC. The selected bucket is total-ordered by `(capacity ASC,
+  remaining ASC, reset_epoch DESC, canonical_entry ASC)`: lower capacity,
+  lower remaining count, and later reset are more restrictive, and the complete
+  canonical serialized entry is the final deterministic tie-breaker. All three
+  singleton headers are taken from this one selected bucket.
 - `X-Sentry-Rate-Limits` is omitted when no bucket is active; otherwise it is a
   comma-separated list with no whitespace. Each entry has the grammar
   `<seconds>:<category;category>:<scope>[:<reason>[:<namespace;namespace>]]`.
@@ -2243,15 +2266,18 @@ already owned by different content.
 
 DIF assembly does not require a client idempotency key. For a checksum-keyed
 request map containing one or more entries, the adapter derives the operation
-identity from `(tenant_id, project_id, canonical_request_body_digest)`. The
-digest is the lowercase hexadecimal SHA-256 of the RFC 8785 canonical JSON
-encoding of that request map: checksum keys are lowercase and sorted, each
-entry contains the normalized `debug_id` when supplied and preserves its
-ordered chunk list, and the optional idempotency key is excluded. A matching
-retry, including a multi-entry map, resumes the same
-operation. When supplied, the client key is bound to that canonical body
-digest and a reuse with different content returns `409`; key-conflict
-behavior is not applied when no key was supplied.
+identity from `(principal_id, tenant_id, project_id,
+canonical_request_body_digest)`. The authenticated principal is part of the
+identity so two authorized principals submitting the same map receive
+independent operations and audit attribution. The digest is the lowercase
+hexadecimal SHA-256 of the RFC 8785 canonical JSON encoding of that request
+map: checksum keys are lowercase and sorted, each entry contains the
+normalized `debug_id` when supplied and preserves its ordered chunk list, and
+the optional idempotency key is excluded. A matching retry by the same
+principal, including a multi-entry map, resumes the same operation. When
+supplied, the client key is bound to that canonical body digest and a reuse
+with different content returns `409`; key-conflict behavior is not applied
+when no key was supplied.
 
 Artifact upload, symbolication, and event enrichment are asynchronous. A
 successful upload means the artifact authority durably accepted the artifact
@@ -2587,12 +2613,19 @@ canonical UTC serialization. The normalized body is the RFC 8785 request
 digest preimage. Deployment writes require a client idempotency key; a missing
 or malformed key returns `400 invalid_request` before mutation. The key binds
 through `(principal_id, scope_kind, scope_id, operation, idempotency_key)` and
-the normalized body digest. Repeating it with the same body returns the
-original successful result, while reusing it with a different body or scope
-returns `409 conflict`. The first successful `POST` for a new identity returns
-`201` with the fixed Deployment DTO. An identical retry that finds the retained
-idempotency result returns `200` with the same Deployment DTO; it does not replay
-the original `201` status or create a second record. Both `dateCreated` and
+the normalized body digest. A completed deployment idempotency record or
+tombstone is retained for exactly 24 hours after the successful commit. Define
+`expires_at` as commit time plus 24 hours: while `now < expires_at`, repeating
+the same body returns the original successful result, while reusing the key
+with a different body or scope returns `409 conflict`. The first successful
+`POST` for a new identity returns `201` with the fixed Deployment DTO. An
+identical retry that finds the retained idempotency result returns `200` with
+the same Deployment DTO; it does not replay the original `201` status or create
+a second record. At `now >= expires_at`, the record no longer matches and the
+request is evaluated as a new write against current authentication,
+authorization, and lifecycle state; the key is reusable, and an accepted retry
+creates a new deployment-history record with a new identity and returns `201`.
+Both `dateCreated` and
 `dateFinished` equal the normalized
 request `timestamp`, serialized as the canonical UTC form
 `YYYY-MM-DDTHH:mm:ss.sssssssssZ`, and `dateStarted` is always `null`. The
@@ -2801,7 +2834,9 @@ exercise:
   breadcrumb shapes;
 - new and duplicate chunks with exact `200` empty responses, conflicting
   chunks, interrupted assembly, optional and conflicting DIF idempotency keys,
-  retries, polling, and lost responses, including non-terminal `not_found` and
+  retries by the same principal, independent operations for two authorized
+  principals submitting the same assembly map, polling, and lost responses,
+  including non-terminal `not_found` and
   `assembling`, the immutable 24-hour DIF deadline and exact-boundary
   terminalization, stable expiry errors and missing-chunk ordering, newly
   created terminal `created`, and duplicate/polled terminal `ok` DIF states
@@ -2844,7 +2879,8 @@ exercise:
   without creating a second operation;
 - pagination using the documented per-route order and tie-breaker, including
   deterministic rate-limit ordering for equal scope/category/duration entries
-  with different reasons or namespaces, snapshot
+  with different reasons or namespaces, total singleton-bucket selection for
+  equal capacities with different remaining counts or reset times, snapshot
   consistency under concurrent inserts/updates, the fixed 15-minute cursor
   lifetime and exact `now >= expires_at` cutoff, cursor binding, malformed and
   expired cursor `400` results, stale cursor `403` results, cross-tenant cursor
@@ -2858,15 +2894,17 @@ exercise:
   of `field_errors`;
 - exact organization/project DTO bodies, including nullable platform,
   organization compatibility booleans, required deployment finish times,
-  canonical aliases, origin arrays, omitted unknown fields, and list/detail
-  consistency, including explicit `null` for every declared nullable field;
+  canonical aliases, origin arrays, omitted unknown fields, canonical
+  nine-digit UTC timestamps, and list/detail consistency, including explicit
+  `null` for every declared nullable field;
 - exact issue/event DTO bodies, nullable fields emitted as explicit `null`,
   omitted unknown fields, omission of `permalink`, and strict `user`/`sdk`
   serialization,
   canonical Event `dateCreated`/`dateReceived` timestamp mappings and exact
   invalid-timestamp behavior,
   every `statusDetails` member's exact type, nullability, and status-dependent
-  presence condition, including Actor and reprocessing-info shapes,
+  presence condition, including canonical `ignoreUntil` and reprocessing-info
+  timestamps, Actor and reprocessing-info shapes,
   list/detail/status-transition consistency, globally unique issue aliases with
   owning-tenant authorization, CLI
   `muted`/`resolvedInNextRelease` mappings, exact single-issue and bulk PUT
@@ -2946,10 +2984,12 @@ exercise:
   exact `maxWait: 0` and `concurrency: 8`, and positive `chunksPerRequest`;
 - the authenticated root capability probe with the exact `200` response,
   `Content-Type`, compatibility value, capability array, and array ordering;
-- active, disabled, deleting, and deleted project collection admission with
-  the exact `200`, `403 permission_denied`, `409 conflict`, and `404
-  not_found` results, retired-environment `409 conflict`, and no persistence
-  for rejected requests, including compressed and legacy parsed events before
+- active, disabled, and deleting project collection admission with the exact
+  `200`, `403 permission_denied`, and `409 conflict` results, a pre-deletion DSN
+  against a deleted project returning `401 invalid_authentication` before
+  lookup, authenticated project-bound management requests against a deleted
+  project returning `404 not_found`, retired-environment `409 conflict`, and
+  no persistence for rejected requests, including compressed and legacy parsed events before
   the environment fence, plus authorized disabled-project reads, blocked
   project-bound management writes, reusable organization-scoped chunk staging,
   staging reuse for disabled targets, and `403` at disabled-project assembly;
@@ -2982,6 +3022,7 @@ exercise:
 - operation polling with `202 pending` and exact `Retry-After: 5`, `200
   succeeded`, `200 failed`, the immutable originating nested failure
   `request_id` across repeated failed polls with distinct current poll IDs, the
+  canonical nine-digit UTC `created_at`/`completed_at` values,
   top-level `410 operation_expired` error at and after the exact
   `completed_at + 24h` cutoff, unknown-operation `404`, and owner-outage `503`
   responses;
@@ -2999,9 +3040,10 @@ exercise:
   terminal checksum-mismatch failures, safe details, and nullability;
 - deployment writes with the closed JSON body, omitted/null normalization,
   metadata bounds, NFC key-collision rejection, bounded timestamp precision,
-  canonical digest, required client idempotency, exact `201` initial and `200`
-  duplicate responses, missing-key rejection, and conflicting supplied-key
-  retry rejection, plus
+  canonical digest, required client idempotency, exact 24-hour retry retention,
+  `now >= expires_at` key reuse as a new deployment, exact `201` initial and
+  `200` duplicate responses, missing-key rejection, and conflicting supplied-key
+  retry rejection during retention, plus
   Write/Manage authorization over every associated
   release project and Owner/Admin authorization for unassociated releases;
 - owner outages, quota exhaustion, processing lag, symbolication lag, no
