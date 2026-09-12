@@ -994,9 +994,17 @@ create, update, or finalization. A retry is looked up by its original
 `(principal_id, target_scope, observed_generation, canonical_request_body_digest)` before
 the current-version check: an already-completed identical request returns its
 original result, while a request not previously committed with a stale
-generation returns `409` and cannot overwrite a later mutation. Conflicting
-content, stale lifecycle state, or unavailable owners use the standard error
-statuses and bodies without creating a second release result.
+generation returns `409` and cannot overwrite a later mutation. For metadata
+and finalization `PUT`s, including keyless retries, the completed retry record
+or tombstone is retained for exactly 24 hours after the successful commit.
+While `now < retry_expires_at`, where `retry_expires_at` is commit time plus
+24 hours, the matching retry returns the original result before the current
+version check. At `now >= retry_expires_at`, the record is expired and no
+longer matches; the request follows ordinary current-version and lifecycle
+validation, so a stale generation returns `409`, while an unchanged current
+generation may be processed as a new mutation. Conflicting content, stale
+lifecycle state, or unavailable owners use the standard error statuses and
+bodies without creating a second release result.
 
 DSN responses never contain `secret`, `clientSecret`, management-token
 plaintext, or any other credential field, including as a nullable field. A
@@ -1106,17 +1114,18 @@ recursive-value rules above.
 
 For an accepted event item, `dateReceived` is the canonical `accepted_at`
 instant recorded by Ingest, not the client-supplied event time. When present,
-the event `timestamp` is a finite JSON number of Unix seconds in the inclusive
-range `0` through `253402300799.999999999` (from 1970-01-01T00:00:00Z through
-9999-12-31T23:59:59.999999999Z) with no more than nine fractional decimal
-digits after exact decimal expansion. The adapter parses the raw JSON number
-lexeme as an exact decimal, requires an integral number of nanoseconds, and
-stores that value in `normalized_event_object.timestamp` as a fixed-point
-decimal string with exactly nine fractional digits. It converts the same exact
-value to `dateCreated` using the canonical UTC representation
-`YYYY-MM-DDTHH:mm:ss.sssssssssZ`; a missing `timestamp` uses the same
-`accepted_at` instant for `dateCreated`. A non-finite, negative, out-of-range,
-or sub-nanosecond timestamp rejects the Envelope with `400 invalid_envelope`.
+the event `timestamp` is either a finite JSON number of Unix seconds or an
+RFC 3339/ISO-8601 instant string using `Z` or a numeric UTC offset, in the
+inclusive range `0` through `253402300799.999999999` (from
+1970-01-01T00:00:00Z through 9999-12-31T23:59:59.999999999Z), with no more
+than nine fractional decimal digits. The adapter parses numeric lexemes and
+timestamp strings into the same exact integral nanosecond value and stores it
+in `normalized_event_object.timestamp` as a fixed-point decimal string with
+exactly nine fractional digits. It converts that value to `dateCreated` using
+the canonical UTC representation `YYYY-MM-DDTHH:mm:ss.sssssssssZ`; a missing
+`timestamp` uses the same `accepted_at` instant for `dateCreated`. A
+non-finite number, malformed string, negative or out-of-range instant, or
+sub-nanosecond value rejects the Envelope with `400 invalid_envelope`.
 Event lists order by `dateReceived DESC`, then external event ID, regardless of
 `dateCreated`.
 
@@ -1621,8 +1630,13 @@ nullable `sampled`, `transaction`, `release`, `environment`, and `sample_rate`
 members. `sampled` accepts either a boolean or one of the bounded strings
 `true`, `false`, `1`, or `0`; `transaction`, `release`, and `environment` are
 bounded NFC-normalized strings when non-null; and `sample_rate` is a finite
-JSON number from `0` through `1` inclusive when non-null. `trace_id` uses the
-32-character hexadecimal trace-ID grammar and is normalized to lowercase;
+JSON number or a bounded ASCII decimal string from `0` through `1` inclusive
+when non-null. Decimal strings have an optional fractional part and no sign or
+exponent. Both forms are parsed as exact decimals, must be finite and within
+the inclusive range, and must round-trip through the RFC 8785 IEEE-754
+binary64 number model without changing numeric value; both normalize to one
+canonical decimal representation. `trace_id` uses the 32-character hexadecimal
+trace-ID grammar and is normalized to lowercase;
 `public_key` is a bounded non-empty string. Unknown members inside `trace`,
 duplicate members anywhere, null values where a non-null value is required,
 wrong shapes, malformed timestamps or IDs, invalid DSNs, and DSN/project
@@ -1777,7 +1791,7 @@ management schemas remain the explicit exception.
   | Field class | Accepted shape and normalization |
   | --- | --- |
   | `event_id` | Required 32-character hexadecimal string, lowercased. |
-  | `timestamp` | Optional finite JSON number of Unix seconds, parsed from its raw JSON number lexeme as an exact decimal and represented as a fixed-point string with exactly nine fractional digits; non-finite values, strings, and values that are not an integral number of nanoseconds are invalid. |
+  | `timestamp` | Optional finite JSON number of Unix seconds or RFC 3339/ISO-8601 instant string using `Z` or a numeric UTC offset; both forms are parsed to the same exact integral nanosecond value and represented as a fixed-point string with exactly nine fractional digits. Non-finite numbers, malformed strings, out-of-range values, and values that are not integral numbers of nanoseconds are invalid. |
   | `platform`, `level`, `message`, `culprit`, `transaction`, `release`, `dist`, `environment` | Optional bounded UTF-8 strings or `null`; strings are NFC-normalized, and `level` is lowercased. Missing and explicit `null` are omitted from the normalized object. |
   | `tags` | Optional object whose keys and values are bounded UTF-8 strings; both are NFC-normalized, and the object keys are sorted by RFC 8785 canonical order. |
   | `contexts` | Optional `null` or bounded JSON object. An explicit `null` is treated as absent; object keys are NFC-normalized and sorted, and nested arrays preserve order. |
@@ -1816,15 +1830,20 @@ management schemas remain the explicit exception.
   is coerced, and omitted or null outer metadata emits all four fields as `null`.
 
   Recursive bounded values are only `null`, booleans, finite numbers, NFC
-  strings, arrays, or objects. Before sorting or emitting any object, the
-  adapter NFC-normalizes every key and rejects the object with `400
-  invalid_envelope` if two distinct input keys produce the same normalized
+  strings, arrays, or objects. A recursive number is parsed from its raw JSON
+  lexeme as an exact decimal and is accepted only when conversion to the RFC
+  8785 IEEE-754 binary64 number model and canonical reserialization preserve
+  the same numeric value; values such as `9007199254740993` are rejected
+  rather than rounded to `9007199254740992`. Before sorting or emitting any
+  object, the adapter NFC-normalizes every key and rejects the object with
+  `400 invalid_envelope` if two distinct input keys produce the same normalized
   key; it never overwrites or resolves the collision. Object keys are then
   sorted, array order is preserved, and explicit `null` members are retained
-  inside a present nested object. The normalized top-level object contains only the
-  listed accepted fields, uses the normalized values above, and is serialized
-  with RFC 8785; transport fields (`dsn`, `sent_at`, `sdk` envelope headers,
-  `trace`, request IDs, and excluded items) remain outside the preimage.
+  inside a present nested object. The normalized top-level object contains only
+  the listed accepted fields, uses the normalized values above, and is
+  serialized with RFC 8785; transport fields (`dsn`, `sent_at`, `sdk` envelope
+  headers, `trace`, request IDs, and excluded items) remain outside the
+  preimage.
 - `payload_digest` is lowercase hexadecimal SHA-256 over the UTF-8 bytes of
   the RFC 8785 canonical-JSON encoding of this exact semantic object:
 
@@ -2662,7 +2681,8 @@ exercise:
   precedence and empty fallback, deterministic Event `culprit` precedence and
   null fallback, Issue `culprit` sourced from the authoritative aggregate
   across multiple events and consistent in list/detail projections, exact
-  nanosecond timestamp normalization and distinct
+  numeric and Java RFC 3339/ISO-8601 string timestamp normalization with
+  distinct
   `payload_digest` values for one-nanosecond changes, `timestamp` to
   `dateCreated` mapping,
   `accepted_at` to `dateReceived` mapping, missing-timestamp fallback,
@@ -2671,12 +2691,14 @@ exercise:
   error signal, strict `user`/`sdk` type validation and null/missing/unknown
   member mapping, recognized Envelope `event_id`/`dsn`/`sent_at`/`sdk`/`trace`
   header shapes, dynamic-sampling `trace` fields including string/boolean
-  `sampled`, ignored unknown top-level members, rejected unknown nested
+  `sampled` and numeric/string `sample_rate` normalization and bounds, ignored
+  unknown top-level members, rejected unknown nested
   `sdk`/`trace` members, invalid-shape rejection, and NFC-normalized key
   collisions before hashing, including rejection of scalar and `null`
   `exception.values` and `stacktrace.frames` elements, standard
   `breadcrumbs.values` wrapper normalization, empty arrays, recursive bounds,
-  and rejection of bare-array, null, scalar, missing-values, and invalid-element
+  binary64 round-trip rejection for non-canonical recursive numbers, and
+  rejection of bare-array, null, scalar, missing-values, and invalid-element
   breadcrumb shapes;
 - new and duplicate chunks with exact `200` empty responses, conflicting
   chunks, interrupted assembly, optional and conflicting DIF idempotency keys,
@@ -2772,9 +2794,10 @@ exercise:
   required client idempotency for release creation, explicit `null` for
   declared nullable response fields,
   observed-generation retry identities carried by required `If-Match` ETags,
-  lost-response retries, stale-generation conflicts, exact `201`/`200` DTO
-  responses and headers including strong mutation ETags and list-response ETag
-  omission, no `202` operation responses, and rejection of
+  lost-response retries, exact 24-hour retention and post-expiry behavior for
+  completed keyless retry records, stale-generation conflicts, exact `201`/`200`
+  DTO responses and headers including strong mutation ETags and list-response
+  ETag omission, no `202` operation responses, and rejection of
   unknown or misplaced fields, mixed-authority project lists, all-or-nothing
   project authorization, and the Owner/Admin requirement when `projects` is
   omitted or empty;
