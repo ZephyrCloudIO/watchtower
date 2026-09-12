@@ -798,8 +798,8 @@ beyond those listed.
 | Artifact | `dateCreated` | Required RFC 3339 UTC string |
 | Artifact | `state` | Required enum: `accepted`, `processing`, `processed`, or `failed` |
 | DIF | `id` | Required non-empty string compatibility alias; never a Watchtower canonical ID |
-| DIF | `debugId` | Required lowercase UUID string unless `uuid` is supplied |
-| DIF | `uuid` | Nullable lowercase UUID string; at least one of `debugId` or `uuid` is present |
+| DIF | `debugId` | Nullable lowercase UUID string; `null` when no upstream `debug_id` is supplied |
+| DIF | `uuid` | Nullable lowercase UUID string; `null` when no upstream `uuid` is supplied; at least one of `debugId` or `uuid` is non-null |
 | DIF | `name` | Required logical filename string |
 | DIF | `objectName` | Required string |
 | DIF | `cpuName` | Required string |
@@ -826,7 +826,7 @@ beyond those listed.
 | Deployment | `url` | Nullable HTTP(S) URL |
 | Deployment | `dateStarted` | Nullable RFC 3339 UTC string |
 | Deployment | `dateFinished` | Required RFC 3339 UTC string; the deployment request `timestamp` is the completion time |
-| Deployment | `dateCreated` | Required RFC 3339 UTC string |
+| Deployment | `dateCreated` | Required RFC 3339 UTC string; equal to the deployment request `timestamp` and `dateFinished` |
 | Deployment | `release` | Required object containing exactly the non-empty release version string `version` |
 
 ### DSN mutation request and response bodies
@@ -873,7 +873,11 @@ keys. The canonical request identity is the RFC 8785 canonical-JSON digest of
 the normalized body shown below; omitted optional members remain omitted, while
 an explicit `null` is retained and means clear the corresponding nullable
 metadata. The `Idempotency-Key`, when supplied, binds to this digest but is not
-included in it. Release `GET` responses include the strong resource `ETag`.
+included in it. Only the single-release detail response (`GET
+/api/0/organizations/<organization>/releases/<version>/`) includes the strong
+resource `ETag`; organization- and project-scoped release list
+responses omit `ETag`, and a collection response ETag is never accepted as the
+observed version for `If-Match`.
 Release metadata and finalization `PUT` requests require that exact observed
 ETag in `If-Match`; creation has no prior version and does not require it.
 
@@ -959,10 +963,13 @@ they never inline artifact, chunk, minidump, or source-map bytes.
 
 The optional `dif` member in a DIF assembly result uses the pinned sentry-cli
 `DebugInfoFile` shape rather than the internal DIF summary above. It contains
-the required `debugId` or `uuid` identity (at least one), `objectName`,
-`cpuName`, lowercase 40-character `sha1`, and the required bounded `data`
-object with nullable `type` and a string-array `features` field. No snake-case
-aliases or internal storage fields are emitted.
+the always-present nullable `debugId` and `uuid` identity members, with at
+least one non-null, plus `objectName`, `cpuName`, lowercase 40-character
+`sha1`, and the required bounded `data` object with nullable `type` and a
+string-array `features` field. An absent upstream identity member is emitted
+as `null`, never omitted. No snake-case aliases or internal storage fields are
+emitted. The standalone DIF DTO uses the same identity presence and
+nullability rule.
 
 ### Issue and event DTOs
 
@@ -1688,10 +1695,21 @@ management schemas remain the explicit exception.
   supplied recognized string members, including an empty object when none are
   supplied. A present `sdk` object ignores unknown members and serializes
   exactly `{ "name": <string-or-null>, "version": <string-or-null> }`, using
-  `null` for either recognized member that was absent. A scalar, array, or
-  wrong-typed recognized member rejects the Envelope with `400 invalid_envelope`;
-  no value is coerced or silently dropped. Recognized strings are NFC-normalized
-  before DTO serialization and digest construction.
+  `null` for either recognized member that was absent. For `user` or `sdk`, a
+  scalar, array, or wrong-typed recognized member rejects
+  the Envelope with `400 invalid_envelope`; no value is coerced or silently
+  dropped. Recognized strings are NFC-normalized before DTO serialization and
+  digest construction.
+
+  `metadata` is optional. When present and non-null, it must be an object whose
+  keys and values satisfy the recursive bounded-value rules below; an explicit
+  `null` is treated as absent. The normalized event retains the accepted bounded
+  metadata values, including non-string recursive values, but the Issue and Event
+  DTO projection is always exactly `{ "type": <value>, "value": <value>,
+  "filename": <value>, "function": <value> }`. For each recognized member, an
+  NFC-normalized string is emitted as that string; an absent, explicit-null, or
+  non-string value is emitted as `null`. Unknown members are dropped, no value
+  is coerced, and omitted or null outer metadata emits all four fields as `null`.
 
   Recursive bounded values are only `null`, booleans, finite numbers, NFC
   strings, arrays, or objects. Before sorting or emitting any object, the
@@ -1834,10 +1852,15 @@ return `403` with `permission_denied`. A valid cursor replayed outside its
 tenant or otherwise inaccessible scope returns the same indistinguishable
 `404 not_found` used for an inaccessible resource.
 
-Management responses include `Retry-After` for `429` and `503`, serialized as
-the ceiling of the remaining duration in whole seconds. When a quota is safely
-evaluated, the adapter emits these concrete headers (HTTP header-name casing
-is insignificant):
+Management responses include `Retry-After` for `429` and `503`. When an
+authoritative quota reset or dependency-availability deadline is known, the
+header is serialized as the ceiling of the remaining duration in whole
+seconds. When a `503` is caused by unavailable quota evaluation or another
+owner dependency and no such deadline can be evaluated, the adapter emits the
+exact deterministic fallback `Retry-After: 5`.
+
+When a quota is safely evaluated, the adapter emits these concrete headers (HTTP
+header-name casing is insignificant):
 
 - `X-Sentry-Rate-Limit-Limit` is the decimal capacity of the most restrictive
   applicable bucket.
@@ -1859,7 +1882,10 @@ is insignificant):
 `X-Sentry-Rate-Limit-Reset` are emitted on quota-evaluated responses even when
 remaining is nonzero. A `429` includes `Retry-After` and the active-limit
 entry; a `503` caused by unavailable quota evaluation includes `Retry-After`
-but omits all rate-limit headers. No wildcard header name or empty
+but omits all rate-limit headers. A `503` caused by another unavailable owner
+dependency uses the same five-second fallback when no deadline is available
+and emits no quota headers unless quota evaluation actually supplied them. No
+wildcard header name or empty
 `X-Sentry-Rate-Limits` value is emitted. The values describe the applicable
 Watchtower principal/organization/project quota, not a Sentry billing quota.
 The native control-plane limits remain 600 requests per principal and 6,000
@@ -2074,6 +2100,20 @@ conflict is reserved for a checksum-addressed value whose stored bytes
 differ, or for an existing artifact identity requested with different bytes;
 metadata differences alone never return `409 conflict`.
 
+The first accepted normalized artifact-bundle assembly identity records an
+immutable `assembly_accepted_at` and
+`assembly_expires_at = assembly_accepted_at + 24h`. Matching polls and retries
+do not extend this lifetime, and chunk uploads do not change the deadline.
+While `now < assembly_expires_at`, an assembly missing one or more requested
+chunks remains pending with the response below; a chunk that is uploaded again
+before that boundary can satisfy the request. At the exact boundary
+`now >= assembly_expires_at`, any still-missing or expired requested chunk
+terminalizes the assembly as failed. Its `missingChunks` is then the unique
+requested set absent under the chunk-expiration rule, sorted in lowercase
+lexicographic order, and that terminal result is stable for later identical
+polls; a later chunk upload does not reopen it. If all chunks become available
+before the boundary, normal successful or owner-failure processing applies.
+
 The artifact-bundle assembly response is exactly an object with `state`,
 `missingChunks`, `detail`, and `projects` members. `state` is one of `pending`,
 `succeeded`, or `failed`; `missingChunks` is always an array of lowercase
@@ -2287,9 +2327,12 @@ the original successful result, while reusing it with a different body returns
 `409 conflict`.
 An identical no-key retry also returns the original Deployment DTO with `200`.
 The first successful `POST` for a new identity returns `201` with the fixed
-Deployment DTO; `dateFinished` equals `timestamp`, and `dateStarted` is always
-`null`. The request has no start-time field and no native deployment source is
-consulted. Deployment records history only;
+Deployment DTO; both `dateCreated` and `dateFinished` equal the normalized
+request `timestamp`, serialized as the canonical UTC form
+`YYYY-MM-DDTHH:mm:ss.sssssssssZ`, and `dateStarted` is always `null`. The
+adapter does not use request-receipt or persistence-commit time, and the
+request has no start-time field or native deployment source. Deployment records
+history only;
 they do not grant deployment authority, execute deployment work, or activate
 unsupported release-health behavior.
 
