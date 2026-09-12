@@ -709,9 +709,11 @@ DSN. No source can select a different project from the route.
 
 ### Request and response fields
 
-Every compatible request may carry `X-Request-ID`; the adapter validates a
-canonical UUID v7 value or generates one. The exact mutation precondition wire
-fields are:
+Every compatible request may carry one `X-Request-ID` header. A supplied value
+must be a canonical lowercase UUID v7; a malformed, non-canonical, or duplicate
+header returns `400 invalid_request` before authentication, lookup, idempotency
+evaluation, or mutation. When the header is absent, the adapter generates a
+canonical lowercase UUID v7. The exact mutation precondition wire fields are:
 
 - `Idempotency-Key` is a single HTTP header containing 1–128 printable ASCII
   bytes (`0x21`–`0x7e`), with no whitespace, controls, quotes, or duplicate
@@ -901,7 +903,14 @@ discriminator, resolved target key when applicable, key, and body returns the
 original successful result. Reusing that key with different content for the same
 resolved target returns `409 conflict`; the same key for a different addressed
 key is an independent idempotency identity and is evaluated against that
-target's body.
+target's body. A completed rotation or revocation idempotency record or
+tombstone is retained for exactly 24 hours after the successful commit. Define
+`expires_at` as commit time plus 24 hours: while `now < expires_at`, a matching
+retry returns the original result; at `now >= expires_at`, the record no longer
+matches and the request is evaluated as a new mutation against current
+authorization, lifecycle, and target state. An active target may therefore be
+rotated again, while revocation of an already revoked target returns the
+standard `404 not_found` result.
 
 ### Release mutation request bodies
 
@@ -1115,8 +1124,9 @@ recursive-value rules above.
 For an accepted event item, `dateReceived` is the canonical `accepted_at`
 instant recorded by Ingest, not the client-supplied event time. When present,
 the event `timestamp` is either a finite JSON number of Unix seconds or an
-RFC 3339/ISO-8601 instant string using `Z` or a numeric UTC offset, in the
-inclusive range `0` through `253402300799.999999999` (from
+RFC 3339/ISO-8601 instant string using `Z` or a numeric UTC offset, with
+second values `00` through `59`, in the inclusive range `0` through
+`253402300799.999999999` (from
 1970-01-01T00:00:00Z through 9999-12-31T23:59:59.999999999Z), with no more
 than nine fractional decimal digits. The adapter parses numeric lexemes and
 timestamp strings into the same exact integral nanosecond value and stores it
@@ -1124,8 +1134,10 @@ in `normalized_event_object.timestamp` as a fixed-point decimal string with
 exactly nine fractional digits. It converts that value to `dateCreated` using
 the canonical UTC representation `YYYY-MM-DDTHH:mm:ss.sssssssssZ`; a missing
 `timestamp` uses the same `accepted_at` instant for `dateCreated`. A
-non-finite number, malformed string, negative or out-of-range instant, or
-sub-nanosecond value rejects the Envelope with `400 invalid_envelope`.
+non-finite number, malformed string, leap-second string, negative or
+out-of-range instant, or sub-nanosecond value rejects the Envelope with
+`400 invalid_envelope`. Leap-second values such as `23:59:60Z` are not
+normalized.
 Event lists order by `dateReceived DESC`, then external event ID, regardless of
 `dateCreated`.
 
@@ -1154,7 +1166,7 @@ each entry type appears at most once and absent source data produces no entry:
 | `message` | `message` is present and non-empty | `{ "formatted": <normalized message> }` |
 | `exception` | `exception.values` is a non-empty array | `{ "values": <normalized exception.values> }` |
 | `stacktrace` | `stacktrace.frames` is a non-empty array | `{ "frames": <normalized stacktrace.frames> }` |
-| `breadcrumbs` | `breadcrumbs` is a non-empty array | `{ "values": <normalized breadcrumbs> }` |
+| `breadcrumbs` | `breadcrumbs.values` is a non-empty array | `{ "values": <normalized breadcrumbs.values> }` |
 
 The four entry data objects contain no other members. Nested values use the
 recursive bounded-value normalization rules, object keys use RFC 8785 order,
@@ -1184,6 +1196,14 @@ other query parameter are unsupported. `query`, `status`, and
 `environment` may be combined, and the complete normalized parameter set is
 bound into pagination. The bulk `PUT` route's separate repeated `id` and
 `current_status` parameters are not accepted by `GET`.
+
+For `environment` matching, the adapter NFC-normalizes each query value once,
+deduplicates the normalized values, and compares them case-sensitively against
+the NFC-normalized environment of every retained event belonging to the issue.
+An issue matches when any retained event has a non-null environment equal to
+one of the normalized query values; missing or null event environments do not
+match. No Unicode case folding or locale-specific comparison is applied. The
+normalized environment set is the value bound into the cursor.
 
 For `query` matching, the adapter computes
 `match_key(value) = NFC(DefaultCaseFold(NFC(value)))` using the Unicode 15.1
@@ -1791,7 +1811,7 @@ management schemas remain the explicit exception.
   | Field class | Accepted shape and normalization |
   | --- | --- |
   | `event_id` | Required 32-character hexadecimal string, lowercased. |
-  | `timestamp` | Optional finite JSON number of Unix seconds or RFC 3339/ISO-8601 instant string using `Z` or a numeric UTC offset; both forms are parsed to the same exact integral nanosecond value and represented as a fixed-point string with exactly nine fractional digits. Non-finite numbers, malformed strings, out-of-range values, and values that are not integral numbers of nanoseconds are invalid. |
+  | `timestamp` | Optional finite JSON number of Unix seconds or RFC 3339/ISO-8601 instant string using `Z` or a numeric UTC offset with seconds `00` through `59`; both forms are parsed to the same exact integral nanosecond value and represented as a fixed-point string with exactly nine fractional digits. Non-finite numbers, malformed or leap-second strings, out-of-range values, and values that are not integral numbers of nanoseconds are invalid. |
   | `platform`, `level`, `message`, `culprit`, `transaction`, `release`, `dist`, `environment` | Optional bounded UTF-8 strings or `null`; strings are NFC-normalized, and `level` is lowercased. Missing and explicit `null` are omitted from the normalized object. |
   | `tags` | Optional object whose keys and values are bounded UTF-8 strings; both are NFC-normalized, and the object keys are sorted by RFC 8785 canonical order. |
   | `contexts` | Optional `null` or bounded JSON object. An explicit `null` is treated as absent; object keys are NFC-normalized and sorted, and nested arrays preserve order. |
@@ -2494,9 +2514,11 @@ or malformed key returns `400 invalid_request` before mutation. The key binds
 through `(principal_id, scope_kind, scope_id, operation, idempotency_key)` and
 the normalized body digest. Repeating it with the same body returns the
 original successful result, while reusing it with a different body or scope
-returns `409 conflict`.
-The first successful `POST` for a new identity returns `201` with the fixed
-Deployment DTO; both `dateCreated` and `dateFinished` equal the normalized
+returns `409 conflict`. The first successful `POST` for a new identity returns
+`201` with the fixed Deployment DTO. An identical retry that finds the retained
+idempotency result returns `200` with the same Deployment DTO; it does not replay
+the original `201` status or create a second record. Both `dateCreated` and
+`dateFinished` equal the normalized
 request `timestamp`, serialized as the canonical UTC form
 `YYYY-MM-DDTHH:mm:ss.sssssssssZ`, and `dateStarted` is always `null`. The
 adapter does not use request-receipt or persistence-commit time, and the
@@ -2662,8 +2684,10 @@ exercise:
 - empty, unsupported-only, attachment-only, supported-only, and mixed Envelopes,
   including unassociated-attachment exclusion, and an
   envelope-level event ID on an excluded-only Envelope, all expecting `200`
-  with a zero-length response body, plus eventless empty/client-report retries
-  with the same client `X-Request-ID`, different client IDs, and no client ID;
+  with a zero-length response body, plus malformed, non-canonical, and duplicate
+  `X-Request-ID` headers returning `400 invalid_request` before lookup or
+  mutation, plus eventless empty/client-report retries with the same client
+  `X-Request-ID`, different client IDs, and no client ID;
   client reports also cover the exact `discarded_events` shape, token and
   quantity boundaries, duplicate-record digest handling, unknown members,
   multiple `client_report` items, and the aggregate 1,024-record limit;
@@ -2686,7 +2710,7 @@ exercise:
   `payload_digest` values for one-nanosecond changes, `timestamp` to
   `dateCreated` mapping,
   `accepted_at` to `dateReceived` mapping, missing-timestamp fallback,
-  nanosecond precision/range rejection, nullable level mapping, deterministic
+  nanosecond precision/range rejection including leap-second rejection, nullable level mapping, deterministic
   tag-array serialization, invalid levels, event items with no
   error signal, strict `user`/`sdk` type validation and null/missing/unknown
   member mapping, recognized Envelope `event_id`/`dsn`/`sent_at`/`sdk`/`trace`
@@ -2696,7 +2720,7 @@ exercise:
   `sdk`/`trace` members, invalid-shape rejection, and NFC-normalized key
   collisions before hashing, including rejection of scalar and `null`
   `exception.values` and `stacktrace.frames` elements, standard
-  `breadcrumbs.values` wrapper normalization, empty arrays, recursive bounds,
+  `breadcrumbs.values` wrapper normalization and Event entry projection, empty arrays, recursive bounds,
   binary64 round-trip rejection for non-canonical recursive numbers, and
   rejection of bare-array, null, scalar, missing-values, and invalid-element
   breadcrumb shapes;
@@ -2815,13 +2839,16 @@ exercise:
 - issue queries with NFC plus Unicode 15.1 default case folding, `ß`/`ss`,
   locale-independent Turkish case behavior, and folded Unicode-scalar
   substring matching over only the Issue `title` and `culprit` projections,
-  including message-only non-matches; Envelope items carrying arbitrary `item_count` or
+  including message-only non-matches, any-retained-event environment matching
+  with NFC-normalized case-sensitive values, and cursor binding to the
+  normalized environment set; Envelope items carrying arbitrary `item_count` or
   `item_headers` values on supported and excluded types, confirming they are
   ignored and do not alter acceptance or the payload digest;
 - DSN issuance with required name and nullable platform, empty-object rotation,
   bodyless revocation, exact `201`/`200`/`204` responses, same-tuple conflicts,
-  independent cross-project/operation keys, and rejection of unknown members
-  or bodies;
+  independent cross-project/operation keys, exact 24-hour retry retention and
+  post-expiry current-state behavior, and rejection of unknown members or
+  bodies;
 - direct release-file uploads with exact multipart parts and encodings,
   decompressed-byte checksums, duplicate/conflicting identities, the exact
   pending `202` Operation DTO without artifact identity, terminal artifact
