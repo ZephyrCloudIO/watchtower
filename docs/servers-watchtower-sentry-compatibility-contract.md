@@ -241,9 +241,13 @@ to a native route.
 | `/api/<project_id>/security-report/` | `POST` | Collection-only DSN | Explicitly unsupported in v1; returns `501 unsupported_capability` with no persistence side effect because security reports are not error telemetry. |
 | Any other `/api/<project_id>/...` ingestion route | Any | Any | `404` or `405` according to whether the path or method is unknown; no side effect. |
 
-An unsupported method on a known supported ingestion route returns the standard
-`405 method_not_allowed` object and an `Allow` header containing exactly the
-methods listed here, in the listed order. The route-specific values are:
+An unsupported method other than `HEAD` on a known supported ingestion route
+returns the standard `405 method_not_allowed` object and an `Allow` header
+containing exactly the methods listed here, in the listed order. An unsupported
+`HEAD` on a known supported ingestion route retains the same `405` status,
+route-specific `Allow` header, and request-ID headers, but is bodyless: it has
+`Content-Length: 0`, no `Content-Type`, and no JSON error body. The conceptual
+error remains `method_not_allowed`. The route-specific values are:
 
 | Route | `Allow` |
 | --- | --- |
@@ -621,7 +625,7 @@ mutation is the complete Project DTO; the result for deletion is `null`.
 
 | Mutation | Initial request | Pending poll or duplicate | Terminal or completed duplicate |
 | --- | --- | --- | --- |
-| Project creation | `POST` returns `202` pending Operation DTO and requires `Idempotency-Key`. | The same key and canonical body return the same pending operation with `202`; changed body within the same principal/organization/operation tuple returns `409 conflict`, while another scope is independent. | The operation URL returns `200` with `status: "succeeded"` and the Project DTO in `result`; repeating the same key returns that same terminal Operation DTO with `200`. |
+| Project creation | `POST` returns `202` pending Operation DTO and requires `Idempotency-Key`. | The same key and canonical body return the same pending operation with `202`; changed body within the same principal/organization/operation tuple returns `409 conflict`, while another scope is independent. | While `now < completed_at + 24h`, the operation URL and a repeat of the same key return `200` with `status: "succeeded"` and the same Project DTO in `result`. At `now >= completed_at + 24h`, the operation URL and completed duplicate return the top-level `410 operation_expired` error; they do not create another project or operation. |
 | Browser-origin update | When the generation-matched Ingest acknowledgement is already available, `PUT` returns `200` with the Project DTO, the new strong `ETag`, and no `Location` or `Retry-After`; otherwise it returns `202` with a pending Operation DTO. | A retry with the same project, observed `If-Match`, normalized body, and supplied key, if any, returns the same current `200` or `202` result before the current-version check; otherwise a stale `If-Match` returns `409 conflict`. | A pending update polls to `200` with a succeeded Operation DTO whose `result` is the updated Project DTO; a completed duplicate returns the same terminal result. |
 | Project deletion | A bodyless authorized request with the required confirmation, observed `If-Match`, and `Idempotency-Key` returns `202` pending Operation DTO; it never returns a Project DTO. | The same target and key return the same pending operation with `202`; changed content within the same principal/project/operation tuple returns `409 conflict`, while another scope is independent. | The operation URL and a terminal retry return `200` with a succeeded Operation DTO and `result: null`; no deleted Project DTO is exposed. |
 
@@ -1420,9 +1424,9 @@ Every direct management or ingestion error other than the documented suspension
 response uses this exact JSON object. The bodyless error exceptions are a
 failed TUS `HEAD`, whose HTTP status and headers are authoritative, with
 `Content-Length: 0`, `Tus-Resumable: 1.0.0`, and request-ID headers, and an
-unsupported `HEAD` on a known management route, whose `405` status,
-route-specific `Allow`, and request-ID headers remain authoritative. Both have
-neither `Content-Type` nor a JSON error body.
+unsupported `HEAD` on a known management or ingestion route, whose `405`
+status, route-specific `Allow`, and request-ID headers remain authoritative.
+Both have neither `Content-Type` nor a JSON error body.
 
 ```json
 {
@@ -1547,7 +1551,9 @@ bodyless successes and `204` responses omit it. Response bodies are JSON for
 management routes;
 Envelope, legacy `store`, and `minidump` ingestion `POST`s return `200` with a
 zero-length body and request-ID headers, while `OPTIONS` returns `204` without
-a body. Other ingestion failures use the stable JSON error shape.
+a body. Unsupported `HEAD` requests on known ingestion routes use the
+bodyless `405` exception above. Other ingestion failures use the stable JSON
+error shape.
 
 For a non-Envelope crash path whose fixture specifies minidump upload, the
 pinned native uploader sends a bounded `upload_file_minidump` binary multipart
@@ -1556,9 +1562,13 @@ fixture (`prod`, `ver`, `ptype`, `plat`, and `guid` where present), and a
 required `sentry` JSON metadata part containing the scoped external event ID
 and any supplied release, distribution, and platform context. The annotation allowlist is fixture-
 specific and does not accept arbitrary scalar keys; annotations are metadata,
-not event or attachment parts. A body-only raw-minidump request is not
-admitted; `application/octet-stream` is rejected as an unsupported media type.
-Unlisted multipart file parts are rejected before acceptance. The legacy `store` body is JSON and must contain
+not event or attachment parts. Exactly one `upload_file_minidump` part and
+exactly one `sentry` part are required, and each allowed annotation part
+(`prod`, `ver`, `ptype`, `plat`, or `guid`) may occur at most once. Duplicate
+permitted parts, missing required parts, and unlisted multipart file parts return
+`400 invalid_request` before acceptance, digest construction, or persistence.
+A body-only raw-minidump request is not admitted; `application/octet-stream` is
+rejected as an unsupported media type. The legacy `store` body is JSON and must contain
 the pinned error-event fields needed to construct one event; it cannot carry
 an arbitrary batch.
 
@@ -1607,6 +1617,7 @@ request can be recovered safely.
 | --- | ---: |
 | Decompressed Envelope or legacy event request | 50,000,000 bytes |
 | Envelope item count | 1,024 items |
+| Decoded JSON nesting | 16 levels |
 | One Envelope item payload | 20,000,000 bytes |
 | One JSON error event | 1,000,000 bytes |
 | One attachment or native crash item | 20,000,000 bytes |
@@ -1651,11 +1662,14 @@ HTTP(S) URLs are at most 2,048 ASCII bytes. UUIDs, event IDs, checksums,
 timestamps, and other fields with an exact grammar use that grammar in
 addition to these length limits.
 
-Recursive event objects have at most 16 nesting levels, 256 members per
-object, and 1,024 elements per array. Object keys are at most 128 UTF-8
-bytes. Recursive strings use the general 256-byte limit unless they are
-message, exception-value, or stacktrace text. These structural limits are
-checked before canonicalization and digest calculation.
+Every decoded JSON value, including a value in an ignored extensible member,
+has at most 16 nesting levels. Recursive event objects additionally have at
+most 256 members per object and 1,024 elements per array. Object keys are at
+most 128 UTF-8 bytes. Recursive strings use the general 256-byte limit unless
+they are message, exception-value, or stacktrace text. These structural limits
+are checked before unknown-value handling, canonicalization, or digest
+calculation; an over-depth Envelope value returns `400 invalid_envelope` with
+no acceptance side effect.
 
 The smaller applicable limit wins. A request that exceeds a byte, decoded-
 payload, multipart-count, or explicit assembly-cardinality limit returns `413`
@@ -1754,8 +1768,9 @@ client's `event_id`, `timestamp`, `platform`, `level`, `message`, `culprit`,
 event item's `event_id` is required for a supported event.
 
 The recognized envelope-header schemas are extensible at the top level.
-Unknown top-level members are ignored and are not type-checked, persisted,
-returned, used for authorization, or included in the payload digest. `event_id`,
+Unknown top-level members are ignored after the global JSON nesting bound is
+checked; they are not otherwise type-checked, persisted, returned, used for
+authorization, or included in the payload digest. `event_id`,
 when present, is a non-null 32-character ASCII hexadecimal string using the
 event-ID grammar above and is normalized to lowercase. `dsn`, when present, is
 a non-null absolute HTTP(S) DSN URL using the DSN URL grammar above; its public
@@ -1768,8 +1783,9 @@ rejected and omitted members serialize as `null`. `trace` is either `null` or
 an object containing required `trace_id` and `public_key` strings plus optional
 nullable `sampled`, `transaction`, `release`, `environment`, and `sample_rate`
 members. `sampled` accepts either a boolean or one of the bounded strings
-`true`, `false`, `1`, or `0`; `transaction`, `release`, and `environment` are
-bounded NFC-normalized strings when non-null; and `sample_rate` is a finite
+`true`, `false`, `1`, or `0`; `transaction` and `environment` are bounded
+NFC-normalized strings when non-null, while `release` preserves its exact
+decoded release identifier; and `sample_rate` is a finite
 JSON number or a bounded ASCII decimal string from `0` through `1` inclusive
 when non-null. Decimal strings have an optional fractional part and no sign or
 exponent. Both forms are parsed as exact decimals, must be finite and within
@@ -1932,13 +1948,20 @@ management schemas remain the explicit exception.
   | --- | --- |
   | `event_id` | Required 32-character hexadecimal string, lowercased. |
   | `timestamp` | Optional finite JSON number of Unix seconds or RFC 3339/ISO-8601 instant string using `Z` or a numeric UTC offset with seconds `00` through `59`; both forms are parsed to the same exact integral nanosecond value and represented as a fixed-point string with exactly nine fractional digits. Non-finite numbers, malformed or leap-second strings, out-of-range values, and values that are not integral numbers of nanoseconds are invalid. |
-  | `platform`, `level`, `message`, `culprit`, `transaction`, `release`, `dist`, `environment` | Optional bounded UTF-8 strings or `null`; strings are NFC-normalized, and `level` is lowercased. Missing and explicit `null` are omitted from the normalized object. |
+  | `platform`, `level`, `message`, `culprit`, `transaction`, `dist`, `environment` | Optional bounded UTF-8 strings or `null`; strings are NFC-normalized, and `level` is lowercased. Missing and explicit `null` are omitted from the normalized object. |
+  | `release` | Optional bounded UTF-8 string or `null`; the decoded release identifier is preserved exactly without Unicode normalization. Missing and explicit `null` are omitted from the normalized object. |
   | `tags` | Optional object whose keys and values are bounded UTF-8 strings; both are NFC-normalized, and the object keys are sorted by RFC 8785 canonical order. |
   | `contexts` | Optional `null` or bounded JSON object. An explicit `null` is treated as absent; object keys are NFC-normalized and sorted, and nested arrays preserve order. |
   | `breadcrumbs` | Optional object with required `values` array of bounded objects. The `values` array is normalized to an ordered array; order is preserved and every nested object/value uses the recursive bounded-value rules below. |
   | `exception`, `stacktrace`, `debug_meta`, `metadata` | Optional bounded JSON objects using the recursive bounded-value rules below; absent and `null` values are omitted. |
   | `user` | Optional `null` or object with optional `id`, `username`, and `name` members; each present member is a bounded NFC-normalized non-empty string. |
   | `sdk` | Optional `null` or object whose `name` and `version` members are nullable bounded NFC-normalized strings. |
+
+Release strings are compared using their exact decoded values for event DTO
+serialization, payload digests, and release or artifact association. NFC is
+used only for the documented release ordering keys; NFC-equivalent release
+versions therefore remain distinct identities and reach the release ID
+tie-breaker.
 
   `user` and `sdk` use the closed schemas above rather than arbitrary recursive
   objects. A missing or explicit `null` `user` or `sdk` serializes as `null`.
@@ -2818,8 +2841,10 @@ exercise:
 - minidump uploads with the exact fixture-emitted Crashpad scalar annotations,
   required Sentry metadata and external event ID, each optional release/dist/
   platform omission combination, explicit-null rejection, and rejection of eventless
-  minidumps, body-only `application/octet-stream` requests, and unlisted file
-  parts, bounded fields, and the successful `200` zero-length acknowledgement;
+  minidumps, duplicate `upload_file_minidump`, `sentry`, and annotation parts,
+  body-only `application/octet-stream` requests, and unlisted file parts,
+  bounded fields, deterministic `400 invalid_request` no-side-effect failures,
+  and the successful `200` zero-length acknowledgement;
 - `sdk.native.crash` using the exact multipart minidump request and
   `sdk.native.tus-minidump` using the separate TUS creation/append and Envelope
   `attachment-ref` binding workflow;
@@ -2863,7 +2888,10 @@ exercise:
   conflicting event/request digests expect the standard `409 conflict` body
   and no new acceptance side effect;
 - nested identity/gzip item payloads at and over the decoded 20,000,000-byte
-  item and 50,000,000-byte aggregate limits, with no partial persistence;
+  item and 50,000,000-byte aggregate limits, with no partial persistence, plus
+  unknown Envelope-header values at and over the global 16-level JSON nesting
+  bound, including ignored over-depth values returning `400 invalid_envelope`
+  without acceptance;
 - duplicate, case-variant, malformed, and conflicting event IDs, including
   acceptance-record retirement while the canonical event remains queryable,
   identical retries after environment retirement, and uniqueness-tombstone
@@ -2885,6 +2913,8 @@ exercise:
   member mapping, recognized Envelope `event_id`/`dsn`/`sent_at`/`sdk`/`trace`
   header shapes, dynamic-sampling `trace` fields including string/boolean
   `sampled` and numeric/string `sample_rate` normalization and bounds, ignored
+  unknown Envelope-header values with bounded nesting, exact composed versus
+  decomposed event release preservation and release/artifact association,
   unknown top-level members, rejected unknown nested
   `sdk`/`trace` members, invalid-shape rejection, and NFC-normalized key
   collisions before hashing, including rejection of scalar and `null`
@@ -2987,7 +3017,9 @@ exercise:
   fixed Release DTO responses with `shortVersion: null` or `404 not_found` for
   `/previous-with-commits/`, including repeated project filters from 1 through
   100, deterministic over-limit `413` responses, skipped no-commit releases,
-  deterministic NFC-normalized Unicode-scalar release ordering/tie-breaking,
+  exact composed/decomposed release preservation in Event DTOs, payload
+  digests, and release/artifact association, deterministic NFC-normalized
+  Unicode-scalar release ordering/tie-breaking,
   normalized project/environment array
   ordering, readable-project candidate filtering before selection,
   inaccessible-project filtering, visible unassociated candidates for
@@ -3073,7 +3105,7 @@ exercise:
   body and no `field_errors`, platform-token grammar,
   recognized Envelope scalars over 4,096 bytes returning `400 invalid_envelope`,
   and unsupported methods returning the route-specific `Allow` header, including
-  bodyless `HEAD` errors on known management routes,
+  bodyless `HEAD` errors on known management and ingestion routes,
   exact scalar byte boundaries, recursive event depth/member/array boundaries,
   and URL/text limits, plus
   DIF/artifact-bundle assembly cardinality at and over each explicit digest,
@@ -3100,7 +3132,9 @@ exercise:
   canonical nine-digit UTC `created_at`/`completed_at` values,
   top-level `410 operation_expired` error at and after the exact
   `completed_at + 24h` cutoff, unknown-operation `404`, and owner-outage `503`
-  responses;
+  responses, plus project-creation duplicate retries returning the terminal
+  Operation DTO before that cutoff and `410 operation_expired` at and after it
+  without creating another project or operation;
 - malformed management JSON versus malformed Envelope JSON, with
   `invalid_request` and `invalid_envelope` respectively, plus overlong
   management and Envelope fields retaining those distinct error codes;
@@ -3151,7 +3185,7 @@ matrix result. A client regression cannot be hidden by changing the fixture.
 - Every supported and unsupported route, method, format, Envelope item, and
   relevant non-Envelope path has explicit behavior, including exact `Allow`
   headers for known-route `405` responses and bodyless unsupported `HEAD`
-  responses on known management routes.
+  responses on known management and ingestion routes.
 - Authentication, content type, compression, limits, fields, errors,
   pagination, rate headers, unknown fields, retries, idempotency, capability
   negotiation, chunking, polling, and asynchronous semantics are explicit.
