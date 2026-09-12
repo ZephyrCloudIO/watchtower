@@ -390,7 +390,7 @@ the allowlist, or a project with no configured allowlist, receives
 | Route family | Methods and behavior |
 | --- | --- |
 | `/api/0/` | `GET` authentication/capability read required by sentry-cli; it returns the exact safe compatibility response defined in Capability negotiation. Mutations and unlisted methods are rejected. |
-| `/api/0/organizations/` | `GET` organization reads for the authenticated principal; pagination and current authorization apply. Organization creation, deletion, membership, team, SSO, and broad settings administration are not exposed through Sentry compatibility. |
+| `/api/0/organizations/` | `GET` organization reads for the authenticated management credential, limited to that credential's owning organization; pagination and current authorization apply. Organization creation, deletion, membership, team, SSO, and broad settings administration are not exposed through Sentry compatibility. |
 | `/api/0/organizations/<organization>/` | `GET` organization read. Unknown or unauthorized organizations return indistinguishable `404`. |
 | `/api/0/organizations/<organization>/projects/` | `GET` project list and `POST` project creation using the exact request body below. Creation returns the pending Operation DTO defined in Project mutation responses until all required owners and Jobs acknowledge enablement. |
 | `/api/0/projects/<organization>/<project>/` | `GET` project read, `PUT` supported project settings including the browser-origin allowlist, and bodyless `DELETE` project deletion. Project settings and deletion require the current strong `If-Match` plus `X-Watchtower-Project-Generation`; deletion additionally requires a current Owner/Admin user session recently reauthenticated within five minutes under applicable organization SSO/MFA conditions, `X-Confirm-Project-Name` containing the exact current project name, idempotency, lifecycle fences, and never reports success before authoritative completion. |
@@ -434,11 +434,14 @@ known supported path returns `405`.
 Organization path slugs are globally unique compatibility aliases and are
 resolved before tenant selection. Project path slugs are compatibility aliases
 unique within their organization and are resolved only after the canonical
-tenant is selected. Both resolutions require the expected resource generation;
-a project slug cannot select a resource in another tenant. A deleted
-resource's slug may be reused only after deletion completes and only by a new
-resource generation. A replacement receives a new canonical UUID, generation,
-and credentials.
+tenant is selected. Ordinary organization and project reads use these path
+aliases and current authorization without supplying an expected resource
+generation; project generation matching is a mutation precondition only for
+the project settings and deletion requests that carry
+`X-Watchtower-Project-Generation`. A project slug cannot select a resource in
+another tenant. A deleted resource's slug may be reused only after deletion
+completes and only by a new resource generation. A replacement receives a new
+canonical UUID, generation, and credentials.
 
 ### Project mutation request bodies
 
@@ -453,8 +456,10 @@ keys. `POST /api/0/organizations/<organization>/projects/` accepts exactly:
 }
 ```
 
-`name` and `slug` are required. `name` is a non-empty string of at most 256
-UTF-8 bytes. `slug` is a canonical lowercase ASCII compatibility alias
+`name` and `slug` are required. `name` is a non-empty printable ASCII string
+of 1 through 256 bytes, with every byte in `0x20` through `0x7e`, so the exact
+value can be carried by `X-Confirm-Project-Name`. `slug` is a canonical
+lowercase ASCII compatibility alias
 matching `[a-z0-9][a-z0-9._-]{0,255}`. The adapter does not derive, rewrite,
 or suffix a slug. A slug already used by another project in the organization,
 including a project whose deletion has not completed, returns `409 conflict`
@@ -642,6 +647,11 @@ read receives the ordinary suspension response.
   applicable organization SSO/MFA conditions; personal and service tokens
   cannot delete projects. Sentry token strings are not Watchtower credentials
   and are not imported or persisted.
+- Personal and service management tokens belong to exactly one organization.
+  `GET /api/0/organizations/` returns only that credential's owning
+  organization when it is currently readable, or the normal empty/suspended
+  result; it never enumerates another organization. The compatibility adapter
+  does not add a general user-session flow for multi-organization listing.
 - The adapter accepts the pinned clients' `X-Sentry-Auth`, DSN query parameters,
   `Authorization: Bearer`, and `X-Sentry-Token` spellings, plus the native
   authenticated user session required for project deletion, only when they
@@ -710,8 +720,9 @@ fields are:
   otherwise both the slug and generation must match the same project before
   idempotency is evaluated.
 - Project deletion additionally requires one `X-Confirm-Project-Name` header.
-  Its value is the exact current project display name, compared case-sensitively
-  without trimming or alias normalization; a missing or mismatched value returns
+  Its value is the exact current project display name, which therefore uses the
+  printable ASCII project-name grammar above, compared case-sensitively without
+  trimming or alias normalization; a missing or mismatched value returns
   `400 invalid_request` before idempotency lookup or mutation.
 
 The adapter forwards neither credential material nor unrestricted customer
@@ -1526,24 +1537,27 @@ client's `event_id`, `timestamp`, `platform`, `level`, `message`, `exception`,
 `breadcrumbs`, `sdk`, `user`, `debug_meta`, and bounded event metadata. The
 event item's `event_id` is required for a supported event.
 
-The recognized envelope-header schemas are closed. `event_id`, when present,
-is a non-null 32-character ASCII hexadecimal string using the event-ID grammar
-above and is normalized to lowercase. `dsn`, when present, is a non-null
-absolute HTTP(S) DSN URL using the DSN URL grammar above; its public key and
-project alias must match the authenticated collection DSN and route project.
-`sent_at`, when present, is a non-null RFC 3339 UTC instant and is normalized
-to the canonical nine-fraction-digit UTC representation. `sdk` is either
-`null` or an object containing exactly nullable bounded NFC-normalized string
-members `name` and `version`; omitted members serialize as `null`.
-`trace` is either `null` or an object containing required `trace_id` and
-`public_key` strings plus optional nullable `sampled` boolean and `transaction`
-string members. `trace_id` uses the 32-character hexadecimal trace-ID grammar
-and is normalized to lowercase; `public_key` is a bounded non-empty string and
-`transaction` is a bounded NFC-normalized string when non-null. Unknown or
-duplicate members, null values where a non-null value is required, wrong
-shapes, malformed timestamps or IDs, invalid DSNs, and DSN/project mismatches
-return `400 invalid_envelope` before acceptance. These transport headers are
-bounded metadata and remain outside the payload digest.
+The recognized envelope-header schemas are extensible at the top level.
+Unknown top-level members are ignored and are not type-checked, persisted,
+returned, used for authorization, or included in the payload digest. `event_id`,
+when present, is a non-null 32-character ASCII hexadecimal string using the
+event-ID grammar above and is normalized to lowercase. `dsn`, when present, is
+a non-null absolute HTTP(S) DSN URL using the DSN URL grammar above; its public
+key and project alias must match the authenticated collection DSN and route
+project. `sent_at`, when present, is a non-null RFC 3339 UTC instant and is
+normalized to the canonical nine-fraction-digit UTC representation. `sdk` is
+either `null` or an object containing exactly nullable bounded NFC-normalized
+string members `name` and `version`; unknown members inside this object are
+rejected and omitted members serialize as `null`. `trace` is either `null` or
+an object containing required `trace_id` and `public_key` strings plus optional
+nullable `sampled` boolean and `transaction` string members. `trace_id` uses the
+32-character hexadecimal trace-ID grammar and is normalized to lowercase;
+`public_key` is a bounded non-empty string and `transaction` is a bounded
+NFC-normalized string when non-null. Unknown members inside `trace`, duplicate
+members anywhere, null values where a non-null value is required, wrong shapes,
+malformed timestamps or IDs, invalid DSNs, and DSN/project mismatches return
+`400 invalid_envelope` before acceptance. These transport headers are bounded
+metadata and remain outside the payload digest.
 
 `attachment` requires bounded bytes and may carry `filename`, `content_type`,
 `attachment_type`, and the integer `attachment_length`. When present,
@@ -1619,10 +1633,11 @@ response body. An empty Envelope follows the same no-op behavior. Exclusion
 diagnostics contain only item type, reason, count, project, request ID, and
 correlation ID.
 
-Unknown object members in Envelope headers, item headers, event payloads,
-client reports, minidump metadata, and extensible bounded DTO data are ignored
-at the adapter boundary and are never persisted, returned, or used for
-authorization. Exact management request bodies defined by this contract,
+Unknown top-level members in Envelope headers, members in item headers, event
+payloads, client reports, minidump metadata, and extensible bounded DTO data
+are ignored at the adapter boundary and are never persisted, returned, or used
+for authorization; the nested Envelope-header `sdk` and `trace` objects remain
+closed schemas. Exact management request bodies defined by this contract,
 including project mutations, release mutations, issue status transitions, and
 artifact or deployment assembly bodies, are closed schemas: an unknown member
 returns `400 invalid_request` before mutation. Unknown fields never authorize a
@@ -2089,9 +2104,14 @@ with no side effect. For an artifact bundle,
 SHA-1 of the byte-for-byte concatenation of those chunks after each
 `file_gzip` part has been decompressed, in exactly the listed order. No
 separator, JSON wrapper, multipart framing, compressed bytes, or chunk-name
-text is included in the preimage. The adapter verifies this checksum before
-assembly or persistence; a mismatch returns `400 invalid_request` and does not
-create an artifact or operation. A repeated normalized assembly request,
+text is included in the preimage. The adapter validates checksum syntax before
+accepting the assembly identity but defers byte verification until all
+requested chunks exist. A missing-chunk request is accepted as pending; once
+all chunks are available, the adapter computes the checksum before artifact
+registration. A mismatch terminalizes the accepted assembly as `failed` with a
+safe detail, no artifact or project registration, and no missing chunks; it is
+not converted into a synchronous `400` after pending acceptance. A repeated
+normalized assembly request,
 including its checksum, ordered chunks, version, distribution, and ordered
 project list, is an idempotent duplicate. The same checksum and bytes may be
 registered under a different release, distribution, or project list; those
@@ -2135,8 +2155,9 @@ one failed/null project result per input project; no project registration is
 exposed as a partial success. If failure is caused by missing or expired
 chunks, `missingChunks` is the unique set of requested chunk names absent at
 terminalization, sorted in lowercase lexicographic order. For every other
-terminal failure, `missingChunks` is exactly `[]`. Registration of all project
-artifacts is one atomic operation:
+terminal failure, `missingChunks` is exactly `[]`. A checksum mismatch is one
+of these terminal failures. Registration of all project artifacts is one atomic
+operation:
 if any target cannot complete, no target is committed as a successful result.
 Conflicting input remains `409 conflict`, and an unavailable owner remains
 `503 unavailable` rather than claiming a terminal result.
@@ -2199,9 +2220,10 @@ The pinned sentry-cli chunk workflow is:
    have completed their durable lifecycle checks.
 
 An interrupted upload leaves recoverable chunk state until its 24-hour
-retention fence; it does not create a release file. Missing chunks, checksum mismatch, ordering
-conflicts, expired upload state, quota exhaustion, unauthorized project lists,
-and cross-organization reuse are explicit errors. Same-organization reuse of an
+retention fence; it does not create a release file. Missing chunks, terminal
+checksum mismatch, ordering conflicts, expired upload state, quota exhaustion,
+unauthorized project lists, and cross-organization reuse are explicit errors.
+Same-organization reuse of an
 organization-scoped artifact-bundle chunk is allowed when assembly
 authorization passes. Assembly returns `202` while pending and `409` for
 conflicting content or an already terminal operation with incompatible input. A
@@ -2308,7 +2330,9 @@ a release and carry the following exact closed JSON body:
 ```
 
 `environment` and `timestamp` are required non-empty bounded strings; the
-timestamp is an RFC 3339 UTC instant. `name` and `url` are optional nullable
+timestamp is an RFC 3339 UTC instant with zero through nine fractional decimal
+digits. More than nine fractional digits returns `400 invalid_request` before
+mutation. `name` and `url` are optional nullable
 strings, with omission equivalent to `null`; a non-null URL is HTTP(S).
 `metadata` is optional but, when present, is a non-null object of bounded
 string keys and string values; omission is equivalent to `{}`. Duplicate or
@@ -2317,8 +2341,12 @@ metadata values, or values over the applicable field limits return
 `400 invalid_request` before mutation.
 
 The normalized body replaces omitted nullable values with `null`, omitted
-metadata with `{}`, NFC-normalizes strings, and is the RFC 8785 request digest
-preimage. Deployment writes do not require a client idempotency key; without
+metadata with `{}`, and NFC-normalizes strings. Distinct metadata keys that
+collide after NFC normalization are rejected with `400 invalid_request` before
+the digest or mutation; no key overwrites another. Accepted timestamps with
+fewer than nine fractional digits are right-padded with zeroes in the
+canonical UTC serialization. The normalized body is the RFC 8785 request
+digest preimage. Deployment writes do not require a client idempotency key; without
 one, retries use `(tenant_id, operation, release_scope,
 canonical_request_body_digest)`, so a new normalized body digest is a distinct
 deployment record. When a client key is supplied, it binds to the same release
@@ -2512,9 +2540,10 @@ exercise:
   nanosecond precision/range rejection, nullable level mapping, deterministic
   tag-array serialization, invalid levels, event items with no
   error signal, strict `user`/`sdk` type validation and null/missing/unknown
-  member mapping, strict Envelope `event_id`/`dsn`/`sent_at`/`sdk`/`trace`
-  header schemas and invalid-shape rejection, and NFC-normalized key collisions
-  before hashing;
+  member mapping, recognized Envelope `event_id`/`dsn`/`sent_at`/`sdk`/`trace`
+  header shapes, ignored unknown top-level members, rejected unknown nested
+  `sdk`/`trace` members, invalid-shape rejection, and NFC-normalized key
+  collisions before hashing;
 - new and duplicate chunks with exact `200` empty responses, conflicting
   chunks, interrupted assembly, optional and conflicting DIF idempotency keys,
   retries, polling, and lost responses, including non-terminal `not_found` and
@@ -2559,7 +2588,8 @@ exercise:
   `404` results, rate-limit headers, exact
   `rel="next"`/`results="true"`/`cursor` Link parameters, `limit` bounds,
   DSN-key, release-file, release-commit, and deployment lists, unknown fields,
-  mixed active/suspended organization lists, and every safe error class with
+  organization lists scoped to one credential owner including active and
+  suspended behavior, and every safe error class with
   the exact error-body member and detail rules, including consistent omission
   of `field_errors`;
 - exact organization/project DTO bodies, including nullable platform,
@@ -2603,11 +2633,12 @@ exercise:
   project authorization, and the Owner/Admin requirement when `projects` is
   omitted or empty;
 - project creation and browser-origin update with the exact closed request
-  bodies including the required explicit slug, canonical slug-collision and
-  reuse behavior, canonical creation digest, required idempotency, nullable platform,
-  origin validation, exact `200`/`202` Project and Operation DTO states,
-  duplicate behavior, generation headers and stale-generation rejection,
-  response headers, and rejection of unknown members;
+  bodies including the required explicit slug, printable-ASCII project-name
+  validation, canonical slug-collision and reuse behavior, canonical creation
+  digest, required idempotency, nullable platform, origin validation, exact
+  `200`/`202` Project and Operation DTO states, duplicate behavior, generation
+  headers and stale-generation rejection, ordinary alias reads without a
+  generation input, response headers, and rejection of unknown members;
 - issue queries with NFC plus Unicode 15.1 default case folding, `ß`/`ss`,
   locale-independent Turkish case behavior, and folded Unicode-scalar
   substring matching over only the Issue `title` and `culprit` projections,
@@ -2655,9 +2686,9 @@ exercise:
   and exact `now >= expires_at` absence;
 - valid, expired, revoked, insufficient-scope, cross-tenant, stale-projection,
   suspended, disabled, deleting, and deleted resources;
-- personal-token access to multiple organizations with globally unique
-  organization-slug and issue-alias resolution before tenant authorization and
-  independent organization-scoped project slugs;
+- personal-token and service-token organization lists limited to the
+  credential's owning organization, with cross-organization enumeration
+  denied and suspended owning organizations omitted safely;
 - organization/project reads, creation, update, deletion, DSN issuance,
   rotation/revocation, issue/event reads, resolve/reopen/ignore/mute/next-release,
   release requests without client idempotency keys, and deployment workflows
@@ -2677,11 +2708,13 @@ exercise:
   ordered per-project results for one and 100 projects, all-or-nothing
   successful/failed terminal
   states, sorted missing-chunk arrays for missing/expired terminal failures,
-  empty arrays for other terminal failures, safe details, and nullability;
+  empty arrays for other terminal failures, deferred checksum validation and
+  terminal checksum-mismatch failures, safe details, and nullability;
 - deployment writes with the closed JSON body, omitted/null normalization,
-  metadata bounds, canonical digest, exact `201` initial and `200` duplicate
-  responses, distinct no-key deployment bodies, and conflicting supplied-key
-  retry rejection, plus Write/Manage authorization over every associated
+  metadata bounds, NFC key-collision rejection, bounded timestamp precision,
+  canonical digest, exact `201` initial and `200` duplicate responses, distinct
+  no-key deployment bodies, and conflicting supplied-key retry rejection, plus
+  Write/Manage authorization over every associated
   release project and Owner/Admin authorization for unassociated releases;
 - owner outages, quota exhaustion, processing lag, symbolication lag, no
   excluded-payload persistence, and durable acceptance versus visibility.
