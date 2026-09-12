@@ -315,19 +315,29 @@ against that value. The upload is deliberately event-unbound: TUS creation
 stores no event ID and the pinned creation metadata remains only
 `attachment_type`. At binding, the adapter authorizes the collection DSN for
 the same tenant and project, requires the `Location` to resolve to that
-project-bound upload, requires the upload to be `complete-unbound` with the
-declared length, and requires the Envelope/event ID to identify the
-accepted event in that same tenant and project. It atomically transitions
-`complete-unbound` to `bound` and retains the uploaded bytes only as an
-attachment of that event. A completed upload never becomes a standalone
-event or attachment. A positive-length upload's pending lifetime is not
-extended by `PATCH`; once the declared length is reached, the adapter starts
-a fixed 24-hour `complete-unbound` lifetime at that completion time. A
-zero-length upload starts that same 24-hour lifetime at creation. Expiration
-is the exclusive boundary `now >= expires_at`: `HEAD`, `PATCH`, and Envelope
-binding return `404 not_found` at or after the boundary, even if physical
-garbage collection has not yet run. An unreferenced completed upload therefore
-expires without durable customer-payload acceptance.
+project-bound upload, and requires the Envelope/event ID to identify the
+accepted event in that same tenant and project. It evaluates the existing
+Envelope idempotency identity
+`(tenant_id, project_id, external_event_id, payload_digest)` before rejecting
+the upload state. An exact retry whose retained acceptance record already
+bound the same upload and attachment digest to the same event returns the
+original acceptance, even when the upload is now `bound`; it does not create a
+second attachment or transition. The retained binding record includes the
+upload ID, event ID, payload digest, attachment digest and length, and original
+acceptance. A retry with the same event ID and a different digest remains the
+documented `409 conflict`; an otherwise unmatched `bound` upload remains
+inaccessible. Only a first acceptance requires `complete-unbound` with the
+declared length, and it atomically transitions that state to `bound` while
+retaining the uploaded bytes only as an attachment of that event. A completed
+upload never becomes a standalone event or attachment. A positive-length
+upload's pending lifetime is not extended by `PATCH`; once the declared length
+is reached, the adapter starts a fixed 24-hour `complete-unbound` lifetime at
+that completion time. A zero-length upload starts that same 24-hour lifetime
+at creation. Expiration is the exclusive boundary `now >= expires_at`:
+`HEAD`, `PATCH`, and a non-idempotent Envelope binding return `404 not_found`
+at or after the boundary, even if physical garbage collection has not yet
+run. An unreferenced completed upload therefore expires without durable
+customer-payload acceptance.
 
 The reference attachment payload is a closed JSON object with exactly these
 two members:
@@ -577,6 +587,19 @@ idempotency binding, and pending request state. A stale or changed check keeps
 the operation pending and requires the customer to reauthenticate and
 reconfirm the same request; Support cannot widen the scope or originate a
 deletion.
+
+The same bodyless `DELETE` with the same project target, `If-Match`,
+`X-Watchtower-Project-Generation`, `X-Confirm-Project-Name`, and
+`Idempotency-Key` is the customer reconfirmation action for that pending
+operation. After Support releases the scope, a current Owner/Admin session
+recently reauthenticated within five minutes may repeat that exact request;
+API atomically replaces the pending operation's stored authentication proof and
+confirmation timestamp and returns the same `202` pending Operation DTO. This
+refresh never changes the project, observed version, generation, confirmation,
+or idempotency identity and never creates a second operation. A missing, stale,
+or mismatched proof leaves the operation unchanged and returns its normal
+authentication or precondition error; a changed target or key remains a
+`409 conflict`.
 
 There is one restricted read exception to the suspension fence. A `GET`
 `/api/0/operations/<operation_id>/` request may return the normal operation
@@ -945,7 +968,7 @@ an extension surface.
 | Issue | `permalink` | Required string URL |
 | Issue | `level` | Required enum: `sample`, `debug`, `info`, `warning`, `error`, `fatal`, or `unknown` |
 | Issue | `status` | Required enum: `resolved`, `ignored`, `pending_deletion`, `pending_merge`, `reprocessing`, or `unresolved` |
-| Issue | `statusDetails` | Required object whose only allowed keys are optional `ignoreCount`, `ignoreUntil`, `ignoreUserCount`, `ignoreUserWindow`, `ignoreWindow`, `actor`, `inNextRelease`, `inRelease`, `inCommit`, `pendingEvents`, and `info`; counts are non-negative integers, dates are RFC 3339 UTC strings, release flags/values use their pinned scalar types, and non-applicable keys are omitted |
+| Issue | `statusDetails` | Required object whose exact member types, nullability, and presence conditions are defined immediately below; non-applicable members are omitted |
 | Issue | `substatus` | Nullable enum: `archived_until_escalating`, `archived_until_condition_met`, `archived_forever`, `escalating`, `ongoing`, `regressed`, or `new` |
 | Issue | `isPublic` | Required boolean |
 | Issue | `platform` | Nullable string |
@@ -976,6 +999,23 @@ an extension surface.
 | Event | `dist` | Nullable string |
 | Event | `entries` | Required array of objects containing exactly string `type` and bounded JSON `data` |
 | Event | `metadata` | Required object containing exactly nullable string fields `type`, `value`, `filename`, and `function` |
+
+`Issue.statusDetails` is a closed object. A valid ignore contributes the
+non-negative integer `ignoreCount`, RFC 3339 UTC `ignoreUntil`, non-negative
+integer `ignoreUserCount`, non-negative integer `ignoreUserWindow`, and
+non-negative integer `ignoreWindow`; these five members are present only for a
+valid ignore condition. An applicable ignore or release/commit resolution may
+also contribute nullable `actor`, whose non-null value is exactly the Actor
+shape `{type: "user" | "team", id: string, name: string, email?: string}`.
+`inNextRelease` is the boolean `true` only for a resolved-in-next-release
+issue; `inRelease` is a non-empty release-version string only for a
+resolved-in-release issue; and `inCommit` is a non-empty commit identifier
+string only for a commit resolution. A reprocessing issue contributes the
+non-negative integer `pendingEvents` and nullable `info`; when non-null,
+`info` is exactly `{dateCreated: RFC-3339-UTC string, syncCount: non-negative
+integer, totalEvents: non-negative integer}`. All other members are omitted,
+and no member is emitted as `null` except `actor` and `info` under those
+applicable conditions.
 
 Event `entries` are serialized from the normalized event in this fixed order;
 each entry type appears at most once and absent source data produces no entry:
@@ -1695,10 +1735,15 @@ so records inserted or reordered after the first page are deferred to a new
 traversal rather than skipped or duplicated. Each page rechecks current
 authorization, revocation, lifecycle, retention, and security-projection
 freshness; a record that is no longer authorized is omitted without disclosure.
-A stale,
-cross-tenant, malformed, or expired cursor is rejected without disclosing data:
-malformed and expired cursors return `400` with `invalid_request`, while stale
-cursors whose bound authorization or security revision is no longer valid
+A snapshot and every cursor created for it have a fixed 15-minute lifetime
+starting at the instant the first page establishes the snapshot. The cursor
+carries that immutable expiration, and page reads, retries, and generated next
+links never refresh it. Expiration is the exact boundary `now >= expires_at`;
+the request returns `400 invalid_request` with no data disclosure at or after
+that boundary. A stale, cross-tenant, malformed, or expired cursor is rejected
+without disclosing data: malformed and expired cursors return `400` with
+`invalid_request`, while stale cursors whose bound authorization or security
+revision is no longer valid
 return `403` with `permission_denied`. A valid cursor replayed outside its
 tenant or otherwise inaccessible scope returns the same indistinguishable
 `404 not_found` used for an inaccessible resource.
@@ -1947,10 +1992,13 @@ missing chunks, `detail: null`, and one pending/null project result per input
 project. A successful terminal response is `200` with `state: "succeeded"`, an
 empty `missingChunks` array, `detail: null`, and one succeeded project result
 with its registered Artifact DTO for every input project. A terminal owner
-failure is `200` with `state: "failed"`, an empty or still-relevant
-`missingChunks` array, a non-null safe top-level detail, and one failed/null
-project result per input project; no project registration is exposed as a
-partial success. Registration of all project artifacts is one atomic operation:
+failure is `200` with `state: "failed"`, a non-null safe top-level detail, and
+one failed/null project result per input project; no project registration is
+exposed as a partial success. If failure is caused by missing or expired
+chunks, `missingChunks` is the unique set of requested chunk names absent at
+terminalization, sorted in lowercase lexicographic order. For every other
+terminal failure, `missingChunks` is exactly `[]`. Registration of all project
+artifacts is one atomic operation:
 if any target cannot complete, no target is committed as a successful result.
 Conflicting input remains `409 conflict`, and an unavailable owner remains
 `503 unavailable` rather than claiming a terminal result.
@@ -1974,7 +2022,13 @@ caller's authorization. Unknown, cross-organization, or otherwise inaccessible
 aliases return the same indistinguishable `404 not_found`; same-organization
 reuse is allowed after those checks. Watchtower bounds every field and enforces
 required checksum, order, project, and applicable artifact identity. These are
-adapter DTOs only.
+adapter DTOs only. Every accepted organization- or project-scoped chunk has
+`expires_at = accepted_at + 24h`, where `accepted_at` is the first successful
+storage time for that checksum in that scope. Matching retries, capability
+probes, assembly submission, and assembly polling do not extend the lifetime.
+At the exact boundary `now >= expires_at`, the chunk is treated as absent for
+matching and assembly even if physical cleanup has not run; a later valid
+upload may create a fresh record with a new `accepted_at`.
 The shared capability response advertises `maxFileSize: 50000000` for both
 artifact-bundle and DIF workflows, so a pinned client cannot submit a DIF
 larger than the 50 MB debug-file limit. The `1,000,000,000` assembled release
@@ -2006,8 +2060,8 @@ The pinned sentry-cli chunk workflow is:
 6. Expose terminal artifact registration only after API and artifact authority
    have completed their durable lifecycle checks.
 
-An interrupted upload leaves recoverable chunk state until its retention fence;
-it does not create a release file. Missing chunks, checksum mismatch, ordering
+An interrupted upload leaves recoverable chunk state until its 24-hour
+retention fence; it does not create a release file. Missing chunks, checksum mismatch, ordering
 conflicts, expired upload state, quota exhaustion, unauthorized project lists,
 and cross-organization reuse are explicit errors. Same-organization reuse of an
 organization-scoped artifact-bundle chunk is allowed when assembly
@@ -2047,6 +2101,14 @@ only when the route project is currently readable by the principal, and the
 Release DTO's `projects` array is filtered to associated projects for which the
 principal has current read authority. The route project must remain in the
 filtered array; otherwise the route returns indistinguishable `404 not_found`.
+For organization-scoped release list and detail reads, an associated release
+is eligible only when at least one associated project is currently readable by
+the principal; its `projects` array is filtered to those readable projects,
+and an eligible release with no remaining readable project is omitted or
+returned as indistinguishable `404 not_found` for detail. An unassociated
+release is visible only to a principal with organization-level `Owner` or
+`Admin` authority. No organization-scoped Release DTO exposes an unreadable
+project's ID, slug, or name.
 For `previous-with-commits`, readable-project scope is applied before candidate
 ordering and selection, so a candidate associated only with unreadable
 projects is not eligible and produces the standard `404 not_found` when no
@@ -2082,8 +2144,14 @@ returns the same `204` no-op; an unknown or inaccessible target returns
 `404 not_found`, a stale observed version or key reused for another target
 returns `409 conflict`, and an unavailable artifact owner returns `503`.
 
-Release finalization is idempotent. Deployment records reference a release and
-carry the following exact closed JSON body:
+Release finalization is idempotent. Before a deployment record is accepted, the
+adapter resolves every project associated with the release and requires the
+authenticated principal to have current `Write` or `Manage` authority on every
+one. A deployment for an unassociated release requires organization-level
+`Owner` or `Admin` authority. These checks are repeated for retries and occur
+before returning a new or duplicate deployment result; an inaccessible or
+unauthorized project fails closed without mutation. Deployment records reference
+a release and carry the following exact closed JSON body:
 
 ```json
 {
@@ -2268,7 +2336,9 @@ exercise:
   against dereferenced upload bytes rather than reference JSON bytes, and
   subsequent Envelope `attachment-ref` binding to the event ID, including the
   canonical lowercase UUID v7 upload ID, event-unbound creation metadata,
-  same-project binding authorization, and rejection of cross-project binding;
+  same-project binding authorization, exact same-event retries after a lost
+  `200` binding response when the upload is already `bound`, and rejection of
+  cross-project binding;
 - empty, unsupported-only, attachment-only, supported-only, and mixed Envelopes,
   including unassociated-attachment exclusion, and an
   envelope-level event ID on an excluded-only Envelope, all expecting `200`
@@ -2321,9 +2391,12 @@ exercise:
   no broader project DTO disclosure, plus authorized polling of that exact
   deletion operation while suspended, the pending Support release gate, and
   rejection of unrelated operation status reads; deletion also covers its
-  zero-byte body requirement and rejection of `{}` or other entity bodies;
+  zero-byte body requirement and rejection of `{}` or other entity bodies,
+  plus same-key fresh-authentication reconfirmation after Support release
+  without creating a second operation;
 - pagination using the documented per-route order and tie-breaker, snapshot
-  consistency under concurrent inserts/updates, cursor binding, malformed and
+  consistency under concurrent inserts/updates, the fixed 15-minute cursor
+  lifetime and exact `now >= expires_at` cutoff, cursor binding, malformed and
   expired cursor `400` results, stale cursor `403` results, cross-tenant cursor
   `404` results, rate-limit headers, exact
   `rel="next"`/`results="true"`/`cursor` Link parameters, `limit` bounds,
@@ -2334,6 +2407,8 @@ exercise:
   canonical aliases, origin arrays, omitted unknown fields, and list/detail
   consistency;
 - exact issue/event DTO bodies, nullable fields, omitted unknown fields,
+  every `statusDetails` member's exact type, nullability, and status-dependent
+  presence condition, including Actor and reprocessing-info shapes,
   list/detail/status-transition consistency, tenant-unique issue aliases, CLI
   `muted`/`resolvedInNextRelease` mappings, exact single-issue and bulk PUT
   bodies, exact issue-list `query`/`status`/repeated `environment`/`cursor`/
@@ -2351,7 +2426,9 @@ exercise:
   deterministic ordering/tie-breaking, normalized project/environment array
   ordering, readable-project candidate filtering before selection,
   inaccessible-project filtering, no-match behavior, and the pinned
-  sentry-cli parsing workflow;
+  sentry-cli parsing workflow, including organization release list/detail
+  filtering for readable projects and unassociated-release organization
+  authority;
 - release creation, metadata update, and finalization with the exact request
   bodies, nullable fields, mutually exclusive combinations, canonical digests,
   observed-generation retry identities carried by required `If-Match` ETags,
@@ -2404,7 +2481,9 @@ exercise:
   DIF/artifact-bundle assembly cardinality at and over each explicit digest,
   chunk, and project limit before lookup, including zero, one, 100, duplicate,
   cross-organization, and 101-project artifact lists, and repeated identical
-  assembly POST polling without a generic status URL;
+  assembly POST polling without a generic status URL, the 24-hour
+  organization/project chunk lifetime, non-extending duplicate/poll behavior,
+  and exact `now >= expires_at` absence;
 - valid, expired, revoked, insufficient-scope, cross-tenant, stale-projection,
   suspended, disabled, deleting, and deleted resources;
 - personal-token access to multiple organizations with globally unique
@@ -2425,11 +2504,13 @@ exercise:
   preserving chunk order;
 - artifact-bundle polling with exact pending `202`, ordered per-project
   results for one and 100 projects, all-or-nothing successful/failed terminal
-  states, missing-chunk arrays, safe details, and nullability;
+  states, sorted missing-chunk arrays for missing/expired terminal failures,
+  empty arrays for other terminal failures, safe details, and nullability;
 - deployment writes with the closed JSON body, omitted/null normalization,
   metadata bounds, canonical digest, exact `201` initial and `200` duplicate
   responses, distinct no-key deployment bodies, and conflicting supplied-key
-  retry rejection;
+  retry rejection, plus Write/Manage authorization over every associated
+  release project and Owner/Admin authorization for unassociated releases;
 - owner outages, quota exhaustion, processing lag, symbolication lag, no
   excluded-payload persistence, and durable acceptance versus visibility.
 
