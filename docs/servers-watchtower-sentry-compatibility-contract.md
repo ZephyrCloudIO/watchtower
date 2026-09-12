@@ -316,6 +316,33 @@ disabled project still applies these write rules. Organization-scoped chunk
 staging remains reusable organization state and is fenced at project-bound
 assembly.
 
+A `deleting` project is fenced for every ordinary management route after
+authentication and tenant/project resolution. A direct project-bound project
+read or mutation, including project detail/settings, DSN reads or mutations,
+issue and event reads or status transitions, release and release-file reads or
+mutations, project-scoped chunk or DIF/artifact operations, and deployment
+records, returns `409 conflict` with detail `The request conflicts with the
+current resource state.` and creates no side effect. Organization-scoped
+collection and list reads continue to apply their existing readable-project
+filters and omit records owned by deleting projects; they do not expose a
+deleting project DTO or lifecycle status. Unknown or inaccessible resources
+retain the ordinary indistinguishable `404 not_found` result, and malformed or
+invalid credentials fail before lifecycle evaluation.
+
+The project deletion flow has two exceptions to this fence. A bodyless
+`DELETE` that repeats the same principal, project generation, observed
+`If-Match`, exact confirmation, and idempotency identity as the stored deletion
+operation revalidates current deletion authority and returns that operation's
+existing `202` pending or terminal `200` response; it never creates a second
+operation. A changed deletion identity, another principal, or a new deletion
+attempt while the project is deleting returns `409 conflict` without mutation.
+`GET /api/0/operations/<operation_id>/` remains available for the exact
+project-deletion operation to an authorized caller for that tenant while the
+project is deleting and returns the normal Operation DTO, whose successful
+deletion result remains `null`; it exposes no project or organization DTO.
+Other operation IDs remain subject to ordinary authorization and lifecycle
+rules.
+
 After bounded transport decoding, event parsing, and complete structural
 validation, Ingest normalizes the identity of a retained supported event item
 and performs the event idempotency lookup before applying the API-owned
@@ -721,6 +748,15 @@ read receives the ordinary suspension response.
   carry a valid Watchtower credential of the correct kind. Credentials are
   never logged, returned, copied into internal messages, or used to bypass
   current authorization.
+- For management requests, `Authorization: Bearer` and `X-Sentry-Token` are
+  alternate credential sources with no precedence. If both are supplied, each
+  must independently resolve to the same current principal, owning
+  organization, and effective project-grant scope; a malformed, invalid, or
+  conflicting source returns `401 invalid_authentication` before tenant or
+  project lookup, idempotency evaluation, or mutation. Agreeing sources are
+  evaluated as one management principal. The native user session required for
+  project deletion is a separate authorization requirement and does not create
+  a token-source precedence rule.
 - Authentication failure is `401`; an inaccessible resource is `404`; an
   authenticated but unauthorized visible action is `403`; stale observed
   versions and lifecycle conflicts are `409`; exhausted quota is `429`; an
@@ -906,7 +942,7 @@ only representation of an absent nullable Release timestamp.
 | DIF | `sha1` | Required lowercase 40-character hexadecimal full-file SHA-1 |
 | DIF | `type` | Required enum: `debug`, `proguard`, `breakpad`, or `sourcebundle` |
 | DIF | `state` | Required sentry-cli enum: `not_found`, `created`, `assembling`, `ok`, or `error` |
-| DIF | `missingChunks` | Required array of lowercase 40-character hexadecimal SHA-1 values; empty when complete |
+| DIF | `missingChunks` | Required array of unique lowercase 40-character hexadecimal SHA-1 values sorted in lexicographic order; empty when complete |
 | DIF | `detail` | Nullable bounded safe processing detail |
 | DIF | `dateCreated` | Required UTC timestamp serialized exactly as `YYYY-MM-DDTHH:mm:ss.sssssssssZ` |
 | DSN | `id` | Required non-empty string compatibility alias; never a Watchtower canonical ID |
@@ -2324,9 +2360,14 @@ release or distribution fields. Every result contains exactly
 and require `dif`; and `error` requires non-null bounded safe `detail` and
 omits `dif`. Neither field is emitted as `null`. DIF `state` uses only
 `not_found`, `created`, `assembling`, `ok`, and `error`. Missing chunks produce
-non-terminal `not_found` with a non-empty `missingChunks` array; once all
-chunks are available but assembly is still running, the state is non-terminal
-`assembling` with an empty array. A newly registered DIF returns terminal
+non-terminal `not_found` with a non-empty `missingChunks` array. For this
+non-terminal state, the array is the unique set of requested chunk checksums
+that are absent at response time, including expired chunks, normalized to
+lowercase and sorted in lowercase lexicographic order. Repeated requested
+checksums appear once and request order is not preserved; repeated polls return
+the same array while the absent set is unchanged. Once all chunks are available
+but assembly is still running, the state is non-terminal `assembling` with an
+empty array. A newly registered DIF returns terminal
 `created`; an already registered matching DIF or a later successful poll of a
 completed assembly returns terminal `ok`. Terminal owner failure produces
 `error` with an empty `missingChunks` array. Neither `created` nor `ok` is a
@@ -2841,6 +2882,8 @@ exercise:
   terminalization, stable expiry errors and missing-chunk ordering, newly
   created terminal `created`, and duplicate/polled terminal `ok` DIF states
   with exact state-specific `detail`/`dif` presence, plus
+  repeated and unsorted missing chunk references asserting unique sorted
+  pending `missingChunks` arrays,
   identical DIF bytes submitted with alternate valid chunk partitions or names,
   asserting first-write-wins for the registered logical name, decompressed-byte
   SHA-1 mismatch rejection with no partial persistence, and case-variant,
@@ -2850,6 +2893,10 @@ exercise:
   URLs, including conventional comma-and-space `X-Sentry-Auth` members,
   percent-decoding, duplicate parameters, missing/unknown members,
   route-project mismatches, and conflicting sources;
+- management credentials supplied through `Authorization: Bearer` and
+  `X-Sentry-Token`, including agreeing sources, conflicting principals or
+  effective scopes, malformed secondary sources, and rejection before tenant
+  lookup or mutation;
 - versioned and versionless artifact-bundle assembly, the deterministic
   `artifact-bundle-<checksum>` name, reuse of identical bundle bytes across
   release, distribution, and project-list identities, release-artifact
@@ -2993,6 +3040,11 @@ exercise:
   the environment fence, plus authorized disabled-project reads, blocked
   project-bound management writes, reusable organization-scoped chunk staging,
   staging reuse for disabled targets, and `403` at disabled-project assembly;
+- deleting-project management reads and writes across project settings, DSNs,
+  issues/events, releases, deployments, and artifact routes, including omitted
+  deleting records in collection lists, exact deletion retries returning the
+  existing operation, changed-identity conflicts, and authorized polling of
+  only the associated deletion operation;
 - chunk requests at and over the advertised `maxRequestSize`, including
   duplicate and rejected parts, with `413` and no partial persistence for an
   over-limit request, `400` for overlong scalar fields with the exact generic
