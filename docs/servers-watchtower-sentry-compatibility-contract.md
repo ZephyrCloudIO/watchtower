@@ -745,7 +745,7 @@ payloads into internal messages.
 
 | Operation | Required request fields | Successful response fields |
 | --- | --- | --- |
-| Envelope/event admission | Project DSN, project alias, Envelope headers, item headers/payloads, and a supported event ID for event items | A non-conflicting Envelope `POST` returns `200` with an empty body and request ID headers; digest/idempotency conflicts return `409`; legacy or client-specific body expectations retain the preserved scoped external event ID |
+| Envelope/event admission | Project DSN, project alias, Envelope headers, item headers/payloads, and a supported event ID for event items | A non-conflicting Envelope `POST` returns `200` with an empty body and request ID headers; digest/idempotency conflicts return `409`; the supplied external event ID remains scoped request/event identity and is not returned in the success response |
 | Organization/project read | Organization/project compatibility alias and current management credential | Upstream-compatible resource DTO containing only currently readable fields, canonical-safe pagination link, and request ID |
 | Project create/update/delete | Organization scope, the exact project mutation body defined below, current authorization, observed version and `X-Watchtower-Project-Generation` for settings update and delete, a bodyless delete, `X-Confirm-Project-Name` for delete, and idempotency key for create/delete | Exact `200` Project DTO or `202`/`200` Operation DTO responses defined in Project mutation responses; direct Project DTOs include the strong `ETag` and project-generation header |
 | DSN issue/rotate/revoke | Project scope, the exact closed issuance body, `{}` rotation body, or bodyless revocation shape below, current Manage authority, and a required idempotency key | `201` issuance or `200` rotation returns the fixed DSN DTO; `204` revocation has an empty body; management-token plaintext is never returned |
@@ -1082,12 +1082,16 @@ instant recorded by Ingest, not the client-supplied event time. When present,
 the event `timestamp` is a finite JSON number of Unix seconds in the inclusive
 range `0` through `253402300799.999999999` (from 1970-01-01T00:00:00Z through
 9999-12-31T23:59:59.999999999Z) with no more than nine fractional decimal
-digits. The adapter converts it to `dateCreated` using the canonical UTC
-representation `YYYY-MM-DDTHH:mm:ss.sssssssssZ`; a missing `timestamp` uses
-the same `accepted_at` instant for `dateCreated`. A non-finite, negative,
-out-of-range, or sub-nanosecond timestamp rejects the Envelope with `400
-invalid_envelope`. Event lists order by `dateReceived DESC`, then external
-event ID, regardless of `dateCreated`.
+digits after exact decimal expansion. The adapter parses the raw JSON number
+lexeme as an exact decimal, requires an integral number of nanoseconds, and
+stores that value in `normalized_event_object.timestamp` as a fixed-point
+decimal string with exactly nine fractional digits. It converts the same exact
+value to `dateCreated` using the canonical UTC representation
+`YYYY-MM-DDTHH:mm:ss.sssssssssZ`; a missing `timestamp` uses the same
+`accepted_at` instant for `dateCreated`. A non-finite, negative, out-of-range,
+or sub-nanosecond timestamp rejects the Envelope with `400 invalid_envelope`.
+Event lists order by `dateReceived DESC`, then external event ID, regardless of
+`dateCreated`.
 
 `Issue.statusDetails` is a closed object. A valid ignore contributes the
 non-negative integer `ignoreCount`, RFC 3339 UTC `ignoreUntil`, non-negative
@@ -1715,10 +1719,10 @@ management schemas remain the explicit exception.
   header `Retry-After: 5`. Terminal `200` responses do not include this
   pending-operation header. This fixed polling delay is independent of the
   separate quota-derived `Retry-After` values for `429` and `503` responses.
-- Successful responses include a safe request ID and, where the upstream
-  client expects it, the preserved external event ID. `X-Request-ID` is echoed
-  or generated as a canonical lowercase UUID v7 and `X-Watchtower-Request-ID`
-  is provided for diagnostics.
+- Successful responses include a safe request ID. Ingestion success responses
+  do not include an external event ID; the supplied value remains scoped
+  request/event identity. `X-Request-ID` is echoed or generated as a canonical
+  lowercase UUID v7 and `X-Watchtower-Request-ID` is provided for diagnostics.
 - Safe errors use the upstream-compatible status and shape required by the
   pinned client while including a stable Watchtower code and request ID.
   Original causes are represented only by bounded, redacted structured
@@ -1734,7 +1738,7 @@ management schemas remain the explicit exception.
   | Field class | Accepted shape and normalization |
   | --- | --- |
   | `event_id` | Required 32-character hexadecimal string, lowercased. |
-  | `timestamp` | Optional finite JSON number of Unix seconds, represented by its RFC 8785 canonical number form; non-finite values and strings are invalid. |
+  | `timestamp` | Optional finite JSON number of Unix seconds, parsed from its raw JSON number lexeme as an exact decimal and represented as a fixed-point string with exactly nine fractional digits; non-finite values, strings, and values that are not an integral number of nanoseconds are invalid. |
   | `platform`, `level`, `message`, `culprit`, `transaction`, `release`, `dist`, `environment` | Optional bounded UTF-8 strings or `null`; strings are NFC-normalized, and `level` is lowercased. Missing and explicit `null` are omitted from the normalized object. |
   | `tags` | Optional object whose keys and values are bounded UTF-8 strings; both are NFC-normalized, and the object keys are sorted by RFC 8785 canonical order. |
   | `contexts` | Optional `null` or bounded JSON object. An explicit `null` is treated as absent; object keys are NFC-normalized and sorted, and nested arrays preserve order. |
@@ -2595,7 +2599,9 @@ exercise:
   stacktrace-only error events, exception events, deterministic multi-entry
   Event DTO serialization and ordering, deterministic Event `title` candidate
   precedence and empty fallback, deterministic Event `culprit` precedence and
-  null fallback, `timestamp` to `dateCreated` mapping,
+  null fallback, exact nanosecond timestamp normalization and distinct
+  `payload_digest` values for one-nanosecond changes, `timestamp` to
+  `dateCreated` mapping,
   `accepted_at` to `dateReceived` mapping, missing-timestamp fallback,
   nanosecond precision/range rejection, nullable level mapping, deterministic
   tag-array serialization, invalid levels, event items with no
