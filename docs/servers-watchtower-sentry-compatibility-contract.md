@@ -262,21 +262,28 @@ project returns `403 permission_denied` with detail `Permission denied.`; a
 `deleting` project returns `409 conflict` with detail `The request conflicts
 with the current resource state.`; and a `deleted` project returns `404
 not_found`.
-These lifecycle responses apply to collection and upload admission, and every
-rejected request persists no payload, acceptance record, attachment bytes, or
-operation state.
+These lifecycle responses apply to collection admission and every
+project-bound upload or assembly request, and every rejected request persists
+no payload, acceptance record, attachment bytes, or operation state.
+Organization-scoped chunk staging is project-neutral because its request carries
+no project identity; it follows organization authorization and lifecycle rules
+and is not rejected for a project's disabled state. The project fence is applied
+when that staged data is supplied to a project-bound upload or assembly.
 
 Disablement also applies to management mutations. Authorized `GET` project,
 DSN, issue, event, release, commit, release-file, chunk-capability, and
 operation-status reads remain available, while a disabled project's project
 settings `PUT`, DSN issue/rotation/revocation, issue status `PUT`, release
-create/update/finalize, release-file upload/deletion, chunk upload, DIF or
-artifact assembly, and deployment creation return `403 permission_denied`
+create/update/finalize, release-file upload/deletion, project-scoped chunk
+upload, DIF or artifact assembly, and deployment creation return `403
+permission_denied`
 with detail `Permission denied.` and create no side effect. The compatibility
 project `DELETE` remains available as the authorized lifecycle deletion flow;
 internal retention and purge continue normally. A capability read may return
-its normal metadata, but every upload or assembly URL for a disabled project
-still applies these write rules.
+its normal metadata, but every project-bound upload or assembly request for a
+disabled project still applies these write rules. Organization-scoped chunk
+staging remains reusable organization state and is fenced at project-bound
+assembly.
 
 After bounded transport decoding and event parsing, but before event
 normalization, idempotency lookup, persistence, or durable acceptance, Ingest
@@ -353,9 +360,9 @@ the allowlist, or a project with no configured allowlist, receives
 | `/api/0/organizations/` | `GET` organization reads for the authenticated principal; pagination and current authorization apply. Organization creation, deletion, membership, team, SSO, and broad settings administration are not exposed through Sentry compatibility. |
 | `/api/0/organizations/<organization>/` | `GET` organization read. Unknown or unauthorized organizations return indistinguishable `404`. |
 | `/api/0/organizations/<organization>/projects/` | `GET` project list and `POST` project creation using the exact request body below. Creation returns the pending Operation DTO defined in Project mutation responses until all required owners and Jobs acknowledge enablement. |
-| `/api/0/projects/<organization>/<project>/` | `GET` project read, `PUT` supported project settings including the browser-origin allowlist, and `DELETE` project deletion. Project deletion requires a current Owner/Admin user session recently reauthenticated within five minutes under applicable organization SSO/MFA conditions, `X-Confirm-Project-Name` containing the exact current project name, idempotency, lifecycle fences, and never reports success before authoritative completion. |
+| `/api/0/projects/<organization>/<project>/` | `GET` project read, `PUT` supported project settings including the browser-origin allowlist, and bodyless `DELETE` project deletion. Project deletion requires a current Owner/Admin user session recently reauthenticated within five minutes under applicable organization SSO/MFA conditions, the current strong `If-Match`, `X-Confirm-Project-Name` containing the exact current project name, idempotency, lifecycle fences, and never reports success before authoritative completion. |
 | `/api/0/projects/<organization>/<project>/keys/` | `GET` DSN metadata/public DSNs and `POST` issuance using the exact closed body and `201` response below. Plaintext management tokens are never returned. |
-| `/api/0/projects/<organization>/<project>/keys/<key_id>/` | `PUT` rotation with an empty body and `200` DSN response, and bodyless `DELETE` revocation with `204`; both use the exact idempotency rules below and never return a secret. |
+| `/api/0/projects/<organization>/<project>/keys/<key_id>/` | `PUT` rotation with the empty JSON object `{}` and `200` DSN response, and bodyless `DELETE` revocation with `204`; both use the exact idempotency rules below and never return a secret. |
 | `/api/0/projects/<organization>/<project>/issues/` | `GET` issue list with the exact bounded filters and cursor pagination defined below, and `PUT` only for the pinned bulk status operation with repeated bounded `id` query parameters and a `resolved`, `unresolved`, `ignored`, `muted`, or `resolvedInNextRelease` status body. The latter two map as defined for the unqualified issue route. `POST`, `DELETE`, and unbounded bulk operations are unsupported. |
 | `/api/0/issues/<issue>/` | `GET` issue read and `PUT` status transitions with the exact request body defined below for `resolved`, `unresolved`, `ignored`, `muted`, and `resolvedInNextRelease`. `muted` maps to `ignored`; `resolvedInNextRelease` maps to `resolved` with `statusDetails.inNextRelease: true`. Issue assignment, merge, split, delete, bookmark, alert, and comment operations are unsupported. |
 | `/api/0/issues/<issue>/events/` | `GET` issue event list with bounded cursor pagination. |
@@ -391,9 +398,11 @@ method addressed to one of these explicitly unsupported paths has the same
 `501` result. Unknown paths return `404`, while an unsupported method on a
 known supported path returns `405`.
 
-Organization and project path slugs are compatibility aliases only. The
-adapter resolves them under the canonical tenant UUID and expected resource
-generation; a slug cannot select a resource in another tenant. A deleted
+Organization path slugs are globally unique compatibility aliases and are
+resolved before tenant selection. Project path slugs are compatibility aliases
+unique within their organization and are resolved only after the canonical
+tenant is selected. Both resolutions require the expected resource generation;
+a project slug cannot select a resource in another tenant. A deleted
 resource's slug may be reused only after deletion completes and only by a new
 resource generation. A replacement receives a new canonical UUID, generation,
 and credentials.
@@ -434,15 +443,26 @@ canonical-JSON encoding of the normalized body; the required
 `Idempotency-Key` binds to that digest and is excluded from it. Project updates
 use the observed strong `If-Match` ETag and existing mutation idempotency rules.
 
+`DELETE /api/0/projects/<organization>/<project>/` has a bodyless request
+shape: the entity body must be zero bytes. A present body, including `{}`, is
+`400 invalid_request` before idempotency lookup or mutation. Deletion requires
+the current strong `If-Match`, the exact `X-Confirm-Project-Name` value, and a
+required `Idempotency-Key`.
+
 ### Browser-origin project setting
 
 API owns the project setting `browser_origins`. A project `PUT` may replace it
 with a JSON array of unique serialized origins using the existing `Manage`
 authority, observed resource version, and idempotency rules. Each value has an
 `http` or `https` scheme, an ASCII host, and an optional port, with no path,
-query, fragment, wildcard, or credentials. The stored form uses lowercase
-scheme/host and canonical origin serialization; the empty array disables
-browser-origin admission.
+query, fragment, wildcard, or credentials. Canonicalization uses the WHATWG
+URL Standard origin serializer for HTTP(S): the scheme and host are lowercase,
+default ports (`80` for `http`, `443` for `https`) are omitted, non-default
+ports are retained in decimal form, and the serialized origin contains no
+trailing slash. IPv6 hosts use the serializer's bracketed canonical form. The
+stored form uses this canonical serialization; if two input values serialize to
+the same origin, the request returns `400 invalid_request` rather than silently
+deduplicating them. The empty array disables browser-origin admission.
 
 Project creation persists an empty `browser_origins` array as part of its
 initial settings. API propagates each versioned change to Ingest through the
@@ -469,7 +489,7 @@ mutation is the complete Project DTO; the result for deletion is `null`.
 | --- | --- | --- | --- |
 | Project creation | `POST` returns `202` pending Operation DTO and requires `Idempotency-Key`. | The same key and canonical body return the same pending operation with `202`; changed body within the same principal/organization/operation tuple returns `409 conflict`, while another scope is independent. | The operation URL returns `200` with `status: "succeeded"` and the Project DTO in `result`; repeating the same key returns that same terminal Operation DTO with `200`. |
 | Browser-origin update | When the generation-matched Ingest acknowledgement is already available, `PUT` returns `200` with the Project DTO, the new strong `ETag`, and no `Location` or `Retry-After`; otherwise it returns `202` with a pending Operation DTO. | A retry with the same project, observed `If-Match`, normalized body, and supplied key, if any, returns the same current `200` or `202` result before the current-version check; otherwise a stale `If-Match` returns `409 conflict`. | A pending update polls to `200` with a succeeded Operation DTO whose `result` is the updated Project DTO; a completed duplicate returns the same terminal result. |
-| Project deletion | An authorized request with the required confirmation, observed `If-Match`, and `Idempotency-Key` returns `202` pending Operation DTO; it never returns a Project DTO. | The same target and key return the same pending operation with `202`; changed content within the same principal/project/operation tuple returns `409 conflict`, while another scope is independent. | The operation URL and a terminal retry return `200` with a succeeded Operation DTO and `result: null`; no deleted Project DTO is exposed. |
+| Project deletion | A bodyless authorized request with the required confirmation, observed `If-Match`, and `Idempotency-Key` returns `202` pending Operation DTO; it never returns a Project DTO. | The same target and key return the same pending operation with `202`; changed content within the same principal/project/operation tuple returns `409 conflict`, while another scope is independent. | The operation URL and a terminal retry return `200` with a succeeded Operation DTO and `result: null`; no deleted Project DTO is exposed. |
 
 Direct Project DTO responses include the resource `ETag`; Operation DTO
 responses do not claim resource completion until their `status` is terminal.
@@ -624,12 +644,12 @@ payloads into internal messages.
 | --- | --- | --- |
 | Envelope/event admission | Project DSN, project alias, Envelope headers, item headers/payloads, and a supported event ID for event items | A non-conflicting Envelope `POST` returns `200` with an empty body and request ID headers; digest/idempotency conflicts return `409`; legacy or client-specific body expectations retain the preserved scoped external event ID |
 | Organization/project read | Organization/project compatibility alias and current management credential | Upstream-compatible resource DTO containing only currently readable fields, canonical-safe pagination link, and request ID |
-| Project create/update/delete | Organization scope, the exact project mutation body defined below, current authorization, observed version for settings, `X-Confirm-Project-Name` for delete, and idempotency key for create/delete | Exact `200` Project DTO or `202`/`200` Operation DTO responses defined in Project mutation responses; direct Project DTOs include the strong `ETag` |
-| DSN issue/rotate/revoke | Project scope, the exact closed issuance body or empty/bodyless mutation shape below, current Manage authority, and a required idempotency key | `201` issuance or `200` rotation returns the fixed DSN DTO; `204` revocation has an empty body; management-token plaintext is never returned |
+| Project create/update/delete | Organization scope, the exact project mutation body defined below, current authorization, observed version for settings update and delete, a bodyless delete, `X-Confirm-Project-Name` for delete, and idempotency key for create/delete | Exact `200` Project DTO or `202`/`200` Operation DTO responses defined in Project mutation responses; direct Project DTOs include the strong `ETag` |
+| DSN issue/rotate/revoke | Project scope, the exact closed issuance body, `{}` rotation body, or bodyless revocation shape below, current Manage authority, and a required idempotency key | `201` issuance or `200` rotation returns the fixed DSN DTO; `204` revocation has an empty body; management-token plaintext is never returned |
 | Issue/event read or status transition | Tenant-unique issue alias or tenant/project-scoped event alias, bounded filters or status, and current credential | The fixed Issue or Event DTO below, request ID, and cursor link when paginated |
 | Release mutation | Organization/project scope, release version, bounded metadata, and canonical request identity; an `Idempotency-Key` may additionally bind the request | `201` for a new release or `200` for duplicate/update/finalization, with the direct Release DTO and request-ID headers; no operation state |
 | Release artifact upload | Project/release version scope, logical filename, optional distribution, bounded bytes, artifact type, and management credential | Artifact/file/checksum identity, upload or assembly operation ID, and `202` pending state when asynchronous |
-| DIF chunk/assembly upload | Organization or project capability scope for chunks, project scope for assembly, a checksum-keyed request map of one to 256 entries whose lowercase full-file SHA-1 keys each map to `name`, optional `debug_id`, and ordered chunks, bounded bytes, and management credential | DIF checksum/debug identities, assembly operation ID, and `202` pending state when asynchronous |
+| DIF chunk/assembly upload | Organization or project capability scope for chunks, project scope for assembly, a checksum-keyed request map of one to 256 entries whose lowercase full-file SHA-1 keys each map to `name`, optional `debug_id`, and ordered chunks, bounded bytes, and management credential | DIF checksum/debug identities and native repeat-POST `202` pending state when asynchronous; no assembly operation ID or status URL is returned |
 | Release file deletion | Exact project/release scope, required `file_id`, current Manage authority, required observed resource version, and a required idempotency key | `204` with an empty body after durable deletion; repeating the same target is the same successful no-op |
 | Deployment record | Organization scope, release version, environment/name/timestamp, bounded metadata, and canonical request identity; an `Idempotency-Key` may additionally bind the request | Deployment identity, release reference, timestamp, and request ID |
 
@@ -907,17 +927,18 @@ an extension surface.
 | Event | `metadata` | Required object containing exactly nullable string fields `type`, `value`, `filename`, and `function` |
 
 The project issue-list route accepts only these query parameters. Each scalar
-parameter may occur once; repeated scalar parameters, unknown parameters, empty
-values, malformed percent-encoding, and values over the applicable 256-byte
-filter limit return `400 invalid_request` before lookup. `cursor` is the
-opaque cursor from `Link`; `limit` is one decimal integer from `1` through
-`100`, defaulting to `100`.
+parameter may occur once except `environment`, which may occur one to 100
+times. Unknown parameters, empty values, malformed percent-encoding, and
+values over the applicable 256-byte filter limit return `400 invalid_request`
+before lookup. More than 100 unique `environment` values returns `413
+payload_too_large` before lookup. `cursor` is the opaque cursor from `Link`;
+`limit` is one decimal integer from `1` through `100`, defaulting to `100`.
 
 | Parameter | Grammar and semantics |
 | --- | --- |
 | `query` | One non-empty UTF-8 literal, with no query-language operators; case-insensitive substring matching is applied to issue title, culprit, and message. |
 | `status` | One of `resolved`, `unresolved`, or `ignored`; it filters the current issue status. |
-| `environment` | One or more unique non-empty environment strings; repeated values are ORed, while different parameter names are ANDed. |
+| `environment` | One to 100 unique non-empty environment strings; repeated values are ORed, while different parameter names are ANDed. |
 | `cursor` | One opaque, URL-safe cursor returned by the contract's `Link` header; it cannot be combined with a different route scope or filter set. |
 | `limit` | One decimal page size from `1` through `100`; it is not part of the filter predicate but is bound into the cursor. |
 
@@ -1102,7 +1123,7 @@ operation state; the owner-specific failure is recovered asynchronously.
 | --- | --- | --- |
 | Envelope | `application/x-sentry-envelope`; `text/plain;charset=UTF-8` for browser SDK string Envelopes; `application/octet-stream` or an absent `Content-Type` only for a pinned binary Envelope transport | identity and gzip |
 | Legacy store | `application/json` | identity and gzip |
-| Minidump | `multipart/form-data` with a boundary, or `application/octet-stream` for a pinned raw-minidump path | identity and gzip |
+| Minidump | `multipart/form-data` with a boundary | identity and gzip |
 | Release/file/chunk upload | `multipart/form-data` or the exact sentry-cli JSON/multipart form for that operation | identity and gzip |
 | Native TUS upload | `application/offset+octet-stream` for `PATCH`; the exact TUS creation headers for `POST` | identity only |
 | Management API with a JSON entity body | `application/json` | identity and gzip |
@@ -1142,9 +1163,9 @@ fixture (`prod`, `ver`, `ptype`, `plat`, and `guid` where present), and a
 required `sentry` JSON metadata part containing the scoped external event ID,
 release, distribution, and platform context. The annotation allowlist is fixture-
 specific and does not accept arbitrary scalar keys; annotations are metadata,
-not event or attachment parts. A raw-minidump request uses the same crash
-payload with the project DSN authentication. Unlisted multipart file parts are
-rejected before acceptance. The legacy `store` body is JSON and must contain
+not event or attachment parts. A body-only raw-minidump request is not
+admitted; `application/octet-stream` is rejected as an unsupported media type.
+Unlisted multipart file parts are rejected before acceptance. The legacy `store` body is JSON and must contain
 the pinned error-event fields needed to construct one event; it cannot carry
 an arbitrary batch.
 
@@ -1204,10 +1225,14 @@ request can be recovered safely.
 | DIF assembly project scope | 1 project, selected by the route |
 | Artifact-bundle assembly chunks | 1,024 checksums |
 | Artifact-bundle assembly project IDs | 100 project IDs |
+| Client-report discarded-event records | 1,024 records |
 | Browser origins per project | 100 origins |
 | Serialized browser origin | 2,048 ASCII bytes |
 | Management response page | 100 records |
 | Management request filter values | 256 bytes each |
+| Repeated issue-list `environment` values | 100 values |
+| Repeated `previous-with-commits` `project` values | 100 values |
+| Issue-list or `previous-with-commits` request target | 16,384 bytes |
 
 ### Scalar and recursive field limits
 
@@ -1275,6 +1300,12 @@ applicable limit, including repeated, missing, or zero-byte chunk references.
 An over-limit DIF or artifact-bundle assembly returns `413 payload_too_large`
 without persisting or looking up any entry.
 
+The raw request target for the issue-list and `previous-with-commits` routes is
+limited to 16,384 bytes and is checked before query parsing or lookup. An
+over-limit request returns `413 payload_too_large`. Repeated filter values are
+also checked against their 100-value limits before predicate construction; the
+same result applies when either repeated filter exceeds its limit.
+
 ### Envelope framing and item behavior
 
 An Envelope is newline-delimited JSON headers followed by items. The envelope
@@ -1326,9 +1357,29 @@ TUS `Upload-Length`; the reference JSON payload length is not used for this
 comparison. A missing, malformed, or mismatched value is rejected with
 `400 invalid_envelope` before binding. The attachment is retained only with
 its accepted event.
-`client_report` accepts only bounded discarded-event reason, category, and
-quantity records. Required fields and cross-field checks are enforced, while
-unknown non-structural fields follow the unknown-field rule below.
+`client_report` has this JSON payload shape:
+
+```json
+{
+  "discarded_events": [
+    {
+      "reason": "network_error",
+      "category": "error",
+      "quantity": 1
+    }
+  ]
+}
+```
+
+`discarded_events` is required and contains one through 1,024 records. Each
+record requires `reason` and `category` as non-empty lowercase ASCII tokens
+matching `[a-z0-9][a-z0-9._-]{0,63}`, plus `quantity` as an integer from `1`
+through `2,147,483,647`. Unknown non-structural members follow the
+unknown-field rule below and are not included in the digest. Missing required
+members, wrong types, empty arrays or tokens, invalid token grammar, quantities
+outside the range, or a record count over 1,024 rejects the entire Envelope
+with `400 invalid_envelope` before acceptance. Duplicate records are retained
+and sorted by canonical JSON for digest construction; they are not merged.
 
 An `event` item qualifies as a supported error event only when it has a valid
 external `event_id` and at least one error signal: a non-empty `message`, an
@@ -1810,12 +1861,19 @@ if any target cannot complete, no target is committed as a successful result.
 Conflicting input remains `409 conflict`, and an unavailable owner remains
 `503 unavailable` rather than claiming a terminal result.
 
+Artifact-bundle assembly is polled by repeating the identical `POST` body. It
+does not return an assembly operation ID, `Location`, or generic operation
+status URL.
+
 Chunks negotiated by the organization capability are organization-scoped
 transient records keyed by organization and lowercase chunk checksum; their
 upload request intentionally carries no project field. A DIF upload through
 the project-scoped capability remains project-bound. At DIF assembly and
-artifact-bundle assembly, Watchtower verifies the target project(s) and the
-caller's authorization before exposing any result.
+artifact-bundle assembly, Watchtower resolves the target project(s), applies
+the lifecycle fence, and verifies the caller's authorization before checksum
+verification, operation creation, assembly, persistence, or exposing any
+result. A disabled target therefore returns `403 permission_denied` at
+project-bound assembly, while organization-scoped staging remains reusable.
 The `projects` list is authoritative at assembly, where Watchtower resolves
 every alias only within the authenticated organization and verifies the
 caller's authorization. Unknown, cross-organization, or otherwise inaccessible
@@ -1872,12 +1930,14 @@ it is not a canonical UUID. The adapter maps it to the native release command
 and preserves the upstream version string as a bounded external field.
 
 The `previous-with-commits` route accepts only an optional repeated `project`
-query parameter. Each value is a unique, non-empty project alias resolved only
-within the authenticated organization; an unknown, cross-organization, or
-otherwise inaccessible alias returns the indistinguishable `404 not_found`,
-and any other query parameter returns `400 invalid_request`. When the filter is
-omitted, the candidate project scope is the current release's associated
-projects. A candidate release must be in the same organization, be associated
+query parameter with one to 100 unique values. More than 100 values returns
+`413 payload_too_large` before lookup. Each value is a unique, non-empty
+project alias resolved only within the authenticated organization; an unknown,
+cross-organization, or otherwise inaccessible alias returns the
+indistinguishable `404 not_found`, and any other query parameter returns `400
+invalid_request`. When the filter is omitted, the candidate project scope is
+the current release's associated projects. A candidate release must be in the
+same organization, be associated
 with at least one project in that scope, differ from the requested release, and
 have both `commitCount > 0` and a non-null `lastCommit`; releases without
 commits are skipped. Candidates are ordered by `dateCreated ASC`, then
@@ -1959,10 +2019,12 @@ unsupported release-health behavior.
 - Sentry project IDs, DSN key IDs, release versions, and event IDs are
   compatibility aliases or scoped external identifiers. Issue IDs and short
   IDs are compatibility aliases unique within the authenticated tenant and are
-  never reused across project generations. Organization and project slugs are
-  scoped compatibility aliases. All are resolved only after authentication and
-  tenant scope are known; slugs may be reused only after deletion completes for
-  a new resource generation, while canonical IDs and other scoped external
+  never reused across project generations. Organization slugs are globally
+  unique compatibility aliases; project slugs are unique within their
+  organization and tenant-scoped. Organization slugs are resolved before tenant
+  selection, while project slugs are resolved only after the canonical tenant
+  is selected. Slugs may be reused only after deletion completes for a new
+  resource generation, while canonical IDs and other scoped external
   identifiers are never reused across generations.
 - SDK event IDs are retained as `(tenant_id, project_id, external_event_id)`
   identifiers. Two projects may use the same event ID without collision or
@@ -1987,8 +2049,9 @@ The following differences are intentional and are part of v1 compatibility:
    token or permission interpretation.
 2. Watchtower canonical UUID v7 identities and tenant predicates override
    Sentry's integer/string resource IDs. Canonical IDs and non-slug
-   compatibility aliases are scoped and non-reusable; organization and project
-   slugs may be reused only after deletion completes.
+   compatibility aliases are scoped and non-reusable; organization slugs are
+   globally unique, project slugs are organization-scoped, and either slug may
+   be reused only after deletion completes.
 3. Durable acceptance is earlier than processing completion and query
    visibility. Clients must not interpret a successful `POST` as symbolication,
    grouping, issue creation, or read availability.
@@ -2066,8 +2129,8 @@ exercise:
   on every non-empty management response;
 - minidump uploads with the exact fixture-emitted Crashpad scalar annotations,
   required Sentry metadata and external event ID, rejection of eventless
-  minidumps and unlisted file parts, bounded fields, and the successful `200`
-  zero-length acknowledgement;
+  minidumps, body-only `application/octet-stream` requests, and unlisted file
+  parts, bounded fields, and the successful `200` zero-length acknowledgement;
 - `sdk.native.crash` using the exact multipart minidump request and
   `sdk.native.tus-minidump` using the separate TUS creation/append and Envelope
   `attachment-ref` binding workflow;
@@ -2098,6 +2161,9 @@ exercise:
   envelope-level event ID on an excluded-only Envelope, all expecting `200`
   with a zero-length response body, plus eventless empty/client-report retries
   with the same client `X-Request-ID`, different client IDs, and no client ID;
+  client reports also cover the exact `discarded_events` shape, token and
+  quantity boundaries, duplicate-record digest handling, unknown members, and
+  the 1,024-record limit;
   conflicting event/request digests expect the standard `409 conflict` body
   and no new acceptance side effect;
 - nested identity/gzip item payloads at and over the decoded 20,000,000-byte
@@ -2121,8 +2187,8 @@ exercise:
   `artifact-bundle-<checksum>` name, reuse of identical bundle bytes across
   release, distribution, and project-list identities, release-artifact
   identity across release-or-null, distribution, artifact type, and logical
-  filename, plus release-independent DIF duplicates and checksum/debug
-  identity conflicts;
+  filename, repeat-POST polling without an operation ID or status URL, plus
+  release-independent DIF duplicates and checksum/debug identity conflicts;
 - release versions containing percent-encoded reserved path bytes, literal
   plus signs, malformed escapes, invalid UTF-8, query delimiters, and
   double-decoding attempts;
@@ -2130,13 +2196,15 @@ exercise:
   actual responses, DSN tenant binding, exact origin reflection, exposed
   request and rate-limit headers including `Content-Encoding`, and no
   persistence for a disallowed origin,
-  plus project setting update, version-conflict, lifecycle propagation, and
-  read-back cases;
+  plus project setting update, version-conflict, lifecycle propagation,
+  WHATWG default-port and host-case canonicalization, normalized duplicate
+  rejection, and read-back cases;
 - suspended project deletion with the minimal `deletion_target.name`, the
   current strong `ETag`, exact `X-Confirm-Project-Name`/`If-Match` reuse, and
   no broader project DTO disclosure, plus authorized polling of that exact
   deletion operation while suspended, the pending Support release gate, and
-  rejection of unrelated operation status reads;
+  rejection of unrelated operation status reads; deletion also covers its
+  zero-byte body requirement and rejection of `{}` or other entity bodies;
 - pagination using the documented per-route order and tie-breaker, snapshot
   consistency under concurrent inserts/updates, cursor binding, malformed and
   expired cursor `400` results, stale cursor `403` results, cross-tenant cursor
@@ -2153,15 +2221,18 @@ exercise:
   `muted`/`resolvedInNextRelease` mappings, exact single-issue and bulk PUT
   bodies, exact issue-list `query`/`status`/repeated `environment`/`cursor`/
   `limit` filters, duplicate and unknown-filter rejection, repeated unique
-  `id` query parameters from 1 through 100, bounded current-status filters,
-  direct input-ordered bulk response arrays,
+  `environment` values from 1 through 100 and deterministic over-limit `413`
+  responses, the 16,384-byte request-target boundary, repeated unique `id`
+  query parameters from 1 through 100, bounded current-status filters, direct
+  input-ordered bulk response arrays,
   all-or-nothing precondition failures, and rejection of
   scalar/query-only/unbounded updates and route-project-mismatched IDs;
 - release `/commits/` direct arrays containing exactly `{ "id": string }`,
   fixed Release DTO responses or `404 not_found` for
-  `/previous-with-commits/`, including repeated project filters, skipped
-  no-commit releases, deterministic ordering/tie-breaking, no-match behavior,
-  and the pinned sentry-cli parsing workflow;
+  `/previous-with-commits/`, including repeated project filters from 1 through
+  100, deterministic over-limit `413` responses, skipped no-commit releases,
+  deterministic ordering/tie-breaking, no-match behavior, and the pinned
+  sentry-cli parsing workflow;
 - release creation, metadata update, and finalization with the exact request
   bodies, nullable fields, mutually exclusive combinations, canonical digests,
   observed-generation retry identities carried by required `If-Match` ETags,
@@ -2181,7 +2252,7 @@ exercise:
   operation responses, terminal artifact results, and invalid-part rejection;
 - project deletion with missing/mismatched confirmation, release-file deletion
   item reads exposing the current strong `ETag`, deletion without `If-Match` or
-  idempotency key, by exact `file_id`, repeated deletion, wrong-scope `404`,
+  idempotency key, a non-empty entity body, by exact `file_id`, repeated deletion, wrong-scope `404`,
   stale-version and idempotency-key conflicts, and owner outage, including a
   terminal successful deletion poll with `result: null`;
 - organization-scoped capability probes for both DIF and artifact bundles,
@@ -2194,8 +2265,9 @@ exercise:
   the exact `200`, `403 permission_denied`, `409 conflict`, and `404
   not_found` results, retired-environment `409 conflict`, and no persistence
   for rejected requests, including compressed and legacy parsed events before
-  the environment fence, plus authorized disabled-project reads and blocked
-  management writes;
+  the environment fence, plus authorized disabled-project reads, blocked
+  project-bound management writes, reusable organization-scoped chunk staging,
+  and `403` at disabled-project assembly;
 - chunk requests at and over the advertised `maxRequestSize`, including
   duplicate and rejected parts, with `413` and no partial persistence for an
   over-limit request, `400` for overlong scalar fields, platform-token grammar,
@@ -2207,6 +2279,9 @@ exercise:
   assembly POST polling without a generic status URL;
 - valid, expired, revoked, insufficient-scope, cross-tenant, stale-projection,
   suspended, disabled, deleting, and deleted resources;
+- personal-token access to multiple organizations with globally unique
+  organization-slug resolution before tenant selection and independent
+  organization-scoped project slugs;
 - organization/project reads, creation, update, deletion, DSN issuance,
   rotation/revocation, issue/event reads, resolve/reopen/ignore/mute/next-release,
   release requests without client idempotency keys, and deployment workflows;
