@@ -297,13 +297,17 @@ staging remains reusable organization state and is fenced at project-bound
 assembly.
 
 After bounded transport decoding, event parsing, and complete structural
-validation, Ingest normalizes the event identity and performs the idempotency
-lookup before applying the API-owned environment retirement tombstone and
-generation fence. A matching acceptance record or payload-free uniqueness
-tombstone returns the original acceptance, and the same event ID with a
-different digest returns `409 conflict`, even when the environment has since
-been retired. If no prior identity exists, the retirement fence is then
-applied before persistence or durable acceptance. A new event whose
+validation, Ingest normalizes the identity of a retained supported event item
+and performs the event idempotency lookup before applying the API-owned
+environment retirement tombstone and generation fence. A matching acceptance
+record or payload-free uniqueness tombstone returns the original acceptance,
+and the same event ID with a different digest returns `409 conflict`, even
+when the environment has since been retired. If no prior identity exists, the
+retirement fence is then applied before persistence or durable acceptance. An
+empty, unsupported-only, or attachment-only Envelope retains no supported
+event identity and follows the separate no-op/client-report retry rules below;
+its validated envelope-level event ID remains bounded request metadata and is
+not reserved by this lookup. A new event whose
 `environment` names an environment that is retired for the project returns
 `409 conflict` with detail `The request conflicts with the current resource
 state.` and persists no payload, acceptance record, attachment bytes, or
@@ -904,14 +908,17 @@ ETag in `If-Match`; creation has no prior version and does not require it.
 }
 ```
 
-`version` is required and is a non-empty bounded string. `projects` is
+`version` is required and is a non-empty bounded string containing no control
+characters. This is the same control-character restriction applied to decoded
+`<version>` path segments below. `projects` is
 optional, but when present is a non-null array of at most 100 unique project
 aliases from the organization. `ref`, `url`, and `dateStarted` are optional nullable
 strings; a non-null `url` is an HTTP(S) URL and a non-null `dateStarted` is an
 RFC 3339 UTC timestamp. `dateReleased` is not accepted during creation;
 finalization uses the separate body below. An empty object, a missing or empty
-`version`, an invalid nullable value, a duplicate project, or any other member
-returns `400 invalid_request` before mutation.
+`version`, a control character in `version`, an invalid nullable value, a
+duplicate project, or any other member returns `400 invalid_request` before
+mutation.
 
 When `projects` is non-empty, the adapter resolves every alias within the
 authenticated organization and requires `Write` or `Manage` authority on
@@ -1025,7 +1032,7 @@ an extension surface.
 | Event | `platform` | Nullable string |
 | Event | `level` | Nullable enum: `fatal`, `error`, `warning`, `info`, or `debug`; emitted as `null` when the normalized event omitted `level` |
 | Event | `tags` | Required array of objects containing required string fields `key` and `value`, plus optional string `query`; one object is emitted per normalized tag in RFC 8785 canonical key order, `key` and `value` use the normalized tag member, `query` is always omitted because normalized tags have no query metadata, and the array is empty when no tags are present |
-| Event | `contexts` | Required bounded JSON object; values are JSON scalars, arrays, or objects subject to the event limits above |
+| Event | `contexts` | Required bounded JSON object; values are JSON scalars, arrays, or objects subject to the event limits above; omitted or explicit-null input is emitted as `{}` |
 | Event | `user` | Nullable object containing only the safe readable string fields `id`, `username`, and `name` |
 | Event | `sdk` | Nullable object containing exactly nullable string fields `name` and `version` |
 | Event | `release` | Nullable string |
@@ -1041,6 +1048,12 @@ top-level `message`; each `exception.values` element in array order, checking
 `function` then `filename`; and `metadata.value`, `metadata.type`,
 `metadata.filename`, then `metadata.function`. Missing, non-string, and empty
 candidates are skipped. If no candidate remains, `title` is the empty string.
+
+`Event.contexts` is always present as an object. When the accepted normalized
+event omits `contexts` or supplies explicit `null`, the adapter treats it as an
+empty object and emits `{}`. A non-object, non-null `contexts` value is rejected
+with `400 invalid_envelope`; object contents continue to use the bounded
+recursive-value rules above.
 
 For an accepted event item, `dateReceived` is the canonical `accepted_at`
 instant recorded by Ingest, not the client-supplied event time. When present,
@@ -1174,9 +1187,10 @@ Every operation response body has exactly these fields:
 `status` in a serialized Operation DTO is one of `pending`, `succeeded`, or
 `failed`; an expired tombstone is a retained internal state and is never
 serialized as an Operation DTO.
-`completed_at` is null only for `pending`; `result` is non-null for a succeeded
-non-destructive operation but is `null` for a succeeded destructive operation
-(currently project deletion); and `error` is non-null only for `failed`. A
+`completed_at` is null only for `pending`; `result` is `null` for `pending`,
+`failed`, and succeeded destructive operations (currently project deletion),
+and is non-null only for a succeeded non-destructive operation. `error` is
+non-null only for `failed`. A
 non-null result contains only the bounded resource or artifact DTO
 for the originating operation. A successful destructive operation is terminal
 by `status: "succeeded"` and never returns a deleted resource DTO. An error
@@ -1698,7 +1712,7 @@ management schemas remain the explicit exception.
   | `timestamp` | Optional finite JSON number of Unix seconds, represented by its RFC 8785 canonical number form; non-finite values and strings are invalid. |
   | `platform`, `level`, `message`, `release`, `dist`, `environment` | Optional bounded UTF-8 strings or `null`; strings are NFC-normalized, and `level` is lowercased. Missing and explicit `null` are omitted from the normalized object. |
   | `tags` | Optional object whose keys and values are bounded UTF-8 strings; both are NFC-normalized, and the object keys are sorted by RFC 8785 canonical order. |
-  | `contexts` | Optional bounded JSON object. Object keys are NFC-normalized and sorted; nested arrays preserve order. |
+  | `contexts` | Optional `null` or bounded JSON object. An explicit `null` is treated as absent; object keys are NFC-normalized and sorted, and nested arrays preserve order. |
   | `breadcrumbs` | Optional ordered array of bounded objects. Array order is preserved and every nested object/value uses the recursive bounded-value rules below. |
   | `exception`, `stacktrace`, `debug_meta`, `metadata` | Optional bounded JSON objects using the recursive bounded-value rules below; absent and `null` values are omitted. |
   | `user` | Optional `null` or object with optional `id`, `username`, and `name` members; each present member is a bounded NFC-normalized non-empty string. |
@@ -1771,14 +1785,15 @@ management schemas remain the explicit exception.
   attachment bytes contribute through their SHA-256 and size. Empty,
   unsupported-only, and attachment-only Envelopes use `event: null`, an empty
   attachment array, and an empty client-report array.
-- Envelope and event submissions are idempotent by the tuple
+- A retained supported event submission is idempotent by the tuple
   `(tenant_id, project_id, external_event_id, payload_digest)` while the
   Ingest-owned acceptance record containing the payload digest and original
   acceptance remains retained. The same tuple returns the original
   acceptance; the same event ID with a different digest returns `409` and is
-  not merged or durably accepted. These idempotency checks occur after complete
-  structural validation and before the environment retirement fence or any new
-  acceptance side effect, so this
+  not merged or durably accepted. These idempotency checks apply only when the
+  Envelope retains a supported event item, occur after complete structural
+  validation and before the environment retirement fence or any new acceptance
+  side effect, so this
   `409 conflict` is the explicit exception to the otherwise universal `200`
   Envelope acknowledgement. If the acceptance record retires while the canonical event
   remains queryable, a payload-free uniqueness tombstone retains the scoped
@@ -1788,15 +1803,17 @@ management schemas remain the explicit exception.
   `409 conflict`; the event-detail route resolves the one retained canonical
   event. Only after the tombstone and query-retention horizon expire does this
   contract make no historical deduplication or conflicting-digest guarantee.
-- An accepted Envelope with no `external_event_id` uses a separate retry
-  identity only when the caller supplied a valid canonical `X-Request-ID`:
-  `(tenant_id, project_id, client_request_id, payload_digest)`. The same client
-  request ID and digest returns the original acceptance, while reusing it with
-  a different digest returns `409 conflict` with no new acceptance side effect.
-  If no client `X-Request-ID` was
-  supplied, the generated response request ID is diagnostic only and each
-  retry is a new accepted no-op/client-report submission; identical payloads
-  are never collapsed by content alone.
+- An accepted Envelope with no retained supported event item uses a separate
+  no-op/client-report retry identity when the caller supplied a valid canonical
+  `X-Request-ID`: `(tenant_id, project_id, client_request_id, payload_digest)`.
+  This identity is used even when a syntax-validated envelope-level event ID is
+  present; that event ID remains bounded request metadata and is never used for
+  event uniqueness or conflict detection. The same client request ID and digest
+  returns the original acceptance, while reusing it with a different digest
+  returns `409 conflict` with no new acceptance side effect. If no client
+  `X-Request-ID` was supplied, the generated response request ID is diagnostic
+  only and each retry is a new accepted no-op/client-report submission;
+  identical payloads are never collapsed by content alone.
 - Creation, deletion, rotation, release finalization, chunk assembly, and
   deployment writes use the control-plane idempotency tuple. Project creation,
   project deletion, DSN mutation, and release-file deletion reject a missing
@@ -2379,12 +2396,14 @@ unsupported release-health behavior.
   is selected. Slugs may be reused only after deletion completes for a new
   resource generation, while canonical IDs and other scoped external
   identifiers are never reused across generations.
-- SDK event IDs are retained as `(tenant_id, project_id, external_event_id)`
-  identifiers. Two projects may use the same event ID without collision or
-  disclosure. A payload-free uniqueness tombstone prevents reuse while the
-  canonical event remains queryable, and the scoped event alias resolves to at
-  most that one canonical event. An SDK event ID is never a canonical
-  Watchtower primary key.
+- SDK event IDs for retained supported events are retained as
+  `(tenant_id, project_id, external_event_id)` identifiers. Two projects may
+  use the same event ID without collision or disclosure. A payload-free
+  uniqueness tombstone prevents reuse while the canonical event remains
+  queryable, and the scoped event alias resolves to at most that one canonical
+  event. An SDK event ID is never a canonical Watchtower primary key. An event
+  ID carried only by an empty or excluded-only Envelope is not registered and
+  may be reused by a later supported event.
 - API owns control-plane, project, DSN, release, artifact, operation, and audit
   authority. Ingest owns raw accepted records and recoverable handoff. Processor
   owns processing, canonical telemetry, symbolication, and derived issue data.
@@ -2746,6 +2765,10 @@ matrix result. A client regression cannot be hidden by changing the fixture.
 - Authentication, content type, compression, limits, fields, errors,
   pagination, rate headers, unknown fields, retries, idempotency, capability
   negotiation, chunking, polling, and asynchronous semantics are explicit.
+- Release creation rejects control-character versions; missing or explicit-null
+  event `contexts` emits `{}`; pending and failed Operation DTOs emit
+  `result: null`; and an event ID seen only by a no-op Envelope can be reused
+  by a later supported event.
 - All deviations, exclusions, aliases, identity rules, tenant fences, and
   storage ownership boundaries are explicit.
 - The contract contains no placeholder product decisions and remains aligned
