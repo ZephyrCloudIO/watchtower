@@ -236,7 +236,7 @@ to a native route.
 | `/api/<project_id>/envelope/` | `OPTIONS` | Collection-only DSN in the DSN query parameters or DSN URL, project alias, and request `Origin` | Supported only for a configured project-origin CORS preflight. The DSN authenticates and tenant-binds the project alias before the allowlist is read. Returns `204` with no persistence side effect; a missing, invalid, or disallowed origin receives `401`/`403` with no CORS allow headers. |
 | `/api/<project_id>/store/` | `POST` | Collection-only DSN | Supported legacy JSON error path required by a pinned client. The body is converted to one error event and follows Envelope admission semantics. Successful admission returns `200` with a zero-length body and request-ID headers. |
 | `/api/<project_id>/minidump/` | `POST` | Collection-only DSN | Supported for pinned crash workflows whose fixture specifies the non-Envelope minidump path. `multipart/form-data` and the pinned client field names are accepted. Successful admission returns `200` with a zero-length body and request-ID headers. |
-| `/api/<project_id>/upload/` | `POST` | Collection-only DSN | Supported pinned Native large-attachment TUS creation route. A valid integer `Upload-Length` from `0` through `20,000,000`, `Tus-Resumable: 1.0.0`, and `Upload-Metadata: sentry <base64({"attachment_type":"event.minidump"})>` request returns `201` with a project-bound `Location` containing a canonical lowercase UUID v7 `upload_id`, `Tus-Resumable: 1.0.0`, and `Upload-Offset: 0`; a zero-length upload is created directly as `complete-unbound`, while a positive-length upload is pending. Neither creation path accepts attachment bytes. |
+| `/api/<project_id>/upload/` | `POST` | Collection-only DSN | Supported pinned Native large-attachment TUS creation route. A valid integer `Upload-Length` from `0` through `20,000,000`, `Tus-Resumable: 1.0.0`, and `Upload-Metadata: sentry <base64({"attachment_type":"event.minidump"})>` request returns `201` with a project-bound `Location` containing a canonical lowercase UUID v7 `upload_id`, `Tus-Resumable: 1.0.0`, and `Upload-Offset: 0`; a zero-length upload is created directly as `complete-unbound`, while a positive-length upload is pending. Neither creation path accepts attachment bytes. A pending upload has a fixed 24-hour lifetime beginning at creation. |
 | `/api/<project_id>/upload/<upload_id>` | `HEAD`, `PATCH` | Collection-only DSN bound to the upload | Supported pinned Native TUS offset and append workflow. `HEAD` requires request `Tus-Resumable: 1.0.0` and, on success, returns `200` with an empty body and `Tus-Resumable: 1.0.0`, `Upload-Offset`, and `Upload-Length` response headers. Missing or unsupported `Tus-Resumable` returns `412 precondition_failed`; a missing, expired, already-bound, or inaccessible upload returns `404 not_found`, and invalid authentication returns `401 invalid_authentication`. A failed `HEAD` has no response body or `Content-Type`; it returns only its status, `Tus-Resumable: 1.0.0`, request-ID headers, and `Content-Length: 0`, with no `Upload-Offset` or `Upload-Length`. `PATCH` requires `Tus-Resumable: 1.0.0`, `Upload-Offset`, and `application/offset+octet-stream`, appends only at the expected offset, and returns `204` with an empty body, `Tus-Resumable: 1.0.0`, and the new `Upload-Offset`. A stale or mismatched offset returns `409 conflict` with the current `Upload-Offset`; bytes that would exceed `Upload-Length` return `413 payload_too_large` with the current `Upload-Offset`. `PATCH` failures use the standard JSON error body and atomically append no bytes. Reaching the declared length transitions the upload to `complete-unbound`; it remains subject to attachment and project limits and is not accepted until the subsequent Envelope binds it to an event. |
 | `/api/<project_id>/security-report/` | `POST` | Collection-only DSN | Explicitly unsupported in v1; returns `501 unsupported_capability` with no persistence side effect because security reports are not error telemetry. |
 | Any other `/api/<project_id>/...` ingestion route | Any | Any | `404` or `405` according to whether the path or method is unknown; no side effect. |
@@ -315,8 +315,14 @@ declared length, and requires the Envelope/event ID to identify the
 accepted event in that same tenant and project. It atomically transitions
 `complete-unbound` to `bound` and retains the uploaded bytes only as an
 attachment of that event. A completed upload never becomes a standalone
-event or attachment, and an unreferenced completed upload expires without
-durable customer-payload acceptance.
+event or attachment. A positive-length upload's pending lifetime is not
+extended by `PATCH`; once the declared length is reached, the adapter starts
+a fixed 24-hour `complete-unbound` lifetime at that completion time. A
+zero-length upload starts that same 24-hour lifetime at creation. Expiration
+is the exclusive boundary `now >= expires_at`: `HEAD`, `PATCH`, and Envelope
+binding return `404 not_found` at or after the boundary, even if physical
+garbage collection has not yet run. An unreferenced completed upload therefore
+expires without durable customer-payload acceptance.
 
 The reference attachment payload is a closed JSON object with exactly these
 two members:
@@ -360,7 +366,7 @@ the allowlist, or a project with no configured allowlist, receives
 | `/api/0/organizations/` | `GET` organization reads for the authenticated principal; pagination and current authorization apply. Organization creation, deletion, membership, team, SSO, and broad settings administration are not exposed through Sentry compatibility. |
 | `/api/0/organizations/<organization>/` | `GET` organization read. Unknown or unauthorized organizations return indistinguishable `404`. |
 | `/api/0/organizations/<organization>/projects/` | `GET` project list and `POST` project creation using the exact request body below. Creation returns the pending Operation DTO defined in Project mutation responses until all required owners and Jobs acknowledge enablement. |
-| `/api/0/projects/<organization>/<project>/` | `GET` project read, `PUT` supported project settings including the browser-origin allowlist, and bodyless `DELETE` project deletion. Project deletion requires a current Owner/Admin user session recently reauthenticated within five minutes under applicable organization SSO/MFA conditions, the current strong `If-Match`, `X-Confirm-Project-Name` containing the exact current project name, idempotency, lifecycle fences, and never reports success before authoritative completion. |
+| `/api/0/projects/<organization>/<project>/` | `GET` project read, `PUT` supported project settings including the browser-origin allowlist, and bodyless `DELETE` project deletion. Project settings and deletion require the current strong `If-Match` plus `X-Watchtower-Project-Generation`; deletion additionally requires a current Owner/Admin user session recently reauthenticated within five minutes under applicable organization SSO/MFA conditions, `X-Confirm-Project-Name` containing the exact current project name, idempotency, lifecycle fences, and never reports success before authoritative completion. |
 | `/api/0/projects/<organization>/<project>/keys/` | `GET` DSN metadata/public DSNs and `POST` issuance using the exact closed body and `201` response below. Plaintext management tokens are never returned. |
 | `/api/0/projects/<organization>/<project>/keys/<key_id>/` | `PUT` rotation with the empty JSON object `{}` and `200` DSN response, and bodyless `DELETE` revocation with `204`; both use the exact idempotency rules below and never return a secret. |
 | `/api/0/projects/<organization>/<project>/issues/` | `GET` issue list with the exact bounded filters and cursor pagination defined below, and `PUT` only for the pinned bulk status operation with repeated bounded `id` query parameters and a `resolved`, `unresolved`, `ignored`, `muted`, or `resolvedInNextRelease` status body. The latter two map as defined for the unqualified issue route. `POST`, `DELETE`, and unbounded bulk operations are unsupported. |
@@ -415,17 +421,29 @@ keys. `POST /api/0/organizations/<organization>/projects/` accepts exactly:
 ```json
 {
   "name": "project-name",
+  "slug": "project-slug",
   "platform": "javascript"
 }
 ```
 
-`name` is required and is a non-empty string of at most 256 UTF-8 bytes. `platform` is
-optional and nullable; omission and explicit `null` mean that no platform is
-configured. When present it uses the lowercase ASCII platform-token grammar
+`name` and `slug` are required. `name` is a non-empty string of at most 256
+UTF-8 bytes. `slug` is a canonical lowercase ASCII compatibility alias
+matching `[a-z0-9][a-z0-9._-]{0,255}`. The adapter does not derive, rewrite,
+or suffix a slug. A slug already used by another project in the organization,
+including a project whose deletion has not completed, returns `409 conflict`
+without creating an operation; concurrent claims are resolved by the same
+atomic uniqueness rule. After deletion completes, a new project may reuse the
+slug only with a new canonical UUID, generation, and credentials. `platform`
+is optional and nullable; omission and explicit `null` mean that no platform
+is configured. When present it uses the lowercase ASCII platform-token grammar
 defined in Scalar and recursive field limits.
 `browser_origins` is not accepted during creation and is initialized to an
 empty array. A missing or empty name, an invalid platform, a duplicate key, or
-any other member returns `400 invalid_request` before mutation.
+an invalid slug, or any other member returns `400 invalid_request` before
+mutation. The required `Idempotency-Key` and normalized canonical body digest
+make a retry with the same principal, organization, operation, key, and body
+return the original pending or terminal Operation DTO before a new slug claim;
+changing the body or scope returns `409 conflict`.
 
 `PUT /api/0/projects/<organization>/<project>/` accepts exactly this body for
 the v1 browser-origin setting:
@@ -491,10 +509,14 @@ mutation is the complete Project DTO; the result for deletion is `null`.
 | Browser-origin update | When the generation-matched Ingest acknowledgement is already available, `PUT` returns `200` with the Project DTO, the new strong `ETag`, and no `Location` or `Retry-After`; otherwise it returns `202` with a pending Operation DTO. | A retry with the same project, observed `If-Match`, normalized body, and supplied key, if any, returns the same current `200` or `202` result before the current-version check; otherwise a stale `If-Match` returns `409 conflict`. | A pending update polls to `200` with a succeeded Operation DTO whose `result` is the updated Project DTO; a completed duplicate returns the same terminal result. |
 | Project deletion | A bodyless authorized request with the required confirmation, observed `If-Match`, and `Idempotency-Key` returns `202` pending Operation DTO; it never returns a Project DTO. | The same target and key return the same pending operation with `202`; changed content within the same principal/project/operation tuple returns `409 conflict`, while another scope is independent. | The operation URL and a terminal retry return `200` with a succeeded Operation DTO and `result: null`; no deleted Project DTO is exposed. |
 
-Direct Project DTO responses include the resource `ETag`; Operation DTO
-responses do not claim resource completion until their `status` is terminal.
-All duplicate lookups occur within the existing principal, scope, operation,
-key, observed-version, and canonical-body identity rules.
+Direct Project DTO responses include the resource `ETag` and the
+`X-Watchtower-Project-Generation` response header. Operation DTO responses do
+not claim resource completion until their `status` is terminal. All duplicate
+lookups occur within the existing principal, scope, operation, key,
+observed-version, and canonical-body identity rules. A project generation is a
+non-reusable canonical lowercase UUID v7 assigned when the project is created;
+settings updates retain it, while a replacement after deletion receives a new
+one.
 
 ### Suspended organization behavior
 
@@ -632,6 +654,15 @@ fields are:
   single `If-Match` header containing that exact quoted ETag; `If-Match: *`, an
   unquoted value, a weak tag, a list, or a JSON/query-string version is invalid
   and returns `400 invalid_request`. A mismatched tag returns `409 conflict`.
+- A project detail response includes one `X-Watchtower-Project-Generation`
+  header containing the project's non-reusable canonical lowercase UUID v7
+  generation. Project settings `PUT` and `DELETE` requests require that exact
+  single header in addition to `If-Match`; a missing, malformed, or duplicate
+  header returns `400 invalid_request`, and a generation that does not match
+  the slug-resolved project returns `409 conflict` before mutation. The only
+  earlier lookup is a retry whose stored canonical project generation matches;
+  otherwise both the slug and generation must match the same project before
+  idempotency is evaluated.
 - Project deletion additionally requires one `X-Confirm-Project-Name` header.
   Its value is the exact current project display name, compared case-sensitively
   without trimming or alias normalization; a missing or mismatched value returns
@@ -644,7 +675,7 @@ payloads into internal messages.
 | --- | --- | --- |
 | Envelope/event admission | Project DSN, project alias, Envelope headers, item headers/payloads, and a supported event ID for event items | A non-conflicting Envelope `POST` returns `200` with an empty body and request ID headers; digest/idempotency conflicts return `409`; legacy or client-specific body expectations retain the preserved scoped external event ID |
 | Organization/project read | Organization/project compatibility alias and current management credential | Upstream-compatible resource DTO containing only currently readable fields, canonical-safe pagination link, and request ID |
-| Project create/update/delete | Organization scope, the exact project mutation body defined below, current authorization, observed version for settings update and delete, a bodyless delete, `X-Confirm-Project-Name` for delete, and idempotency key for create/delete | Exact `200` Project DTO or `202`/`200` Operation DTO responses defined in Project mutation responses; direct Project DTOs include the strong `ETag` |
+| Project create/update/delete | Organization scope, the exact project mutation body defined below, current authorization, observed version and `X-Watchtower-Project-Generation` for settings update and delete, a bodyless delete, `X-Confirm-Project-Name` for delete, and idempotency key for create/delete | Exact `200` Project DTO or `202`/`200` Operation DTO responses defined in Project mutation responses; direct Project DTOs include the strong `ETag` and project-generation header |
 | DSN issue/rotate/revoke | Project scope, the exact closed issuance body, `{}` rotation body, or bodyless revocation shape below, current Manage authority, and a required idempotency key | `201` issuance or `200` rotation returns the fixed DSN DTO; `204` revocation has an empty body; management-token plaintext is never returned |
 | Issue/event read or status transition | Tenant-unique issue alias or tenant/project-scoped event alias, bounded filters or status, and current credential | The fixed Issue or Event DTO below, request ID, and cursor link when paginated |
 | Release mutation | Organization/project scope, release version, bounded metadata, and canonical request identity; an `Idempotency-Key` may additionally bind the request | `201` for a new release or `200` for duplicate/update/finalization, with the direct Release DTO and request-ID headers; no operation state |
@@ -821,6 +852,18 @@ finalization uses the separate body below. An empty object, a missing or empty
 `version`, an invalid nullable value, a duplicate project, or any other member
 returns `400 invalid_request` before mutation.
 
+When `projects` is non-empty, the adapter resolves every alias within the
+authenticated organization and requires `Write` or `Manage` authority on
+every resolved project before creating or associating the release. An unknown,
+cross-organization, inaccessible, or unauthorized project returns the same
+indistinguishable `404 not_found` result; no release, association, or
+idempotency operation is partially created. Existing release metadata and
+finalization mutations recheck the same authority for every project already
+attached to the release. When `projects` is omitted or an empty array, the
+release has no project association and requires the authenticated principal to
+hold the organization-level `Owner` or `Admin` role. A project-scoped
+credential cannot use omission to broaden its release scope.
+
 `PUT /api/0/organizations/<organization>/releases/<version>/` accepts one of
 these two mutually exclusive shapes:
 
@@ -926,6 +969,23 @@ an extension surface.
 | Event | `entries` | Required array of objects containing exactly string `type` and bounded JSON `data` |
 | Event | `metadata` | Required object containing exactly nullable string fields `type`, `value`, `filename`, and `function` |
 
+Event `entries` are serialized from the normalized event in this fixed order;
+each entry type appears at most once and absent source data produces no entry:
+
+| Entry type | Emission condition | Exact `data` object |
+| --- | --- | --- |
+| `message` | `message` is present and non-empty | `{ "formatted": <normalized message> }` |
+| `exception` | `exception.values` is a non-empty array | `{ "values": <normalized exception.values> }` |
+| `stacktrace` | `stacktrace.frames` is a non-empty array | `{ "frames": <normalized stacktrace.frames> }` |
+| `breadcrumbs` | `breadcrumbs` is a non-empty array | `{ "values": <normalized breadcrumbs> }` |
+
+The four entry data objects contain no other members. Nested values use the
+recursive bounded-value normalization rules, object keys use RFC 8785 order,
+and array order is preserved. Event fields represented by dedicated DTO
+members, including `platform`, `level`, `tags`, `contexts`, `user`, `sdk`,
+`release`, and `dist`, do not create entries. An event admitted solely because
+its level is `error` or `fatal` therefore has an empty `entries` array.
+
 The project issue-list route accepts only these query parameters. Each scalar
 parameter may occur once except `environment`, which may occur one to 100
 times. Unknown parameters, empty values, malformed percent-encoding, and
@@ -936,7 +996,7 @@ payload_too_large` before lookup. `cursor` is the opaque cursor from `Link`;
 
 | Parameter | Grammar and semantics |
 | --- | --- |
-| `query` | One non-empty UTF-8 literal, with no query-language operators; case-insensitive substring matching is applied to issue title, culprit, and message. |
+| `query` | One non-empty UTF-8 literal, with no query-language operators; Unicode-default-case-folded substring matching is applied to issue title, culprit, and message. |
 | `status` | One of `resolved`, `unresolved`, or `ignored`; it filters the current issue status. |
 | `environment` | One to 100 unique non-empty environment strings; repeated values are ORed, while different parameter names are ANDed. |
 | `cursor` | One opaque, URL-safe cursor returned by the contract's `Link` header; it cannot be combined with a different route scope or filter set. |
@@ -947,6 +1007,15 @@ other query parameter are unsupported. `query`, `status`, and
 `environment` may be combined, and the complete normalized parameter set is
 bound into pagination. The bulk `PUT` route's separate repeated `id` and
 `current_status` parameters are not accepted by `GET`.
+
+For `query` matching, the adapter computes
+`match_key(value) = NFC(DefaultCaseFold(NFC(value)))` using the Unicode 15.1
+full default case-folding table, independently of locale or database
+collation. It tests whether the folded query is a contiguous Unicode scalar
+sequence in the folded issue `title`, `culprit`, or `message`; null fields do
+not match. Full folds may expand characters, so `ß` and `ss` match one another
+after folding. Locale-specific mappings are not applied: `I` folds to `i`,
+`İ` folds to `i` followed by a combining dot, and dotless `ı` remains distinct.
 
 The issue `project` object uses the same field types as the project DTO but
 contains no organization or lifecycle metadata. `PUT` status transitions accept
@@ -1340,9 +1409,14 @@ The adapter recognizes these bounded request fields. For the envelope header,
 the DSN and event ID are checked against the authenticated project and the
 event ID is retained only as a scoped external identifier. Every item header
 requires `type`; `length` is optional and selects length-delimited framing when
-present. `content_type`, `filename`, `attachment_type`,
-`content_encoding` (`identity` or `gzip`), `item_count`, and `item_headers` are
-accepted only for the item types that define them. An `event` payload may contain the pinned
+present. `content_type`, `filename`, `attachment_type`, and
+`content_encoding` (`identity` or `gzip`) are recognized only for the item
+types that define them. `item_count` and `item_headers` are not recognized by
+any v1 item type and are ignored as unknown fields for every supported,
+excluded, or future item. Their values are not type-checked, persisted,
+returned, used for authorization, or included in the payload digest. Duplicate
+object member names remain invalid under the general JSON framing rule. An
+`event` payload may contain the pinned
 client's `event_id`, `timestamp`, `platform`, `level`, `message`, `exception`,
 `stacktrace`, `release`, `dist`, `environment`, `tags`, `contexts`,
 `breadcrumbs`, `sdk`, `user`, `debug_meta`, and bounded event metadata. The
@@ -2150,6 +2224,8 @@ exercise:
   append, stale-offset `409` responses and current
   offsets, overflow `413` responses, atomic no-append behavior for both
   failures, incomplete-upload retention, finalization at the declared length,
+  the 24-hour pending and complete-unbound lifetimes, no extension by append,
+  and exact `now >= expires_at` behavior,
   failed-`HEAD` status/header-only responses with `Content-Length: 0`, the
   exact closed `{url,path}` reference object and relative-path validation,
   ordinary `attachment_length` range/equality checks, reference-length checks
@@ -2172,8 +2248,9 @@ exercise:
   acceptance-record retirement while the canonical event remains queryable and
   uniqueness-tombstone enforcement; equivalent payloads with different
   compression, JSON ordering, or excluded metadata; message-only and
-  stacktrace-only error events, exception events, invalid levels, event items
-  with no error signal, and NFC-normalized key collisions before hashing;
+  stacktrace-only error events, exception events, deterministic multi-entry
+  Event DTO serialization and ordering, invalid levels, event items with no
+  error signal, and NFC-normalized key collisions before hashing;
 - new and duplicate chunks with exact `200` empty responses, conflicting
   chunks, interrupted assembly, optional and conflicting DIF idempotency keys,
   retries, polling, and lost responses, including non-terminal `not_found` and
@@ -2238,11 +2315,20 @@ exercise:
   observed-generation retry identities carried by required `If-Match` ETags,
   lost-response retries, stale-generation conflicts, exact `201`/`200` DTO
   responses and headers, no `202` operation responses, and rejection of
-  unknown or misplaced fields;
+  unknown or misplaced fields, mixed-authority project lists, all-or-nothing
+  project authorization, and the Owner/Admin requirement when `projects` is
+  omitted or empty;
 - project creation and browser-origin update with the exact closed request
-  bodies, canonical creation digest, required idempotency, nullable platform,
+  bodies including the required explicit slug, canonical slug-collision and
+  reuse behavior, canonical creation digest, required idempotency, nullable platform,
   origin validation, exact `200`/`202` Project and Operation DTO states,
-  duplicate behavior, response headers, and rejection of unknown members;
+  duplicate behavior, generation headers and stale-generation rejection,
+  response headers, and rejection of unknown members;
+- issue queries with NFC plus Unicode 15.1 default case folding, `ß`/`ss`,
+  locale-independent Turkish case behavior, and folded Unicode-scalar
+  substring matching; Envelope items carrying arbitrary `item_count` or
+  `item_headers` values on supported and excluded types, confirming they are
+  ignored and do not alter acceptance or the payload digest;
 - DSN issuance with required name and nullable platform, empty-object rotation,
   bodyless revocation, exact `201`/`200`/`204` responses, same-tuple conflicts,
   independent cross-project/operation keys, and rejection of unknown members
