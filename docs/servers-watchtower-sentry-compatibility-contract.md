@@ -967,7 +967,8 @@ an extension surface.
 | Event | `dateCreated` | Required RFC 3339 UTC string |
 | Event | `dateReceived` | Required RFC 3339 UTC string |
 | Event | `platform` | Nullable string |
-| Event | `tags` | Required array of objects containing required string fields `key` and `value`, plus optional string `query` |
+| Event | `level` | Nullable enum: `fatal`, `error`, `warning`, `info`, or `debug`; emitted as `null` when the normalized event omitted `level` |
+| Event | `tags` | Required array of objects containing required string fields `key` and `value`, plus optional string `query`; one object is emitted per normalized tag in RFC 8785 canonical key order, `key` and `value` use the normalized tag member, `query` is always omitted because normalized tags have no query metadata, and the array is empty when no tags are present |
 | Event | `contexts` | Required bounded JSON object; values are JSON scalars, arrays, or objects subject to the event limits above |
 | Event | `user` | Nullable object containing only the safe readable string fields `id`, `username`, and `name` |
 | Event | `sdk` | Nullable object containing exactly nullable string fields `name` and `version` |
@@ -1137,7 +1138,7 @@ operation `error` value. The suspension response above remains the only
 route-specific extension and retains only its documented bounded members.
 
 The `internal_error` body is the same shape with the fixed `code` and `detail`
-values `internal_error` and `Internal server error`, respectively, and never
+values `internal_error` and `Internal server error.`, respectively, and never
 contains `field_errors`. Original causes and unrestricted diagnostics never
 cross the response boundary. The adapter uses these stable Watchtower-safe
 codes while preserving the pinned client's expected HTTP status family.
@@ -1190,7 +1191,7 @@ exception above, the canonical details are:
 
 Runtime boundary codes `unknown`, `internal`, and `data_loss` map to the
 deterministic `500 internal_error` response. Its pinned-client error shape
-contains only the stable code, the fixed message `Internal server error`, the
+contains only the stable code, the fixed message `Internal server error.`, the
 request ID, and applicable retry metadata; the original cause and unrestricted
 diagnostics remain outside the response.
 
@@ -2029,11 +2030,13 @@ project alias resolved only within the authenticated organization; an unknown,
 cross-organization, or otherwise inaccessible alias returns the
 indistinguishable `404 not_found`, and any other query parameter returns `400
 invalid_request`. When the filter is omitted, the candidate project scope is
-the current release's associated projects. A candidate release must be in the
-same organization, be associated
-with at least one project in that scope, differ from the requested release, and
-have both `commitCount > 0` and a non-null `lastCommit`; releases without
-commits are skipped. Candidates are ordered by `dateCreated ASC`, then
+the intersection of the current release's associated projects and the
+projects currently readable by the principal; when supplied, it is the
+validated requested project set. A candidate release must be in the same
+organization, be associated with at least one readable project in that scope,
+differ from the requested release, and have both `commitCount > 0` and a
+non-null `lastCommit`; releases without commits are skipped. Candidates are
+ordered by `dateCreated ASC`, then
 `version ASC`, then `id ASC`. The route returns the candidate with the greatest
 ordering tuple strictly before the requested release's tuple, using the fixed
 Release DTO below. If no candidate matches, it returns the standard `404
@@ -2044,9 +2047,13 @@ only when the route project is currently readable by the principal, and the
 Release DTO's `projects` array is filtered to associated projects for which the
 principal has current read authority. The route project must remain in the
 filtered array; otherwise the route returns indistinguishable `404 not_found`.
-The same filtering applies to the `previous-with-commits` result after its
-candidate and project-scope checks. No project-scoped response includes an
-unreadable project's ID, slug, or name.
+For `previous-with-commits`, readable-project scope is applied before candidate
+ordering and selection, so a candidate associated only with unreadable
+projects is not eligible and produces the standard `404 not_found` when no
+other candidate matches. After selection, the result's `projects` array is
+still filtered to associated projects for which the principal has current read
+authority. No project-scoped response includes an unreadable project's ID,
+slug, or name.
 
 Every `<version>` in a release path is one RFC 3986 URI path segment. Clients
 percent-encode the UTF-8 bytes of the version, including reserved bytes such as
@@ -2280,7 +2287,8 @@ exercise:
   enforcement; equivalent payloads with different
   compression, JSON ordering, or excluded metadata; message-only and
   stacktrace-only error events, exception events, deterministic multi-entry
-  Event DTO serialization and ordering, invalid levels, event items with no
+  Event DTO serialization and ordering, nullable level mapping, deterministic
+  tag-array serialization, invalid levels, event items with no
   error signal, and NFC-normalized key collisions before hashing;
 - new and duplicate chunks with exact `200` empty responses, conflicting
   chunks, interrupted assembly, optional and conflicting DIF idempotency keys,
@@ -2341,7 +2349,8 @@ exercise:
   `/previous-with-commits/`, including repeated project filters from 1 through
   100, deterministic over-limit `413` responses, skipped no-commit releases,
   deterministic ordering/tie-breaking, normalized project/environment array
-  ordering, inaccessible-project filtering, no-match behavior, and the pinned
+  ordering, readable-project candidate filtering before selection,
+  inaccessible-project filtering, no-match behavior, and the pinned
   sentry-cli parsing workflow;
 - release creation, metadata update, and finalization with the exact request
   bodies, nullable fields, mutually exclusive combinations, canonical digests,
