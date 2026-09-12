@@ -233,10 +233,10 @@ to a native route.
 | Route | Methods | Authentication | v1 behavior |
 | --- | --- | --- | --- |
 | `/api/<project_id>/envelope/` | `POST` | Collection-only DSN in `X-Sentry-Auth`, DSN query parameters, or the DSN URL used by the pinned SDK | Supported for an active project for error events, attachments, client reports, and native crash items. Every structurally valid, non-conflicting Envelope returns `200` with an empty response body, including accepted, mixed, empty, and unsupported-only Envelopes; durable acceptance is returned before asynchronous processing/query visibility. An idempotency or digest conflict returns the `409 conflict` response defined below instead of the blanket `200`. Disabled, deleting, and deleted projects use the lifecycle admission responses below before payload acceptance. |
-| `/api/<project_id>/envelope/` | `OPTIONS` | Collection-only DSN in the DSN query parameters or DSN URL, project alias, and request `Origin` | Supported only for a configured project-origin CORS preflight. The DSN authenticates and tenant-binds the project alias before the allowlist is read. Returns `204` with no persistence side effect; a missing, invalid, or disallowed origin receives `401`/`403` with no CORS allow headers. |
+| `/api/<project_id>/envelope/` | `OPTIONS` | Collection-only DSN in the DSN query parameters or DSN URL, project alias, and request `Origin` | Supported only for a configured project-origin CORS preflight. The DSN authenticates and tenant-binds the project alias before the allowlist is read. Returns `204` with no persistence side effect; missing or invalid DSN authentication receives `401 invalid_authentication`, while a missing, malformed, or disallowed origin, including a project with no configured allowlist, receives `403 permission_denied` with no CORS allow headers. |
 | `/api/<project_id>/store/` | `POST` | Collection-only DSN | Supported legacy JSON error path required by a pinned client. The body is converted to one error event and follows Envelope admission semantics. Successful admission returns `200` with a zero-length body and request-ID headers. |
 | `/api/<project_id>/minidump/` | `POST` | Collection-only DSN | Supported for pinned crash workflows whose fixture specifies the non-Envelope minidump path. `multipart/form-data` and the pinned client field names are accepted. Successful admission returns `200` with a zero-length body and request-ID headers. |
-| `/api/<project_id>/upload/` | `POST` | Collection-only DSN | Supported pinned Native large-attachment TUS creation route. A valid integer `Upload-Length` from `0` through `20,000,000`, `Tus-Resumable: 1.0.0`, and `Upload-Metadata: sentry <base64({"attachment_type":"event.minidump"})>` request returns `201` with a project-bound `Location` containing a canonical lowercase UUID v7 `upload_id`, `Tus-Resumable: 1.0.0`, and `Upload-Offset: 0`; a zero-length upload is created directly as `complete-unbound`, while a positive-length upload is pending. Neither creation path accepts attachment bytes. A pending upload has a fixed 24-hour lifetime beginning at creation. |
+| `/api/<project_id>/upload/` | `POST` | Collection-only DSN | Supported pinned Native large-attachment TUS creation route. A valid integer `Upload-Length` from `0` through `20,000,000`, `Tus-Resumable: 1.0.0`, and `Upload-Metadata: sentry <base64({"attachment_type":"event.minidump"})>` request returns `201` with an absolute HTTP(S), project-bound `Location` containing a canonical lowercase UUID v7 `upload_id`, `Tus-Resumable: 1.0.0`, and `Upload-Offset: 0`; a zero-length upload is created directly as `complete-unbound`, while a positive-length upload is pending. Neither creation path accepts attachment bytes. A pending upload has a fixed 24-hour lifetime beginning at creation. |
 | `/api/<project_id>/upload/<upload_id>` | `HEAD`, `PATCH` | Collection-only DSN bound to the upload | Supported pinned Native TUS offset and append workflow. `HEAD` requires request `Tus-Resumable: 1.0.0` and, on success, returns `200` with an empty body and `Tus-Resumable: 1.0.0`, `Upload-Offset`, and `Upload-Length` response headers. Missing or unsupported `Tus-Resumable` returns `412 precondition_failed`; a missing, expired, already-bound, or inaccessible upload returns `404 not_found`, and invalid authentication returns `401 invalid_authentication`. A failed `HEAD` has no response body or `Content-Type`; it returns only its status, `Tus-Resumable: 1.0.0`, request-ID headers, and `Content-Length: 0`, with no `Upload-Offset` or `Upload-Length`. `PATCH` requires `Tus-Resumable: 1.0.0`, `Upload-Offset`, and `application/offset+octet-stream`, appends only at the expected offset, and returns `204` with an empty body, `Tus-Resumable: 1.0.0`, and the new `Upload-Offset`. A stale or mismatched offset returns `409 conflict` with the current `Upload-Offset`; bytes that would exceed `Upload-Length` return `413 payload_too_large` with the current `Upload-Offset`. `PATCH` failures use the standard JSON error body and atomically append no bytes. Reaching the declared length transitions the upload to `complete-unbound`; it remains subject to attachment and project limits and is not accepted until the subsequent Envelope binds it to an event. |
 | `/api/<project_id>/security-report/` | `POST` | Collection-only DSN | Explicitly unsupported in v1; returns `501 unsupported_capability` with no persistence side effect because security reports are not error telemetry. |
 | Any other `/api/<project_id>/...` ingestion route | Any | Any | `404` or `405` according to whether the path or method is unknown; no side effect. |
@@ -858,11 +858,16 @@ beyond those listed.
 ### DSN mutation request and response bodies
 
 DSN mutations require `Idempotency-Key` and the current `Manage` authority.
-Their full idempotency tuple is `(principal_id, canonical_project_uuid,
-operation_discriminator, idempotency_key)`, where the discriminator is one of
-`dsn.issue`, `dsn.rotate`, or `dsn.revoke`; the key is never looked up globally
-across projects or operation discriminators. The request digest is the RFC 8785
-canonical-JSON digest of the body shape below, excluding the HTTP key.
+Issuance uses the full idempotency tuple
+`(principal_id, canonical_project_uuid, dsn.issue, idempotency_key)`.
+Rotation and revocation use
+`(principal_id, canonical_project_uuid, operation_discriminator,
+target_dsn_key_id, idempotency_key)`, where the discriminator is `dsn.rotate` or
+`dsn.revoke` and `target_dsn_key_id` is the canonical project-scoped DSN-key
+identity resolved from `<key_id>` before mutation. The key is never looked up
+globally across projects, operations, or addressed DSN keys. The request digest
+is the RFC 8785 canonical-JSON digest of the body shape below, excluding the
+HTTP key and path target.
 
 `POST /api/0/projects/<organization>/<project>/keys/` accepts exactly:
 
@@ -887,10 +892,11 @@ containing the newly durable public DSN. `DELETE` on the same route is
 bodyless: a present body, including `{}`, is invalid. Successful revocation
 returns `204` with an empty body and no `Content-Type`. Repeating the same
 operation with the same principal, canonical project scope, operation
-discriminator, key, and body returns the original successful result. Reusing
-that key with different content within that same tuple returns `409 conflict`;
-the same key on another project or operation is an independent idempotency
-identity and is evaluated against that scope's body.
+discriminator, resolved target key when applicable, key, and body returns the
+original successful result. Reusing that key with different content for the same
+resolved target returns `409 conflict`; the same key for a different addressed
+key is an independent idempotency identity and is evaluated against that
+target's body.
 
 ### Release mutation request bodies
 
@@ -1076,6 +1082,12 @@ aggregate. The adapter emits that aggregate value in both Issue list and detail
 DTOs, or `null` when the aggregate has no value. It does not derive
 `Issue.culprit` from `Event.culprit`, select a candidate from any event in the
 issue, or apply the Event candidate precedence while projecting an Issue.
+
+`Issue.metadata` is the required four-field object supplied by the authoritative
+issue aggregate. The adapter emits that aggregate-owned object in both Issue
+list and detail DTOs, using `null` for fields the aggregate does not have. It
+does not derive `Issue.metadata` from `Event.metadata`, select an event, or
+apply the Event metadata projection while projecting an Issue.
 
 `Event.contexts` is always present as an object. When the accepted normalized
 event omits `contexts` or supplies explicit `null`, the adapter treats it as an
@@ -1843,12 +1855,17 @@ management schemas remain the explicit exception.
   `X-Request-ID`: `(tenant_id, project_id, client_request_id, payload_digest)`.
   This identity is used even when a syntax-validated envelope-level event ID is
   present; that event ID remains bounded request metadata and is never used for
-  event uniqueness or conflict detection. The same client request ID and digest
-  returns the original acceptance, while reusing it with a different digest
-  returns `409 conflict` with no new acceptance side effect. If no client
-  `X-Request-ID` was supplied, the generated response request ID is diagnostic
-  only and each retry is a new accepted no-op/client-report submission;
-  identical payloads are never collapsed by content alone.
+  event uniqueness or conflict detection. The payload-free acceptance record or
+  tombstone is retained through the applicable raw-acceptance horizon: seven
+  days from `accepted_at` by default, or the shorter project retention policy.
+  Its exact expiration is `now >= expires_at`, where `expires_at` is
+  `accepted_at` plus that applicable horizon. While retained, the same client
+  request ID and digest returns the original acceptance, while reusing it with a
+  different digest returns `409 conflict` with no new acceptance side effect.
+  After expiration, the identity is no longer authoritative and the retry is a
+  new no-op/client-report submission. If no client `X-Request-ID` was supplied,
+  the generated response request ID is diagnostic only and each retry is a new
+  accepted submission; identical payloads are never collapsed by content alone.
 - Creation, deletion, rotation, release finalization, chunk assembly, and
   deployment writes use the control-plane idempotency tuple. Project creation,
   project deletion, DSN mutation, and release-file deletion reject a missing
@@ -1940,8 +1957,8 @@ header-name casing is insignificant):
   `seconds` is a non-negative decimal duration, categories are lowercase
   `error`, `attachment`, `default`, `artifact`, or `all`, scope is lowercase
   `principal`, `organization`, `project`, or `key`, reason is a lowercase ASCII
-  token matching `[a-z0-9][a-z0-9_-]{0,63}`, and each namespace is a lowercase token using
-  `[a-z0-9_-]`. Categories and namespaces are unique and lexicographically
+  token matching `[a-z0-9][a-z0-9_-]{0,63}`, and each namespace is a lowercase token matching
+  `[a-z0-9][a-z0-9_-]{0,63}`. Categories and namespaces are unique and lexicographically
   sorted; entries are sorted by scope, category text, and seconds. The reason
   and namespace components are omitted when they do not apply.
 
@@ -2317,10 +2334,13 @@ readable project in scope or be unassociated and visible to the same
 organization-level Owner/Admin principal. Every candidate must be in the same
 organization, differ from the requested release, and have both `commitCount > 0`
 and a non-null `lastCommit`; releases without commits are skipped. Candidates are
-ordered by `dateCreated ASC`, then
-`version ASC`, then `id ASC`. The route returns the candidate with the greatest
-ordering tuple strictly before the requested release's tuple, using the fixed
-Release DTO below. If no candidate matches, it returns the standard `404
+ordered by `dateCreated ASC`, then `NFC(version)` in ascending lexicographic
+Unicode-scalar ordinal order independent of locale or database collation, then
+`id ASC`. The original release version remains the DTO value; NFC-equivalent
+versions therefore reach the `id` tie-breaker. The route uses this same
+comparison for the requested release and returns the candidate with the
+greatest ordering tuple strictly before the requested release's tuple, using the
+fixed Release DTO below. If no candidate matches, it returns the standard `404
 not_found` body without disclosing another release.
 
 For project-scoped release list and detail reads, the release remains visible
