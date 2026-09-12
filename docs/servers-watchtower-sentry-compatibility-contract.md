@@ -461,8 +461,10 @@ keys. `POST /api/0/organizations/<organization>/projects/` accepts exactly:
 ```
 
 `name` and `slug` are required. `name` is a non-empty printable ASCII string
-of 1 through 256 bytes, with every byte in `0x20` through `0x7e`, so the exact
-value can be carried by `X-Confirm-Project-Name`. `slug` is a canonical
+of 1 through 256 bytes. Every byte is in `0x20` through `0x7e`, and its first
+and last byte are in `0x21` through `0x7e`, so leading or trailing spaces
+(including a single-space name) are rejected and the exact value can be carried
+by `X-Confirm-Project-Name`. `slug` is a canonical
 lowercase ASCII compatibility alias
 matching `[a-z0-9][a-z0-9._-]{0,255}`. The adapter does not derive, rewrite,
 or suffix a slug. A slug already used by another project in the organization,
@@ -751,7 +753,7 @@ payloads into internal messages.
 | DSN issue/rotate/revoke | Project scope, the exact closed issuance body, `{}` rotation body, or bodyless revocation shape below, current Manage authority, and a required idempotency key | `201` issuance or `200` rotation returns the fixed DSN DTO; `204` revocation has an empty body; management-token plaintext is never returned |
 | Issue/event read or status transition | Globally unique issue alias resolved before owning-tenant authorization, or tenant/project-scoped event alias, bounded filters or status, and current credential | The fixed Issue or Event DTO below, request ID, and cursor link when paginated |
 | Release mutation | Organization/project scope, release version, bounded metadata, and canonical request identity; an `Idempotency-Key` may additionally bind the request | `201` for a new release or `200` for duplicate/update/finalization, with the direct Release DTO and request-ID headers; no operation state |
-| Release artifact upload | Project/release version scope, logical filename, optional distribution, bounded bytes, artifact type, and management credential | Artifact/file/checksum identity, upload or assembly operation ID, and `202` pending state when asynchronous |
+| Direct release-file upload | Project/release version scope, logical filename, optional distribution, bounded bytes, artifact type, and management credential | Artifact/file/checksum identity, an upload operation ID, and `202` pending state when asynchronous; artifact-bundle assembly uses the native response below and returns no assembly operation ID or status URL |
 | DIF chunk/assembly upload | Organization or project capability scope for chunks, project scope for assembly, a checksum-keyed request map of one to 256 entries whose lowercase full-file SHA-1 keys each map to `name`, optional `debug_id`, and ordered chunks, bounded bytes, and management credential | DIF checksum/debug identities and native repeat-POST `202` pending state when asynchronous; no assembly operation ID or status URL is returned |
 | Release file deletion | Exact project/release scope, required `file_id`, current Manage authority, required observed resource version, and a required idempotency key | `204` with an empty body after durable deletion; repeating the same target is the same successful no-op |
 | Deployment record | Organization scope, release version, environment/name/timestamp, bounded metadata, and canonical request identity; an `Idempotency-Key` may additionally bind the request | Deployment identity, release reference, timestamp, and request ID |
@@ -1910,11 +1912,16 @@ ordering is fixed per route:
 | `GET /api/0/projects/<organization>/<project>/issues/` | `lastSeen DESC`, then issue `id ASC` |
 | `GET /api/0/issues/<issue>/events/` | `dateReceived DESC`, then external event ID `eventID ASC` |
 | `GET /api/0/projects/<organization>/<project>/events/` | `dateReceived DESC`, then external event ID `eventID ASC` |
-| `GET /api/0/organizations/<organization>/releases/` | `dateCreated DESC`, then release `version ASC`, then release `id ASC` |
-| `GET /api/0/projects/<organization>/<project>/releases/` | `dateCreated DESC`, then release `version ASC`, then release `id ASC` |
+| `GET /api/0/organizations/<organization>/releases/` | `dateCreated DESC`, then `NFC(version) ASC`, then release `id ASC` |
+| `GET /api/0/projects/<organization>/<project>/releases/` | `dateCreated DESC`, then `NFC(version) ASC`, then release `id ASC` |
 | `GET /api/0/organizations/<organization>/releases/<version>/commits/` | commit `id ASC` |
 | `GET /api/0/projects/<organization>/<project>/releases/<version>/files/` | `dateCreated ASC`, then artifact `id ASC` |
 | `GET /api/0/organizations/<organization>/releases/<version>/deploys/` | `dateFinished DESC`, then deployment `id ASC` |
+
+For both release-list routes, `NFC(version) ASC` means ascending lexicographic
+Unicode-scalar ordinal order after NFC normalization, independent of locale or
+database collation. The original release version remains the DTO value;
+NFC-equivalent versions therefore reach the `id` tie-breaker.
 
 The first page establishes a read snapshot and its immutable high-water mark;
 the opaque cursor carries that snapshot, the last complete ordering tuple, and
@@ -2343,7 +2350,7 @@ greatest ordering tuple strictly before the requested release's tuple, using the
 fixed Release DTO below. If no candidate matches, it returns the standard `404
 not_found` body without disclosing another release.
 
-For project-scoped release list and detail reads, the release remains visible
+For project-scoped release list reads, the release remains visible
 only when the route project is currently readable by the principal, and the
 Release DTO's `projects` array is filtered to associated projects for which the
 principal has current read authority. The route project must remain in the
@@ -2715,7 +2722,8 @@ exercise:
   fixed Release DTO responses with `shortVersion: null` or `404 not_found` for
   `/previous-with-commits/`, including repeated project filters from 1 through
   100, deterministic over-limit `413` responses, skipped no-commit releases,
-  deterministic ordering/tie-breaking, normalized project/environment array
+  deterministic NFC-normalized Unicode-scalar release ordering/tie-breaking,
+  normalized project/environment array
   ordering, readable-project candidate filtering before selection,
   inaccessible-project filtering, visible unassociated candidates for
   organization-level Owner/Admin principals, the same visibility gate for organization
@@ -2734,7 +2742,8 @@ exercise:
   omitted or empty;
 - project creation and browser-origin update with the exact closed request
   bodies including the required explicit slug, printable-ASCII project-name
-  validation, canonical slug-collision and reuse behavior, canonical creation
+  validation with leading/trailing-space rejection, canonical slug-collision
+  and reuse behavior, canonical creation
   digest, required idempotency, nullable platform, origin validation, exact
   `200`/`202` Project and Operation DTO states, duplicate behavior, generation
   headers and stale-generation rejection, ordinary alias reads without a
