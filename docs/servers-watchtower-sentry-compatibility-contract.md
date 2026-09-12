@@ -266,9 +266,20 @@ These lifecycle responses apply to collection admission and every
 project-bound upload or assembly request, and every rejected request persists
 no payload, acceptance record, attachment bytes, or operation state.
 Organization-scoped chunk staging is project-neutral because its request carries
-no project identity; it follows organization authorization and lifecycle rules
-and is not rejected for a project's disabled state. The project fence is applied
-when that staged data is supplied to a project-bound upload or assembly.
+no project identity, but it is not available to every organization member. Both
+the organization capability `GET` and the multipart `POST` at its returned URL
+require the current principal and credential to have effective `Write` or
+`Manage` authority on at least one project in that organization. Owner/Admin
+membership qualifies through the effective Manage rule; a project-scoped
+personal or service credential qualifies only when its current scope and
+membership together grant Write or Manage on at least one project. Read-only
+members, Viewer credentials, and credentials with no qualifying project scope
+receive the normal authorization failure and consume no staging quota. This
+authority check is the same for the capability read and staging POST; project
+authorization and lifecycle are rechecked when staged data is supplied to a
+project-bound upload or assembly. Staging is therefore not rejected merely
+because a later target project is disabled, while the project fence still
+applies at project-bound assembly.
 
 Disablement also applies to management mutations. Authorized `GET` project,
 DSN, issue, event, release, commit, release-file, chunk-capability, and
@@ -396,7 +407,7 @@ the allowlist, or a project with no configured allowlist, receives
 | `/api/0/organizations/<organization>/releases/<version>/previous-with-commits/` | `GET` the fixed Release DTO below for the deterministic previous release selected by the project-filter rules below, or `404 not_found` when no previous release is available, subject to project and tenant scope. |
 | `/api/0/projects/<organization>/<project>/releases/<version>/files/` | `GET` file listing and `POST` upload using the exact multipart protocol below. Source maps and debug files are handled by the artifact authority. |
 | `/api/0/projects/<organization>/<project>/releases/<version>/files/<file_id>/` | `GET` the one release file identified by `file_id`, returning its Artifact DTO and current strong `ETag`; `DELETE` performs idempotent failed-upload cleanup using that exact observed ETag. Deletion never bypasses lifecycle rules. |
-| `/api/0/organizations/<organization>/chunk-upload/` | `GET` organization-scoped artifact-bundle and DIF chunk capability for the pinned sentry-cli. The response supplies the upload URL, chunk size, request limits, concurrency, hash algorithm, and accepted compression. The returned `url` is itself an admitted organization-scoped multipart `POST` route valid for both workflows; its request carries no project field. |
+| `/api/0/organizations/<organization>/chunk-upload/` | `GET` organization-scoped artifact-bundle and DIF chunk capability for the pinned sentry-cli, available only with effective `Write` or `Manage` authority on at least one project in the organization. The response supplies the upload URL, chunk size, request limits, concurrency, hash algorithm, and accepted compression. The returned `url` is itself an admitted organization-scoped multipart `POST` route valid for both workflows; its request carries no project field and uses the same authority rule. |
 | `/api/0/projects/<organization>/<project>/chunk-upload/` | `GET` project-scoped DIF chunk capability for the pinned sentry-cli. The response supplies a project-bound upload URL, chunk size, request limits, concurrency, hash algorithm, and accepted compression. |
 | `/api/0/projects/<organization>/<project>/files/difs/chunks/` (or the exact project-bound upload URL returned by the DIF capability response) | `POST` multipart chunk upload using `file` or `file_gzip` parts keyed by SHA-1 checksum. A valid new or matching checksum returns `200` with an empty body and the standard request-ID headers; a matching checksum is idempotent, while conflicting bytes are `409`. |
 | `/api/0/projects/<organization>/<project>/files/difs/assemble/` | `POST` DIF assembly with the pinned sentry-cli request map. The response reports each digest's `state`, `missingChunks`, bounded `detail`, and registered DIF when complete. Polling repeats this request with the same body and optional idempotency key. |
@@ -540,7 +551,11 @@ route. While an organization is suspended, collection, ordinary organization
 and project reads, issue/event reads, DSN reads or mutations, release and
 artifact operations, deployment records, and ordinary project changes are
 blocked; no full Organization or Project DTO, including `browser_origins`, is
-returned. On a project route, a current Owner/Admin user session that passes
+returned. For `GET /api/0/organizations/`, the fence is applied per authorized
+organization before the existing snapshot ordering and pagination: suspended
+organizations are omitted, they never make the whole list fail, and an empty
+visible set returns the normal empty direct array. No suspended organization
+DTO, status, or suspension metadata is exposed by this list route. On a project route, a current Owner/Admin user session that passes
 the control-plane reauthentication requirement receives `403
 permission_denied` with exactly this bounded deletion-handoff shape:
 
@@ -756,7 +771,7 @@ beyond those listed.
 | --- | --- | --- |
 | Release | `id` | Required non-empty string compatibility alias; never a Watchtower canonical ID |
 | Release | `version` | Required non-empty release version string |
-| Release | `shortVersion` | Nullable string |
+| Release | `shortVersion` | Nullable string; always `null` in v1, with no derivation from `version` |
 | Release | `ref` | Nullable string |
 | Release | `url` | Nullable HTTP(S) URL |
 | Release | `dateCreated` | Required RFC 3339 UTC string |
@@ -965,7 +980,6 @@ an extension surface.
 | Issue | `shortId` | Required string compatibility alias |
 | Issue | `title` | Required string |
 | Issue | `culprit` | Nullable string |
-| Issue | `permalink` | Required string URL |
 | Issue | `level` | Required enum: `sample`, `debug`, `info`, `warning`, `error`, `fatal`, or `unknown` |
 | Issue | `status` | Required enum: `resolved`, `ignored`, `pending_deletion`, `pending_merge`, `reprocessing`, or `unresolved` |
 | Issue | `statusDetails` | Required object whose exact member types, nullability, and presence conditions are defined immediately below; non-applicable members are omitted |
@@ -1161,19 +1175,16 @@ neither `Content-Type` nor a JSON error body.
 {
   "code": "invalid_request",
   "detail": "The request is invalid.",
-  "request_id": "canonical-lowercase-uuid-v7",
-  "field_errors": [
-    { "field": "version", "reason": "required" }
-  ]
+  "request_id": "canonical-lowercase-uuid-v7"
 }
 ```
 
 `code`, `detail`, and `request_id` are required and non-null. `request_id` is a
 canonical lowercase UUID v7 equal to the `X-Watchtower-Request-ID` response
-header. `field_errors` is omitted when there are no field-specific errors and,
-when present, is a non-empty array whose entries contain exactly the non-empty
-safe strings `field` and `reason`; it is never `null`. No other members are
-allowed. The same object, including `request_id`, is used for the nested
+header. `field_errors` is never emitted, including when one or more known
+fields are invalid; adapters do not select, order, or expose field-specific
+reasons in compatibility error bodies. No other members are allowed. The same
+object, including `request_id`, is used for the nested
 operation `error` value. The suspension response above remains the only
 route-specific extension and retains only its documented bounded members.
 
@@ -1498,15 +1509,18 @@ its accepted event.
 }
 ```
 
-`discarded_events` is required and contains one through 1,024 records. Each
-record requires `reason` and `category` as non-empty lowercase ASCII tokens
-matching `[a-z0-9][a-z0-9._-]{0,63}`, plus `quantity` as an integer from `1`
-through `2,147,483,647`. Unknown non-structural members follow the
-unknown-field rule below and are not included in the digest. Missing required
-members, wrong types, empty arrays or tokens, invalid token grammar, quantities
-outside the range, or a record count over 1,024 rejects the entire Envelope
-with `400 invalid_envelope` before acceptance. Duplicate records are retained
-and sorted by canonical JSON for digest construction; they are not merged.
+`discarded_events` is required and contains one through 1,024 records in each
+`client_report` item. Across all `client_report` items in one Envelope, the
+aggregate record count must also be at most 1,024. Each record requires
+`reason` and `category` as non-empty lowercase ASCII tokens matching
+`[a-z0-9][a-z0-9._-]{0,63}`, plus `quantity` as an integer from `1` through
+`2,147,483,647`. Unknown non-structural members follow the unknown-field rule
+below and are not included in the digest. Missing required members, wrong
+types, empty arrays or tokens, invalid token grammar, quantities outside the
+range, an item record count over 1,024, or an Envelope aggregate over 1,024
+rejects the entire Envelope with `400 invalid_envelope` before acceptance.
+Duplicate records are retained and sorted by canonical JSON for digest
+construction; they are not merged.
 
 An `event` item qualifies as a supported error event only when it has a valid
 external `event_id` and at least one error signal: a non-empty `message`, an
@@ -1605,7 +1619,20 @@ management schemas remain the explicit exception.
   | `tags` | Optional object whose keys and values are bounded UTF-8 strings; both are NFC-normalized, and the object keys are sorted by RFC 8785 canonical order. |
   | `contexts` | Optional bounded JSON object. Object keys are NFC-normalized and sorted; nested arrays preserve order. |
   | `breadcrumbs` | Optional ordered array of bounded objects. Array order is preserved and every nested object/value uses the recursive bounded-value rules below. |
-  | `exception`, `stacktrace`, `sdk`, `user`, `debug_meta`, `metadata` | Optional bounded JSON objects using the recursive bounded-value rules below; absent and `null` values are omitted. |
+  | `exception`, `stacktrace`, `debug_meta`, `metadata` | Optional bounded JSON objects using the recursive bounded-value rules below; absent and `null` values are omitted. |
+  | `user` | Optional `null` or object with optional `id`, `username`, and `name` members; each present member is a bounded NFC-normalized non-empty string. |
+  | `sdk` | Optional `null` or object whose `name` and `version` members are nullable bounded NFC-normalized strings. |
+
+  `user` and `sdk` use the closed schemas above rather than arbitrary recursive
+  objects. A missing or explicit `null` `user` or `sdk` serializes as `null`.
+  A present `user` object ignores unknown members and serializes only the
+  supplied recognized string members, including an empty object when none are
+  supplied. A present `sdk` object ignores unknown members and serializes
+  exactly `{ "name": <string-or-null>, "version": <string-or-null> }`, using
+  `null` for either recognized member that was absent. A scalar, array, or
+  wrong-typed recognized member rejects the Envelope with `400 invalid_envelope`;
+  no value is coerced or silently dropped. Recognized strings are NFC-normalized
+  before DTO serialization and digest construction.
 
   Recursive bounded values are only `null`, booleans, finite numbers, NFC
   strings, arrays, or objects. Before sorting or emitting any object, the
@@ -1894,9 +1921,12 @@ chunk list is only the assembly input: the adapter concatenates the referenced
 chunk bytes in that order, verifies the declared full-file checksum, and then
 uses the assembled bytes and checksum for identity. A matching checksum and
 assembled bytes are a successful duplicate even when a valid retry uses a
-different chunk partition or logical name. Different assembled bytes fail
-checksum validation before mutation; a conflicting debug identity remains
-`409` where the separate debug identity is already owned by different content.
+different chunk partition or logical name. The logical name from the first
+successful registration is canonical: every later duplicate or successful
+poll returns that stored name and never replaces it with the retry's name.
+Different assembled bytes fail checksum validation before mutation; a
+conflicting debug identity remains `409` where the separate debug identity is
+already owned by different content.
 
 DIF assembly does not require a client idempotency key. For a checksum-keyed
 request map containing one or more entries, the adapter derives the operation
@@ -2345,8 +2375,8 @@ exercise:
   with a zero-length response body, plus eventless empty/client-report retries
   with the same client `X-Request-ID`, different client IDs, and no client ID;
   client reports also cover the exact `discarded_events` shape, token and
-  quantity boundaries, duplicate-record digest handling, unknown members, and
-  the 1,024-record limit;
+  quantity boundaries, duplicate-record digest handling, unknown members,
+  multiple `client_report` items, and the aggregate 1,024-record limit;
   conflicting event/request digests expect the standard `409 conflict` body
   and no new acceptance side effect;
 - nested identity/gzip item payloads at and over the decoded 20,000,000-byte
@@ -2359,13 +2389,15 @@ exercise:
   stacktrace-only error events, exception events, deterministic multi-entry
   Event DTO serialization and ordering, nullable level mapping, deterministic
   tag-array serialization, invalid levels, event items with no
-  error signal, and NFC-normalized key collisions before hashing;
+  error signal, strict `user`/`sdk` type validation and null/missing/unknown
+  member mapping, and NFC-normalized key collisions before hashing;
 - new and duplicate chunks with exact `200` empty responses, conflicting
   chunks, interrupted assembly, optional and conflicting DIF idempotency keys,
   retries, polling, and lost responses, including non-terminal `not_found` and
   `assembling`, newly created terminal `created`, and duplicate/polled terminal
   `ok` DIF states with exact state-specific `detail`/`dif` presence, plus
-  identical DIF bytes submitted with alternate valid chunk partitions;
+  identical DIF bytes submitted with alternate valid chunk partitions or names,
+  asserting first-write-wins for the registered logical name;
 - collection credentials in `X-Sentry-Auth`, DSN query parameters, and DSN
   URLs, including percent-decoding, duplicate parameters, missing/unknown
   members, route-project mismatches, and conflicting sources;
@@ -2401,12 +2433,15 @@ exercise:
   `404` results, rate-limit headers, exact
   `rel="next"`/`results="true"`/`cursor` Link parameters, `limit` bounds,
   DSN-key, release-file, release-commit, and deployment lists, unknown fields,
-  and every safe error class with the exact error-body member and detail rules;
+  mixed active/suspended organization lists, and every safe error class with
+  the exact error-body member and detail rules, including consistent omission
+  of `field_errors`;
 - exact organization/project DTO bodies, including nullable platform,
   organization compatibility booleans, required deployment finish times,
   canonical aliases, origin arrays, omitted unknown fields, and list/detail
   consistency;
 - exact issue/event DTO bodies, nullable fields, omitted unknown fields,
+  omission of `permalink`, and strict `user`/`sdk` serialization,
   every `statusDetails` member's exact type, nullability, and status-dependent
   presence condition, including Actor and reprocessing-info shapes,
   list/detail/status-transition consistency, tenant-unique issue aliases, CLI
@@ -2420,7 +2455,7 @@ exercise:
   all-or-nothing precondition failures, and rejection of
   scalar/query-only/unbounded updates and route-project-mismatched IDs;
 - release `/commits/` direct arrays containing exactly `{ "id": string }`,
-  fixed Release DTO responses or `404 not_found` for
+  fixed Release DTO responses with `shortVersion: null` or `404 not_found` for
   `/previous-with-commits/`, including repeated project filters from 1 through
   100, deterministic over-limit `413` responses, skipped no-commit releases,
   deterministic ordering/tie-breaking, normalized project/environment array
@@ -2461,6 +2496,8 @@ exercise:
   stale-version and idempotency-key conflicts, and owner outage, including a
   terminal successful deletion poll with `result: null`;
 - organization-scoped capability probes for both DIF and artifact bundles,
+  including allowed Owner/Admin and project Write/Manage credentials, denied
+  read-only credentials, and the same authority rule on the staging POST,
   project-scoped DIF compatibility, exact SHA-1/hash/compression/chunk values,
   the shared `maxFileSize: 50000000` cap,
   exact `maxWait: 0` and `concurrency: 8`, and positive `chunksPerRequest`;
@@ -2472,7 +2509,7 @@ exercise:
   for rejected requests, including compressed and legacy parsed events before
   the environment fence, plus authorized disabled-project reads, blocked
   project-bound management writes, reusable organization-scoped chunk staging,
-  and `403` at disabled-project assembly;
+  staging reuse for disabled targets, and `403` at disabled-project assembly;
 - chunk requests at and over the advertised `maxRequestSize`, including
   duplicate and rejected parts, with `413` and no partial persistence for an
   over-limit request, `400` for overlong scalar fields, platform-token grammar,
