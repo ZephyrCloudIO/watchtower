@@ -752,11 +752,11 @@ payloads into internal messages.
 | Project create/update/delete | Organization scope, the exact project mutation body defined below, current authorization, observed version and `X-Watchtower-Project-Generation` for settings update and delete, a bodyless delete, `X-Confirm-Project-Name` for delete, and idempotency key for create/delete | Exact `200` Project DTO or `202`/`200` Operation DTO responses defined in Project mutation responses; direct Project DTOs include the strong `ETag` and project-generation header |
 | DSN issue/rotate/revoke | Project scope, the exact closed issuance body, `{}` rotation body, or bodyless revocation shape below, current Manage authority, and a required idempotency key | `201` issuance or `200` rotation returns the fixed DSN DTO; `204` revocation has an empty body; management-token plaintext is never returned |
 | Issue/event read or status transition | Globally unique issue alias resolved before owning-tenant authorization, or tenant/project-scoped event alias, bounded filters or status, and current credential | The fixed Issue or Event DTO below, request ID, and cursor link when paginated |
-| Release mutation | Organization/project scope, release version, bounded metadata, and canonical request identity; an `Idempotency-Key` may additionally bind the request | `201` for a new release or `200` for duplicate/update/finalization, with the direct Release DTO and request-ID headers; no operation state |
-| Direct release-file upload | Project/release version scope, logical filename, optional distribution, bounded bytes, artifact type, and management credential | Artifact/file/checksum identity, an upload operation ID, and `202` pending state when asynchronous; artifact-bundle assembly uses the native response below and returns no assembly operation ID or status URL |
+| Release mutation | Organization/project scope, release version, bounded metadata, and canonical request identity; release creation requires an `Idempotency-Key` | `201` for a new release or `200` for duplicate/update/finalization, with the direct Release DTO and request-ID headers; no operation state |
+| Direct release-file upload | Project/release version scope, logical filename, optional distribution, bounded bytes, artifact type, and management credential | An upload operation ID and `202` pending state when asynchronous; artifact/file/checksum identity is returned by the successful terminal poll; artifact-bundle assembly uses the native response below and returns no assembly operation ID or status URL |
 | DIF chunk/assembly upload | Organization or project capability scope for chunks, project scope for assembly, a checksum-keyed request map of one to 256 entries whose lowercase full-file SHA-1 keys each map to `name`, optional `debug_id`, and ordered chunks, bounded bytes, and management credential | DIF checksum/debug identities and native repeat-POST `202` pending state when asynchronous; no assembly operation ID or status URL is returned |
 | Release file deletion | Exact project/release scope, required `file_id`, current Manage authority, required observed resource version, and a required idempotency key | `204` with an empty body after durable deletion; repeating the same target is the same successful no-op |
-| Deployment record | Organization scope, release version, environment/name/timestamp, bounded metadata, and canonical request identity; an `Idempotency-Key` may additionally bind the request | Deployment identity, release reference, timestamp, and request ID |
+| Deployment record | Organization scope, release version, environment/name/timestamp, bounded metadata, canonical request identity, and a required `Idempotency-Key` | Deployment identity, release reference, timestamp, and request ID |
 
 ### Organization and project DTOs
 
@@ -792,9 +792,9 @@ and list reads, and it exposes no secrets, internal IDs, or raw storage data.
 
 Release, artifact, DIF, DSN, and deployment responses use the fixed objects
 below. List routes return direct arrays of the same objects. Every listed field
-is present unless it is explicitly nullable; unknown upstream fields are
-omitted rather than emitted as `null`, and nested objects contain no fields
-beyond those listed.
+is present, including nullable fields, which are emitted as JSON `null` when no
+value exists. Unknown upstream fields are omitted, and nested objects contain
+no fields beyond those listed.
 
 | DTO | Field | Type and rule |
 | --- | --- | --- |
@@ -915,6 +915,8 @@ list responses omit `ETag`, and a collection response ETag is never accepted
 as the observed version for `If-Match`.
 Release metadata and finalization `PUT` requests require that exact observed
 ETag in `If-Match`; creation has no prior version and does not require it.
+Release creation additionally requires `Idempotency-Key`; a missing or
+malformed key returns `400 invalid_request` before mutation.
 
 `POST /api/0/organizations/<organization>/releases/` accepts exactly:
 
@@ -1016,9 +1018,11 @@ routes and single-issue status transitions return one DTO. Bulk issue status
 transitions return a direct array of updated Issue DTOs in the request `id`
 order. Pagination remains in the
 `Link` header and request ID headers; it is never wrapped in an additional JSON
-object. Every field listed below is present unless it is explicitly nullable.
-Unknown upstream fields are omitted, not emitted as `null`, and do not become
-an extension surface.
+object. Every field listed below is present. Nullable fields are emitted as JSON
+`null` when no value exists. `statusDetails` is the explicit
+conditional-presence exception defined below; its non-applicable members are
+omitted. Unknown upstream fields are omitted and do not become an extension
+surface.
 
 | DTO | Field | Type and rule |
 | --- | --- | --- |
@@ -1664,10 +1668,15 @@ external `event_id` and at least one error signal: a non-empty `message`, an
 `exception` object with a non-empty `values` array, a `stacktrace` object with
 a non-empty `frames` array, or `level` equal to `error` or `fatal`. A present
 `level` must use the enum above. The message, exception, and stacktrace forms
-must otherwise satisfy the declared JSON shapes and recursive limits. A valid
-event item with an ID but none of these signals is individually excluded with
-reason `not_error_event`; it does not create an event or attachment, while a
-malformed supported field still rejects the entire Envelope.
+must otherwise satisfy the declared JSON shapes and recursive limits. When
+present and non-null, `exception` and `stacktrace` must be objects; their
+`values` and `frames` members, when present, must be arrays whose every element
+is a bounded object. An empty array is not an error signal, but a scalar or
+`null` element rejects the entire Envelope with `400 invalid_envelope` before
+acceptance. A valid event item with an ID but none of these signals is
+individually excluded with reason `not_error_event`; it does not create an event
+or attachment, while any other malformed supported field still rejects the
+entire Envelope.
 
 | Item type | v1 behavior |
 | --- | --- |
@@ -1779,6 +1788,13 @@ management schemas remain the explicit exception.
   dropped. Recognized strings are NFC-normalized before DTO serialization and
   digest construction.
 
+  When present and non-null, `exception` and `stacktrace` use the bounded object
+  shapes above. `exception.values` and `stacktrace.frames`, when present, are
+  arrays of bounded objects; every element is required to be an object, so a
+  scalar or `null` element rejects the Envelope with `400 invalid_envelope`
+  before acceptance. Empty arrays remain valid input but do not qualify as an
+  error signal.
+
   `metadata` is optional. When present and non-null, it must be an object whose
   keys and values satisfy the recursive bounded-value rules below; an explicit
   `null` is treated as absent. The normalized event retains the accepted bounded
@@ -1873,18 +1889,19 @@ management schemas remain the explicit exception.
   project deletion, DSN mutation, and release-file deletion reject a missing
   required client key before mutation; reusing a supplied key with different
   content returns `409`.
-- Pinned release create/update/finalize and deployment requests do not require
-  `Idempotency-Key`. Release metadata updates and finalization require the
-  exact observed release `ETag` in `If-Match`. For release creation and deployment, an absent key uses
-  `(tenant_id, operation, target_scope, canonical_request_body_digest)`. For
-  release metadata updates and finalization, it additionally includes the
-  observed monotonic release generation:
-  `(tenant_id, operation, target_scope, observed_release_generation,
-  canonical_request_body_digest)`. A lost-response retry against the same
+- Pinned release creation and deployment requests require `Idempotency-Key`;
+  a missing or malformed key returns `400 invalid_request` before mutation.
+  The key binds through the control-plane tuple
+  `(principal_id, scope_kind, scope_id, operation, idempotency_key)` and the
+  canonical request-body digest, so the same key and body cannot collapse
+  operations from different principals. Release metadata updates and
+  finalization do not require a client key, but they require the exact observed
+  release `ETag` in `If-Match` and use a retry identity containing the
+  principal, target scope, observed monotonic release generation, and
+  canonical request-body digest. A lost-response retry against the same
   generation resumes the identical operation; a later legitimate mutation has
-  a new identity even when its body matches an older request. When supplied,
-  the client key binds to the first observed generation and the same identity;
-  reusing it with different content or scope returns `409`. No retry identity
+  a new identity even when its body matches an older request. Reusing a
+  supplied key with different content or scope returns `409`. No retry identity
   includes credentials or unrestricted payloads.
 - Duplicate or out-of-order asynchronous messages are handled by the owning
   component's idempotent command/reconciliation contract. The adapter never
@@ -2089,10 +2106,12 @@ from the decompressed `file` bytes, not multipart framing or compressed bytes.
 
 The upload identity is
 `(tenant_id, project_id, release_version, dist_or_null, type, name)`. A first
-accepted upload returns `202` with the pending Operation DTO, a `Location`
-header equal to its `status_url`, and `Retry-After: 5`. Polling that operation
-returns `200` with `status: "succeeded"` and the registered Artifact DTO in
-`result`, or `status: "failed"` with the standard bounded operation error.
+accepted upload returns `202` with exactly the pending Operation DTO, a
+`Location` header equal to its `status_url`, and `Retry-After: 5`; the pending
+response contains no artifact, file, or checksum identity. Polling that
+operation returns `200` with `status: "succeeded"` and the registered Artifact
+DTO, including its identity and checksum, in `result`, or `status: "failed"`
+with the standard bounded operation error.
 Retries with the same identity and checksum resume the same operation or
 return its terminal result; the same identity with different decompressed bytes
 returns `409 conflict`. The canonical request digest includes the normalized
@@ -2440,14 +2459,12 @@ collide after NFC normalization are rejected with `400 invalid_request` before
 the digest or mutation; no key overwrites another. Accepted timestamps with
 fewer than nine fractional digits are right-padded with zeroes in the
 canonical UTC serialization. The normalized body is the RFC 8785 request
-digest preimage. Deployment writes do not require a client idempotency key; without
-one, retries use `(tenant_id, operation, release_scope,
-canonical_request_body_digest)`, so a new normalized body digest is a distinct
-deployment record. When a client key is supplied, it binds to the same release
-scope and normalized body digest; repeating that key with the same body returns
-the original successful result, while reusing it with a different body returns
-`409 conflict`.
-An identical no-key retry also returns the original Deployment DTO with `200`.
+digest preimage. Deployment writes require a client idempotency key; a missing
+or malformed key returns `400 invalid_request` before mutation. The key binds
+through `(principal_id, scope_kind, scope_id, operation, idempotency_key)` and
+the normalized body digest. Repeating it with the same body returns the
+original successful result, while reusing it with a different body or scope
+returns `409 conflict`.
 The first successful `POST` for a new identity returns `201` with the fixed
 Deployment DTO; both `dateCreated` and `dateFinished` equal the normalized
 request `timestamp`, serialized as the canonical UTC form
@@ -2645,7 +2662,8 @@ exercise:
   header shapes, dynamic-sampling `trace` fields including string/boolean
   `sampled`, ignored unknown top-level members, rejected unknown nested
   `sdk`/`trace` members, invalid-shape rejection, and NFC-normalized key
-  collisions before hashing;
+  collisions before hashing, including rejection of scalar and `null`
+  `exception.values` and `stacktrace.frames` elements;
 - new and duplicate chunks with exact `200` empty responses, conflicting
   chunks, interrupted assembly, optional and conflicting DIF idempotency keys,
   retries, polling, and lost responses, including non-terminal `not_found` and
@@ -2700,9 +2718,10 @@ exercise:
 - exact organization/project DTO bodies, including nullable platform,
   organization compatibility booleans, required deployment finish times,
   canonical aliases, origin arrays, omitted unknown fields, and list/detail
-  consistency;
-- exact issue/event DTO bodies, nullable fields, omitted unknown fields,
-  omission of `permalink`, and strict `user`/`sdk` serialization,
+  consistency, including explicit `null` for every declared nullable field;
+- exact issue/event DTO bodies, nullable fields emitted as explicit `null`,
+  omitted unknown fields, omission of `permalink`, and strict `user`/`sdk`
+  serialization,
   canonical Event `dateCreated`/`dateReceived` timestamp mappings and exact
   invalid-timestamp behavior,
   every `statusDetails` member's exact type, nullability, and status-dependent
@@ -2733,6 +2752,8 @@ exercise:
   authority;
 - release creation, metadata update, and finalization with the exact request
   bodies, nullable fields, mutually exclusive combinations, canonical digests,
+  required client idempotency for release creation, explicit `null` for
+  declared nullable response fields,
   observed-generation retry identities carried by required `If-Match` ETags,
   lost-response retries, stale-generation conflicts, exact `201`/`200` DTO
   responses and headers including strong mutation ETags and list-response ETag
@@ -2762,8 +2783,9 @@ exercise:
   independent cross-project/operation keys, and rejection of unknown members
   or bodies;
 - direct release-file uploads with exact multipart parts and encodings,
-  decompressed-byte checksums, duplicate/conflicting identities, `202`
-  operation responses, terminal artifact results, and invalid-part rejection;
+  decompressed-byte checksums, duplicate/conflicting identities, the exact
+  pending `202` Operation DTO without artifact identity, terminal artifact
+  results containing identity and checksum, and invalid-part rejection;
 - project deletion with missing/mismatched confirmation, release-file deletion
   item reads exposing the current strong `ETag`, deletion without `If-Match` or
   idempotency key, a non-empty entity body, by exact `file_id`, repeated deletion, wrong-scope `404`,
@@ -2803,8 +2825,9 @@ exercise:
   denied and suspended owning organizations omitted safely;
 - organization/project reads, creation, update, deletion, DSN issuance,
   rotation/revocation, issue/event reads, resolve/reopen/ignore/mute/next-release,
-  release requests without client idempotency keys, and deployment workflows
-  with an always-null `dateStarted`;
+  release metadata/finalization requests without client idempotency keys,
+  rejection of keyless release creation, and deployment workflows with an
+  always-null `dateStarted`;
 - operation polling with `202 pending` and exact `Retry-After: 5`, `200
   succeeded`, `200 failed`, the immutable originating nested failure
   `request_id` across repeated failed polls with distinct current poll IDs, the
@@ -2824,8 +2847,9 @@ exercise:
   terminal checksum-mismatch failures, safe details, and nullability;
 - deployment writes with the closed JSON body, omitted/null normalization,
   metadata bounds, NFC key-collision rejection, bounded timestamp precision,
-  canonical digest, exact `201` initial and `200` duplicate responses, distinct
-  no-key deployment bodies, and conflicting supplied-key retry rejection, plus
+  canonical digest, required client idempotency, exact `201` initial and `200`
+  duplicate responses, missing-key rejection, and conflicting supplied-key
+  retry rejection, plus
   Write/Manage authorization over every associated
   release project and Owner/Admin authorization for unassociated releases;
 - owner outages, quota exhaustion, processing lag, symbolication lag, no
