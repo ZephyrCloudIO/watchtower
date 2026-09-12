@@ -241,6 +241,22 @@ to a native route.
 | `/api/<project_id>/security-report/` | `POST` | Collection-only DSN | Explicitly unsupported in v1; returns `501 unsupported_capability` with no persistence side effect because security reports are not error telemetry. |
 | Any other `/api/<project_id>/...` ingestion route | Any | Any | `404` or `405` according to whether the path or method is unknown; no side effect. |
 
+An unsupported method on a known supported ingestion route returns the standard
+`405 method_not_allowed` object and an `Allow` header containing exactly the
+methods listed here, in the listed order. The route-specific values are:
+
+| Route | `Allow` |
+| --- | --- |
+| `/api/<project_id>/envelope/` | `POST, OPTIONS` |
+| `/api/<project_id>/store/` | `POST` |
+| `/api/<project_id>/minidump/` | `POST` |
+| `/api/<project_id>/upload/` | `POST` |
+| `/api/<project_id>/upload/<upload_id>` | `HEAD, PATCH` |
+
+The explicitly unsupported `/api/<project_id>/security-report/` route retains
+its `501 unsupported_capability` result for every method and does not use this
+`405` rule. Unknown paths remain `404` and do not emit `Allow`.
+
 `project_id` is a compatibility alias accepted only at the adapter boundary.
 It resolves to one canonical lowercase UUID v7 project identity within the
 authenticated tenant. It is never reused after deletion and is never accepted
@@ -420,6 +436,33 @@ the allowlist, or a project with no configured allowlist, receives
 | `/api/0/operations/<operation_id>/` | `GET` Watchtower compatibility polling extension for project/lifecycle/artifact operations that return an operation ID and do not have an upstream polling request. The operation ID is canonical UUID v7, tenant-scoped, non-reusable, and returns the defined operation status DTO and state machine below. |
 | `/api/0/organizations/<organization>/releases/<version>/deploys/` | `GET` and `POST` deployment records. The organization-scoped release visibility predicate applies before any Deployment DTO is returned; deployment records are release metadata and do not schedule deployment work. |
 | Any other `/api/0/...` route | Any | An unknown path returns safe `404` with no persistence side effect; an unsupported method on a known supported path returns `405`; explicitly unsupported capabilities are listed below and return `501`. |
+
+An unsupported method on a known supported management route returns the standard
+`405 method_not_allowed` object, includes an `Allow` header, and has no side
+effect. The header contains exactly the following route-specific method set, in
+the listed order:
+
+| Route family | `Allow` |
+| --- | --- |
+| `/api/0/` | `GET` |
+| `/api/0/organizations/`; `/api/0/organizations/<organization>/` | `GET` |
+| `/api/0/organizations/<organization>/projects/` | `GET, POST` |
+| `/api/0/projects/<organization>/<project>/` | `GET, PUT, DELETE` |
+| `/api/0/projects/<organization>/<project>/keys/` | `GET, POST` |
+| `/api/0/projects/<organization>/<project>/keys/<key_id>/` | `PUT, DELETE` |
+| `/api/0/projects/<organization>/<project>/issues/` | `GET, PUT` |
+| `/api/0/issues/<issue>/` | `GET, PUT` |
+| `/api/0/issues/<issue>/events/`; `/api/0/projects/<organization>/<project>/events/`; `/api/0/projects/<organization>/<project>/events/<event>/` | `GET` |
+| `/api/0/organizations/<organization>/releases/` | `GET, POST` |
+| `/api/0/projects/<organization>/<project>/releases/`; `/api/0/organizations/<organization>/releases/<version>/commits/`; `/api/0/organizations/<organization>/releases/<version>/previous-with-commits/` | `GET` |
+| `/api/0/organizations/<organization>/releases/<version>/` | `GET, PUT` |
+| `/api/0/projects/<organization>/<project>/releases/<version>/files/` | `GET, POST` |
+| `/api/0/projects/<organization>/<project>/releases/<version>/files/<file_id>/` | `GET, DELETE` |
+| `/api/0/organizations/<organization>/chunk-upload/`; `/api/0/projects/<organization>/<project>/chunk-upload/` | `GET` |
+| Returned organization-scoped chunk upload URL; `/api/0/projects/<organization>/<project>/files/difs/chunks/` and its returned project-bound URL | `POST` |
+| `/api/0/projects/<organization>/<project>/files/difs/assemble/`; `/api/0/organizations/<organization>/artifactbundle/assemble/` | `POST` |
+| `/api/0/operations/<operation_id>/` | `GET` |
+| `/api/0/organizations/<organization>/releases/<version>/deploys/` | `GET, POST` |
 
 Both organization-scoped and project-scoped chunk upload URLs accept the
 negotiated multipart request. A valid new or matching chunk upload returns
@@ -801,6 +844,15 @@ is present, including nullable fields, which are emitted as JSON `null` when no
 value exists. Unknown upstream fields are omitted, and nested objects contain
 no fields beyond those listed.
 
+Every non-null timestamp in a Release DTO, including `dateCreated`,
+`dateStarted`, `dateReleased`, `firstEvent`, `lastEvent`, and
+`lastCommit.dateCreated`, is serialized in UTC with exactly nine fractional
+decimal digits as `YYYY-MM-DDTHH:mm:ss.sssssssssZ`. Release mutation inputs
+`dateStarted` and `dateReleased` accept RFC 3339 UTC instants with zero through
+nine fractional digits and are normalized to this representation before
+storage, digest construction, and response serialization. `null` remains the
+only representation of an absent nullable Release timestamp.
+
 | DTO | Field | Type and rule |
 | --- | --- | --- |
 | Release | `id` | Required non-empty string compatibility alias; never a Watchtower canonical ID |
@@ -808,17 +860,17 @@ no fields beyond those listed.
 | Release | `shortVersion` | Nullable string; always `null` in v1, with no derivation from `version` |
 | Release | `ref` | Nullable string |
 | Release | `url` | Nullable HTTP(S) URL |
-| Release | `dateCreated` | Required RFC 3339 UTC string |
-| Release | `dateStarted` | Nullable RFC 3339 UTC string |
-| Release | `dateReleased` | Nullable RFC 3339 UTC string |
-| Release | `firstEvent` | Nullable RFC 3339 UTC string |
-| Release | `lastEvent` | Nullable RFC 3339 UTC string |
+| Release | `dateCreated` | Required UTC timestamp serialized exactly as `YYYY-MM-DDTHH:mm:ss.sssssssssZ` |
+| Release | `dateStarted` | Nullable UTC timestamp serialized exactly as `YYYY-MM-DDTHH:mm:ss.sssssssssZ` |
+| Release | `dateReleased` | Nullable UTC timestamp serialized exactly as `YYYY-MM-DDTHH:mm:ss.sssssssssZ` |
+| Release | `firstEvent` | Nullable UTC timestamp serialized exactly as `YYYY-MM-DDTHH:mm:ss.sssssssssZ` |
+| Release | `lastEvent` | Nullable UTC timestamp serialized exactly as `YYYY-MM-DDTHH:mm:ss.sssssssssZ` |
 | Release | `newGroups` | Required non-negative integer |
 | Release | `commitCount` | Required non-negative integer |
 | Release | `deployCount` | Required non-negative integer |
 | Release | `projects` | Required array of objects containing exactly string `id`, `slug`, and `name`, sorted by NFC-normalized ordinal `(id, slug, name)` ascending |
 | Release | `environments` | Required array of unique strings, sorted by NFC-normalized ordinal Unicode-scalar order ascending |
-| Release | `lastCommit` | Nullable object containing exactly string `id`, `message`, `authorName`, `authorEmail`, and RFC 3339 UTC `dateCreated` |
+| Release | `lastCommit` | Nullable object containing exactly string `id`, `message`, `authorName`, `authorEmail`, and `dateCreated` serialized exactly as `YYYY-MM-DDTHH:mm:ss.sssssssssZ` |
 | Release commit | `id` | Required string; each `/commits/` response element contains exactly this field |
 | Artifact | `id` | Required non-empty string compatibility alias; never a Watchtower canonical ID |
 | Artifact | `name` | Required logical filename string |
@@ -831,7 +883,7 @@ no fields beyond those listed.
 | Artifact | `dateCreated` | Required RFC 3339 UTC string |
 | Artifact | `state` | Required enum: `accepted`, `processing`, `processed`, or `failed` |
 | DIF | `id` | Required non-empty string compatibility alias; never a Watchtower canonical ID |
-| DIF | `debugId` | Nullable lowercase UUID string; `null` when no upstream `debug_id` is supplied |
+| DIF | `debugId` | Nullable lowercase canonical hyphenated UUID string; `null` when no upstream `debug_id` is supplied |
 | DIF | `uuid` | Nullable lowercase UUID string; `null` when no upstream `uuid` is supplied; at least one of `debugId` or `uuid` is non-null |
 | DIF | `name` | Required logical filename string |
 | DIF | `objectName` | Required string |
@@ -948,7 +1000,9 @@ characters. This is the same control-character restriction applied to decoded
 optional, but when present is a non-null array of at most 100 unique project
 aliases from the organization. `ref`, `url`, and `dateStarted` are optional nullable
 strings; a non-null `url` is an HTTP(S) URL and a non-null `dateStarted` is an
-RFC 3339 UTC timestamp. `dateReleased` is not accepted during creation;
+RFC 3339 UTC timestamp with zero through nine fractional decimal digits. The
+accepted timestamp is normalized to `YYYY-MM-DDTHH:mm:ss.sssssssssZ`.
+`dateReleased` is not accepted during creation;
 finalization uses the separate body below. An empty object, a missing or empty
 `version`, a control character in `version`, an invalid nullable value, a
 duplicate project, or any other member returns `400 invalid_request` before
@@ -981,8 +1035,10 @@ unchanged. The finalization shape is exactly:
 { "dateReleased": "2026-09-11T12:00:00Z" }
 ```
 
-`dateReleased` must be a non-null RFC 3339 UTC timestamp and cannot be combined
-with metadata members or sent as `null`. The path version is authoritative and
+`dateReleased` must be a non-null RFC 3339 UTC timestamp with zero through nine
+fractional decimal digits; it is normalized to
+`YYYY-MM-DDTHH:mm:ss.sssssssssZ` and cannot be combined with metadata members
+or sent as `null`. The path version is authoritative and
 `version`, `projects`, `commits`, and all other body members are rejected.
 These exact combinations are the only accepted release update/finalization
 bodies; a missing, malformed, or stale `If-Match` returns the standard `400`
@@ -1544,12 +1600,16 @@ checked before canonicalization and digest calculation.
 The smaller applicable limit wins. A request that exceeds a byte, decoded-
 payload, multipart-count, or explicit assembly-cardinality limit returns `413`
 with a safe code and request ID; it is not partially accepted. A scalar field
-that exceeds its own bounded length, such as an issue filter or browser origin,
-returns `400 invalid_request` with the exact generic error object defined
-above, never field-specific details or `field_errors`. Existing organization,
-project, collection, artifact, and API quotas remain authoritative in addition
-to these protocol limits. Rate-limit exhaustion returns `429` and
-`Retry-After`; inability to evaluate the relevant quota returns `503`.
+in a management request that exceeds its own bounded length, such as an issue
+filter or browser origin, returns `400 invalid_request` with the exact generic
+error object defined above, never field-specific details or `field_errors`. A
+recognized scalar in an Envelope item that exceeds its own bounded length,
+including a 4,097-byte `message`, exception value, or stacktrace text, rejects
+the whole Envelope with `400 invalid_envelope` before acceptance or digest
+construction. Existing organization, project, collection, artifact, and API
+quotas remain authoritative in addition to these protocol limits. Rate-limit
+exhaustion returns `429` and `Retry-After`; inability to evaluate the relevant
+quota returns `503`.
 
 For every multipart request, the decompressed byte total across all parts and
 multipart framing must remain at or below `100,000,000` bytes. The adapter
@@ -2186,8 +2246,9 @@ request map containing one or more entries, the adapter derives the operation
 identity from `(tenant_id, project_id, canonical_request_body_digest)`. The
 digest is the lowercase hexadecimal SHA-256 of the RFC 8785 canonical JSON
 encoding of that request map: checksum keys are lowercase and sorted, each
-entry preserves its ordered chunk list, and the optional idempotency key is
-excluded. A matching retry, including a multi-entry map, resumes the same
+entry contains the normalized `debug_id` when supplied and preserves its
+ordered chunk list, and the optional idempotency key is excluded. A matching
+retry, including a multi-entry map, resumes the same
 operation. When supplied, the client key is bound to that canonical body
 digest and a reuse with different content returns `409`; key-conflict
 behavior is not applied when no key was supplied.
@@ -2214,10 +2275,24 @@ is fixed at eight workers. The positive batch size and four 20 MB chunks keep
 each advertised request below the decompressed request limit including framing.
 The project-scoped DIF capability remains available with the same bounded
 values and a project-bound `url`. A chunk request is multipart: each `file` or
-`file_gzip` part is named by its lowercase SHA-1 checksum. A DIF assembly
-request is a JSON map from the full-file SHA-1 checksum to
-`{name, debug_id?, chunks}`; its response is the same checksum map and does
-not require release or distribution fields. Every result contains exactly
+`file_gzip` part is named by its lowercase SHA-1 checksum. After identity or
+gzip decompression, the adapter computes the lowercase SHA-1 of every part and
+requires it to equal the part name. A malformed name or checksum mismatch
+returns `400 invalid_request` before any chunk in that request is stored; all
+parts are validated before persistence, so a valid sibling part is never
+partially accepted. A matching stored checksum remains idempotent, while
+different bytes for an already stored checksum remain `409 conflict`. A DIF
+assembly request is a JSON map from the full-file SHA-1 checksum to
+`{name, debug_id?, chunks}`; when present, `debug_id` must be either exactly
+32 ASCII hexadecimal characters or the canonical `8-4-4-4-12` hexadecimal
+form, with no braces, URN prefix, whitespace, or other punctuation. Hex case
+is accepted, but the adapter normalizes the value to lowercase canonical
+hyphenated form before request normalization, RFC 8785 digest construction,
+`(project, debug_id)` uniqueness evaluation, and response serialization. An
+omitted `debug_id` is absent; an explicit `null` or malformed value returns
+`400 invalid_request` before checksum verification, assembly identity creation,
+or persistence. Its response is the same checksum map and does not require
+release or distribution fields. Every result contains exactly
 `state` and `missingChunks`, plus state-specific fields: `not_found` and
 `assembling` omit both `detail` and `dif`; `created` and `ok` omit `detail`
 and require `dif`; and `error` requires non-null bounded safe `detail` and
@@ -2732,7 +2807,10 @@ exercise:
   created terminal `created`, and duplicate/polled terminal `ok` DIF states
   with exact state-specific `detail`/`dif` presence, plus
   identical DIF bytes submitted with alternate valid chunk partitions or names,
-  asserting first-write-wins for the registered logical name;
+  asserting first-write-wins for the registered logical name, decompressed-byte
+  SHA-1 mismatch rejection with no partial persistence, and case-variant,
+  hyphenless, malformed, and conflicting `debug_id` behavior after canonical
+  normalization;
 - collection credentials in `X-Sentry-Auth`, DSN query parameters, and DSN
   URLs, including conventional comma-and-space `X-Sentry-Auth` members,
   percent-decoding, duplicate parameters, missing/unknown members,
@@ -2823,8 +2901,10 @@ exercise:
   DTO responses and headers including strong mutation ETags and list-response
   ETag omission, no `202` operation responses, and rejection of
   unknown or misplaced fields, mixed-authority project lists, all-or-nothing
-  project authorization, and the Owner/Admin requirement when `projects` is
-  omitted or empty;
+  project authorization, the Owner/Admin requirement when `projects` is
+  omitted or empty, and equivalent whole-second and zero-to-nine-digit
+  fractional inputs producing the exact nine-digit UTC serialization for every
+  Release timestamp, including `lastCommit.dateCreated`;
 - project creation and browser-origin update with the exact closed request
   bodies including the required explicit slug, printable-ASCII project-name
   validation with leading/trailing-space rejection, canonical slug-collision
@@ -2877,6 +2957,8 @@ exercise:
   duplicate and rejected parts, with `413` and no partial persistence for an
   over-limit request, `400` for overlong scalar fields with the exact generic
   body and no `field_errors`, platform-token grammar,
+  recognized Envelope scalars over 4,096 bytes returning `400 invalid_envelope`,
+  and unsupported methods returning the route-specific `Allow` header,
   exact scalar byte boundaries, recursive event depth/member/array boundaries,
   and URL/text limits, plus
   DIF/artifact-bundle assembly cardinality at and over each explicit digest,
@@ -2904,7 +2986,8 @@ exercise:
   `completed_at + 24h` cutoff, unknown-operation `404`, and owner-outage `503`
   responses;
 - malformed management JSON versus malformed Envelope JSON, with
-  `invalid_request` and `invalid_envelope` respectively;
+  `invalid_request` and `invalid_envelope` respectively, plus overlong
+  management and Envelope fields retaining those distinct error codes;
 - single- and multi-entry DIF assembly retries using the canonical sorted
   checksum-keyed request-map digest, excluding the idempotency key and
   preserving chunk order;
@@ -2947,7 +3030,8 @@ matrix result. A client regression cannot be hidden by changing the fixture.
 - Every in-scope official client and plugin has an exact stable pin, authoritative
   source, required route, and executable fixture.
 - Every supported and unsupported route, method, format, Envelope item, and
-  relevant non-Envelope path has explicit behavior.
+  relevant non-Envelope path has explicit behavior, including exact `Allow`
+  headers for known-route `405` responses.
 - Authentication, content type, compression, limits, fields, errors,
   pagination, rate headers, unknown fields, retries, idempotency, capability
   negotiation, chunking, polling, and asynchronous semantics are explicit.
