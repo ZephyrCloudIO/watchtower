@@ -682,8 +682,11 @@ read receives the ordinary suspension response.
   freshness. A stale or unavailable security projection fails closed.
 
 Collection credential parsing is deterministic. `X-Sentry-Auth` uses the exact
-ASCII grammar `Sentry ` followed by comma-separated `name=value` members with
-no duplicate names, surrounding whitespace, quoted values, or empty values.
+ASCII grammar `Sentry ` followed by comma-separated `name=value` members. Each
+comma may have zero or one ASCII SP or HTAB immediately before and after it;
+that separator whitespace is discarded before member parsing. Header-edge
+whitespace, whitespace inside names or values, duplicate names, quoted values,
+and empty values remain invalid.
 It requires `sentry_version=7` and `sentry_key=<public-key>` and may contain
 the bounded diagnostic `sentry_client=<client>`; `sentry_secret` and unknown
 members are invalid. Query-string credentials use one `sentry_key` parameter
@@ -988,7 +991,7 @@ release resource. An idempotent duplicate or lost-response retry of that
 new strong `ETag`, and the two request-ID headers. These successful responses
 have no `Retry-After` and no operation status; `202` is never used for release
 create, update, or finalization. A retry is looked up by its original
-`(target_scope, observed_generation, canonical_request_body_digest)` before
+`(principal_id, target_scope, observed_generation, canonical_request_body_digest)` before
 the current-version check: an already-completed identical request returns its
 original result, while a request not previously committed with a stale
 generation returns `409` and cannot overwrite a later mutation. Conflicting
@@ -1678,6 +1681,13 @@ individually excluded with reason `not_error_event`; it does not create an event
 or attachment, while any other malformed supported field still rejects the
 entire Envelope.
 
+When present, `breadcrumbs` must be an object with a `values` array. Every
+`values` element must be a bounded object, and the array is subject to the
+recursive event limits. An empty `values` array is valid but emits no
+`breadcrumbs` entry; a bare array, `null`, scalar, missing `values`, or
+non-object/null element rejects the Envelope with `400 invalid_envelope` before
+acceptance.
+
 | Item type | v1 behavior |
 | --- | --- |
 | `event` | Supported when it meets the error-event predicate above. One event item is allowed. |
@@ -1771,7 +1781,7 @@ management schemas remain the explicit exception.
   | `platform`, `level`, `message`, `culprit`, `transaction`, `release`, `dist`, `environment` | Optional bounded UTF-8 strings or `null`; strings are NFC-normalized, and `level` is lowercased. Missing and explicit `null` are omitted from the normalized object. |
   | `tags` | Optional object whose keys and values are bounded UTF-8 strings; both are NFC-normalized, and the object keys are sorted by RFC 8785 canonical order. |
   | `contexts` | Optional `null` or bounded JSON object. An explicit `null` is treated as absent; object keys are NFC-normalized and sorted, and nested arrays preserve order. |
-  | `breadcrumbs` | Optional ordered array of bounded objects. Array order is preserved and every nested object/value uses the recursive bounded-value rules below. |
+  | `breadcrumbs` | Optional object with required `values` array of bounded objects. The `values` array is normalized to an ordered array; order is preserved and every nested object/value uses the recursive bounded-value rules below. |
   | `exception`, `stacktrace`, `debug_meta`, `metadata` | Optional bounded JSON objects using the recursive bounded-value rules below; absent and `null` values are omitted. |
   | `user` | Optional `null` or object with optional `id`, `username`, and `name` members; each present member is a bounded NFC-normalized non-empty string. |
   | `sdk` | Optional `null` or object whose `name` and `version` members are nullable bounded NFC-normalized strings. |
@@ -1896,9 +1906,9 @@ management schemas remain the explicit exception.
   canonical request-body digest, so the same key and body cannot collapse
   operations from different principals. Release metadata updates and
   finalization do not require a client key, but they require the exact observed
-  release `ETag` in `If-Match` and use a retry identity containing the
-  principal, target scope, observed monotonic release generation, and
-  canonical request-body digest. A lost-response retry against the same
+  release `ETag` in `If-Match` and use the exact retry identity
+  `(principal_id, target_scope, observed_generation, canonical_request_body_digest)`.
+  A lost-response retry against the same
   generation resumes the identical operation; a later legitimate mutation has
   a new identity even when its body matches an older request. Reusing a
   supplied key with different content or scope returns `409`. No retry identity
@@ -1983,8 +1993,9 @@ header-name casing is insignificant):
   `principal`, `organization`, `project`, or `key`, reason is a lowercase ASCII
   token matching `[a-z0-9][a-z0-9_-]{0,63}`, and each namespace is a lowercase token matching
   `[a-z0-9][a-z0-9_-]{0,63}`. Categories and namespaces are unique and lexicographically
-  sorted; entries are sorted by scope, category text, and seconds. The reason
-  and namespace components are omitted when they do not apply.
+  sorted; entries are sorted by scope, category text, and seconds, then by the
+  complete canonical serialized entry as a final lexicographic tie-breaker.
+  The reason and namespace components are omitted when they do not apply.
 
 `X-Sentry-Rate-Limit-Limit`, `X-Sentry-Rate-Limit-Remaining`, and
 `X-Sentry-Rate-Limit-Reset` are emitted on quota-evaluated responses even when
@@ -2663,7 +2674,10 @@ exercise:
   `sampled`, ignored unknown top-level members, rejected unknown nested
   `sdk`/`trace` members, invalid-shape rejection, and NFC-normalized key
   collisions before hashing, including rejection of scalar and `null`
-  `exception.values` and `stacktrace.frames` elements;
+  `exception.values` and `stacktrace.frames` elements, standard
+  `breadcrumbs.values` wrapper normalization, empty arrays, recursive bounds,
+  and rejection of bare-array, null, scalar, missing-values, and invalid-element
+  breadcrumb shapes;
 - new and duplicate chunks with exact `200` empty responses, conflicting
   chunks, interrupted assembly, optional and conflicting DIF idempotency keys,
   retries, polling, and lost responses, including non-terminal `not_found` and
@@ -2674,8 +2688,9 @@ exercise:
   identical DIF bytes submitted with alternate valid chunk partitions or names,
   asserting first-write-wins for the registered logical name;
 - collection credentials in `X-Sentry-Auth`, DSN query parameters, and DSN
-  URLs, including percent-decoding, duplicate parameters, missing/unknown
-  members, route-project mismatches, and conflicting sources;
+  URLs, including conventional comma-and-space `X-Sentry-Auth` members,
+  percent-decoding, duplicate parameters, missing/unknown members,
+  route-project mismatches, and conflicting sources;
 - versioned and versionless artifact-bundle assembly, the deterministic
   `artifact-bundle-<checksum>` name, reuse of identical bundle bytes across
   release, distribution, and project-list identities, release-artifact
@@ -2703,7 +2718,9 @@ exercise:
   zero-byte body requirement and rejection of `{}` or other entity bodies,
   plus same-key fresh-authentication reconfirmation after Support release
   without creating a second operation;
-- pagination using the documented per-route order and tie-breaker, snapshot
+- pagination using the documented per-route order and tie-breaker, including
+  deterministic rate-limit ordering for equal scope/category/duration entries
+  with different reasons or namespaces, snapshot
   consistency under concurrent inserts/updates, the fixed 15-minute cursor
   lifetime and exact `now >= expires_at` cutoff, cursor binding, malformed and
   expired cursor `400` results, stale cursor `403` results, cross-tenant cursor
@@ -2826,6 +2843,8 @@ exercise:
 - organization/project reads, creation, update, deletion, DSN issuance,
   rotation/revocation, issue/event reads, resolve/reopen/ignore/mute/next-release,
   release metadata/finalization requests without client idempotency keys,
+  same-body release retries isolated by `principal_id` and stale-generation
+  behavior for a second principal,
   rejection of keyless release creation, and deployment workflows with an
   always-null `dateStarted`;
 - operation polling with `202 pending` and exact `Retry-After: 5`, `200
