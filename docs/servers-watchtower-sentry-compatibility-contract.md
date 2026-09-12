@@ -1067,9 +1067,15 @@ accepted top-level `culprit`; accepted top-level `transaction`; each
 `stacktrace.frames` element in array order, checking `function` then
 `filename`; and `metadata.function` then `metadata.filename`. Missing,
 non-string, and empty candidates are skipped. If no candidate remains,
-`culprit` is `null`. The selected value is emitted only in the Event and Issue
-DTO projections; the accepted `culprit` and `transaction` fields remain part
-of the normalized event and payload digest.
+`culprit` is `null`. The selected value is emitted only in the Event DTO
+projection; the accepted `culprit` and `transaction` fields remain part of the
+normalized event and payload digest.
+
+`Issue.culprit` is a nullable value supplied by the authoritative issue
+aggregate. The adapter emits that aggregate value in both Issue list and detail
+DTOs, or `null` when the aggregate has no value. It does not derive
+`Issue.culprit` from `Event.culprit`, select a candidate from any event in the
+issue, or apply the Event candidate precedence while projecting an Issue.
 
 `Event.contexts` is always present as an object. When the accepted normalized
 event omits `contexts` or supplies explicit `null`, the adapter treats it as an
@@ -1933,8 +1939,8 @@ header-name casing is insignificant):
   `<seconds>:<category;category>:<scope>[:<reason>[:<namespace;namespace>]]`.
   `seconds` is a non-negative decimal duration, categories are lowercase
   `error`, `attachment`, `default`, `artifact`, or `all`, scope is lowercase
-  `principal`, `organization`, `project`, or `key`, reason is a lowercase
-  token using `[a-z0-9_-]`, and each namespace is a lowercase token using
+  `principal`, `organization`, `project`, or `key`, reason is a lowercase ASCII
+  token matching `[a-z0-9][a-z0-9_-]{0,63}`, and each namespace is a lowercase token using
   `[a-z0-9_-]`. Categories and namespaces are unique and lexicographically
   sorted; entries are sorted by scope, category text, and seconds. The reason
   and namespace components are omitted when they do not apply.
@@ -2599,7 +2605,9 @@ exercise:
   stacktrace-only error events, exception events, deterministic multi-entry
   Event DTO serialization and ordering, deterministic Event `title` candidate
   precedence and empty fallback, deterministic Event `culprit` precedence and
-  null fallback, exact nanosecond timestamp normalization and distinct
+  null fallback, Issue `culprit` sourced from the authoritative aggregate
+  across multiple events and consistent in list/detail projections, exact
+  nanosecond timestamp normalization and distinct
   `payload_digest` values for one-nanosecond changes, `timestamp` to
   `dateCreated` mapping,
   `accepted_at` to `dateReceived` mapping, missing-timestamp fallback,
@@ -2654,7 +2662,8 @@ exercise:
   consistency under concurrent inserts/updates, the fixed 15-minute cursor
   lifetime and exact `now >= expires_at` cutoff, cursor binding, malformed and
   expired cursor `400` results, stale cursor `403` results, cross-tenant cursor
-  `404` results, rate-limit headers, exact
+  `404` results, rate-limit headers including reason values at the one- and
+  64-character bounds and outside-grammar cases, exact
   `rel="next"`/`results="true"`/`cursor` Link parameters, `limit` bounds,
   DSN-key, release-file, release-commit, and deployment lists, unknown fields,
   organization lists scoped to one credential owner including active and
