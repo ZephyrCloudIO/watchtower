@@ -468,10 +468,14 @@ the allowlist, or a project with no configured allowlist, receives
 | `/api/0/organizations/<organization>/releases/<version>/deploys/` | `GET` and `POST` deployment records. The organization-scoped release visibility predicate applies before any Deployment DTO is returned; deployment records are release metadata and do not schedule deployment work. |
 | Any other `/api/0/...` route | Any | An unknown path returns safe `404` with no persistence side effect; an unsupported method on a known supported path returns `405`; explicitly unsupported capabilities are listed below and return `501`. |
 
-An unsupported method on a known supported management route returns the standard
-`405 method_not_allowed` object, includes an `Allow` header, and has no side
-effect. The header contains exactly the following route-specific method set, in
-the listed order:
+An unsupported method other than `HEAD` on a known supported management route
+returns the standard `405 method_not_allowed` object, includes an `Allow`
+header, and has no side effect. An unsupported `HEAD` on a known supported
+management route retains the same `405` status, route-specific `Allow` header,
+and request-ID headers, but is bodyless: it has `Content-Length: 0`, no
+`Content-Type`, and no JSON error body. The conceptual error remains
+`method_not_allowed`. The header contains exactly the following route-specific
+method set, in the listed order:
 
 | Route family | `Allow` |
 | --- | --- |
@@ -1413,9 +1417,11 @@ client requires polling; it never claims processing completion.
 ### Compatibility error bodies and mapping
 
 Every direct management or ingestion error other than the documented suspension
-response uses this exact JSON object. The sole bodyless error exception is a
-failed TUS `HEAD`: its HTTP status and headers are authoritative, with
-`Content-Length: 0`, `Tus-Resumable: 1.0.0`, and request-ID headers, and it has
+response uses this exact JSON object. The bodyless error exceptions are a
+failed TUS `HEAD`, whose HTTP status and headers are authoritative, with
+`Content-Length: 0`, `Tus-Resumable: 1.0.0`, and request-ID headers, and an
+unsupported `HEAD` on a known management route, whose `405` status,
+route-specific `Allow`, and request-ID headers remain authoritative. Both have
 neither `Content-Type` nor a JSON error body.
 
 ```json
@@ -2442,8 +2448,13 @@ text, and artifact is either `null` or the complete Artifact DTO whose
 `project` equals that alias.
 
 A pending response is `202` with `Retry-After: 5`, top-level `state: "pending"`,
-the currently missing chunks, `detail: null`, and one pending/null project
-result per input project. A successful terminal response is `200` with
+and `missingChunks` equal to the unique set of requested chunk names absent at
+response time, including chunks expired under the chunk-retention rule,
+normalized to lowercase and sorted in lowercase lexicographic order. Repeated
+requested chunk names appear once, request order is not preserved, and repeated
+polls return the same array while the absent set is unchanged. It has
+`detail: null` and one pending/null project result per input project. A
+successful terminal response is `200` with
 `state: "succeeded"`, an
 empty `missingChunks` array, `detail: null`, and one succeeded project result
 with its registered Artifact DTO for every input project. A terminal owner
@@ -2609,11 +2620,20 @@ deletion, needs current `Manage` authority, and must supply
 the exact observed `If-Match` ETag and an idempotency key bound to the exact
 file target and observed version. A missing `If-Match` or key returns `400
 invalid_request` before artifact authority is called.
-successful delete returns `204` with an empty body only after durable artifact
-authority deletion. Repeating the same target, including with the same key,
-returns the same `204` no-op; an unknown or inaccessible target returns
-`404 not_found`, a stale observed version or key reused for another target
-returns `409 conflict`, and an unavailable artifact owner returns `503`.
+Successful delete returns `204` with an empty body only after durable artifact
+authority deletion. The completed deletion idempotency record or tombstone is
+retained for exactly 24 hours after the successful commit. Define `expires_at`
+as commit time plus 24 hours: while `now < expires_at`, a retry with the same
+principal, canonical project/release scope, operation, file target, observed
+ETag, and key returns the same `204` no-op; a changed target, observed ETag, or
+key binding returns `409 conflict`. At `now >= expires_at`, the record no
+longer matches and the request is evaluated as a new deletion against current
+authentication, authorization, lifecycle, and target state. The same deleted
+target therefore returns the standard `404 not_found`; an expired key used for
+a different current target is a new idempotency identity and must satisfy that
+target's current `If-Match` and authorization requirements. An unknown or
+inaccessible target returns `404 not_found`, and an unavailable artifact owner
+returns `503`.
 
 Release finalization is idempotent. Before a deployment record is accepted, the
 adapter resolves every project associated with the release and requires the
@@ -3021,8 +3041,10 @@ exercise:
 - project deletion with missing/mismatched confirmation, release-file deletion
   item reads exposing the current strong `ETag`, deletion without `If-Match` or
   idempotency key, a non-empty entity body, by exact `file_id`, repeated deletion, wrong-scope `404`,
-  stale-version and idempotency-key conflicts, and owner outage, including a
-  terminal successful deletion poll with `result: null`;
+  stale-version and idempotency-key conflicts, exact 24-hour deletion retry
+  retention, the `now >= expires_at` boundary, post-expiry `404` for the deleted
+  target, and owner outage, including a terminal successful deletion poll with
+  `result: null`;
 - organization-scoped capability probes for both DIF and artifact bundles,
   including allowed Owner/Admin and project Write/Manage credentials, denied
   read-only credentials, and the same authority rule on the staging POST,
@@ -3050,7 +3072,8 @@ exercise:
   over-limit request, `400` for overlong scalar fields with the exact generic
   body and no `field_errors`, platform-token grammar,
   recognized Envelope scalars over 4,096 bytes returning `400 invalid_envelope`,
-  and unsupported methods returning the route-specific `Allow` header,
+  and unsupported methods returning the route-specific `Allow` header, including
+  bodyless `HEAD` errors on known management routes,
   exact scalar byte boundaries, recursive event depth/member/array boundaries,
   and URL/text limits, plus
   DIF/artifact-bundle assembly cardinality at and over each explicit digest,
@@ -3085,7 +3108,9 @@ exercise:
   checksum-keyed request-map digest, excluding the idempotency key and
   preserving chunk order;
 - artifact-bundle polling with exact pending `202` and `Retry-After: 5`,
-  ordered per-project results for one and 100 projects, all-or-nothing
+  unique lowercase lexicographically sorted pending `missingChunks` for
+  repeated and unsorted input references, ordered per-project results for one
+  and 100 projects, all-or-nothing
   successful/failed terminal
   states, sorted missing-chunk arrays for missing/expired terminal failures,
   empty arrays for other terminal failures, deferred checksum validation and
@@ -3125,7 +3150,8 @@ matrix result. A client regression cannot be hidden by changing the fixture.
   source, required route, and executable fixture.
 - Every supported and unsupported route, method, format, Envelope item, and
   relevant non-Envelope path has explicit behavior, including exact `Allow`
-  headers for known-route `405` responses.
+  headers for known-route `405` responses and bodyless unsupported `HEAD`
+  responses on known management routes.
 - Authentication, content type, compression, limits, fields, errors,
   pagination, rate headers, unknown fields, retries, idempotency, capability
   negotiation, chunking, polling, and asynchronous semantics are explicit.
