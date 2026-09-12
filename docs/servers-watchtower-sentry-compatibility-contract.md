@@ -285,16 +285,21 @@ disabled project still applies these write rules. Organization-scoped chunk
 staging remains reusable organization state and is fenced at project-bound
 assembly.
 
-After bounded transport decoding and event parsing, but before event
-normalization, idempotency lookup, persistence, or durable acceptance, Ingest
-applies the API-owned environment retirement tombstone and generation fence.
-If the event's `environment` names an environment that is retired for the
-project, collection returns `409 conflict` with detail `The request conflicts
-with the current resource state.` and persists no payload, acceptance record,
-attachment bytes, or operation state. The adapter never silently drops the
-event, requires a duplicate environment header, or automatically re-registers
-that name. Data already accepted before retirement finishes normally; only an
-authorized reactivation may advance the generation and admit the name again.
+After bounded transport decoding, event parsing, and complete structural
+validation, Ingest normalizes the event identity and performs the idempotency
+lookup before applying the API-owned environment retirement tombstone and
+generation fence. A matching acceptance record or payload-free uniqueness
+tombstone returns the original acceptance, and the same event ID with a
+different digest returns `409 conflict`, even when the environment has since
+been retired. If no prior identity exists, the retirement fence is then
+applied before persistence or durable acceptance. A new event whose
+`environment` names an environment that is retired for the project returns
+`409 conflict` with detail `The request conflicts with the current resource
+state.` and persists no payload, acceptance record, attachment bytes, or
+operation state. The adapter never silently drops the event, requires a
+duplicate environment header, or automatically re-registers that name. Data
+already accepted before retirement finishes normally; only an authorized
+reactivation may advance the generation and admit the name again.
 
 The pinned Native large-attachment flow binds a completed TUS upload through
 the subsequent Envelope, not through the TUS upload alone. The Envelope carries
@@ -554,9 +559,11 @@ while suspended is the control-plane restricted project-deletion request for a
 current Owner/Admin user session with exact name confirmation, fresh
 authentication, the expected version, and idempotency; the project-route
 response exposes only `deletion_target.name` for this handoff and includes the
-current strong `ETag` header. The caller copies that exact name into
-`X-Confirm-Project-Name` and that exact ETag into `If-Match`; the deletion
-request returns only the pending deletion operation and never a resource DTO.
+current strong `ETag` and `X-Watchtower-Project-Generation` headers. The caller
+copies that exact name into `X-Confirm-Project-Name`, that exact ETag into
+`If-Match`, and that exact generation into `X-Watchtower-Project-Generation`;
+the deletion request returns only the pending deletion operation and never a
+resource DTO.
 Organization deletion, suspension removal, token issuance, and all other
 changes remain unavailable.
 
@@ -737,8 +744,8 @@ beyond those listed.
 | Release | `newGroups` | Required non-negative integer |
 | Release | `commitCount` | Required non-negative integer |
 | Release | `deployCount` | Required non-negative integer |
-| Release | `projects` | Required array of objects containing exactly string `id`, `slug`, and `name` |
-| Release | `environments` | Required array of unique strings |
+| Release | `projects` | Required array of objects containing exactly string `id`, `slug`, and `name`, sorted by NFC-normalized ordinal `(id, slug, name)` ascending |
+| Release | `environments` | Required array of unique strings, sorted by NFC-normalized ordinal Unicode-scalar order ascending |
 | Release | `lastCommit` | Nullable object containing exactly string `id`, `message`, `authorName`, `authorEmail`, and RFC 3339 UTC `dateCreated` |
 | Release commit | `id` | Required string; each `/commits/` response element contains exactly this field |
 | Artifact | `id` | Required non-empty string compatibility alias; never a Watchtower canonical ID |
@@ -1081,15 +1088,20 @@ bounded field errors; it never contains owner diagnostics, secrets, or payload
 data.
 
 The status URL returns `202` for `pending` with `Retry-After`, and `200` for
-`succeeded` and `failed`. An expired retained tombstone returns `410` with the
+`succeeded` and `failed`. A terminal operation result is retained for exactly
+24 hours after its `completed_at` instant. Define `expires_at` as
+`completed_at + 24h`: a status read returns the terminal Operation DTO while
+`now < expires_at`, and an expired retained tombstone returns `410` with the
 top-level compatibility-error object `{ "code": "operation_expired", "detail":
-"The operation result has expired.", "request_id": "<request-id>" }`; it does
-not return an Operation DTO with `status: "expired"`. This `410` is the explicit
-operation-status exception to the rule that successful operation reads use the
-Operation DTO. Unknown or inaccessible operation IDs return indistinguishable
-`404 not_found`; an unavailable owner returns `503 unavailable` without
-reporting a terminal state. A `202` creation response uses the same `pending`
-body and never claims lifecycle or artifact completion.
+"The operation result has expired.", "request_id": "<request-id>" }` when
+`now >= expires_at`. The same cutoff applies to a completed duplicate lookup;
+pending operations are not expired by this terminal-result rule. The `410`
+does not return an Operation DTO with `status: "expired"`. This `410` is the
+explicit operation-status exception to the rule that successful operation
+reads use the Operation DTO. Unknown or inaccessible operation IDs return
+indistinguishable `404 not_found`; an unavailable owner returns `503
+unavailable` without reporting a terminal state. A `202` creation response
+uses the same `pending` body and never claims lifecycle or artifact completion.
 
 Responses never expose internal component names, database identifiers, raw
 storage references, secrets, or unrestricted payloads. A `202` response includes
@@ -1468,7 +1480,7 @@ malformed supported field still rejects the entire Envelope.
 | Item type | v1 behavior |
 | --- | --- |
 | `event` | Supported when it meets the error-event predicate above. One event item is allowed. |
-| `attachment` | Supported when associated with a supported error or native crash. It is retained only with the accepted event. |
+| `attachment` | Supported when associated with a supported error or native crash. A structurally valid unassociated attachment is individually excluded with reason `unassociated_attachment`; its bytes are not retained. |
 | `client_report` | Structurally accepted and recorded as bounded client diagnostic metadata; it is not an error event. |
 | `profile`, `profile_chunk` | Individually excluded. |
 | `transaction`, `span` | Individually excluded; tracing semantics belong to #25. |
@@ -1484,12 +1496,13 @@ malformed supported field still rejects the entire Envelope.
 Malformed framing, invalid JSON headers, invalid lengths, invalid compression,
 or an invalid supported item rejects the entire request. A structurally valid
 Envelope retains supported error/attachment items and individually excludes
-unsupported non-error items. An unsupported-only Envelope is durably accepted
-only as a bounded no-op when its framing is valid; it records bounded
-acceptance and handoff metadata, persists no payload bytes, and returns `200`
-with an empty response body. An empty Envelope follows the same no-op behavior.
-Exclusion diagnostics contain only item type, reason, count, project,
-request ID, and correlation ID.
+unsupported non-error items, including an unassociated attachment. An
+unsupported-only or attachment-only Envelope is durably accepted only as a
+bounded no-op when its framing is valid; it records bounded acceptance and
+handoff metadata, persists no payload bytes, and returns `200` with an empty
+response body. An empty Envelope follows the same no-op behavior. Exclusion
+diagnostics contain only item type, reason, count, project, request ID, and
+correlation ID.
 
 Unknown object members in Envelope headers, item headers, event payloads,
 client reports, minidump metadata, and extensible bounded DTO data are ignored
@@ -1595,16 +1608,17 @@ management schemas remain the explicit exception.
   canonical-JSON byte representation, with duplicate members retained. The
   preimage excludes transport compression, Envelope framing and lengths,
   request IDs, DSN, `sent_at`, `sdk`, `trace`, and individually excluded items;
-  attachment bytes contribute through their SHA-256 and size. Empty and
-  unsupported-only Envelopes use `event: null`, an empty attachment array, and
-  an empty client-report array.
+  attachment bytes contribute through their SHA-256 and size. Empty,
+  unsupported-only, and attachment-only Envelopes use `event: null`, an empty
+  attachment array, and an empty client-report array.
 - Envelope and event submissions are idempotent by the tuple
   `(tenant_id, project_id, external_event_id, payload_digest)` while the
   Ingest-owned acceptance record containing the payload digest and original
   acceptance remains retained. The same tuple returns the original
   acceptance; the same event ID with a different digest returns `409` and is
   not merged or durably accepted. These idempotency checks occur after complete
-  structural validation but before any new acceptance side effect, so this
+  structural validation and before the environment retirement fence or any new
+  acceptance side effect, so this
   `409 conflict` is the explicit exception to the otherwise universal `200`
   Envelope acknowledgement. If the acceptance record retires while the canonical event
   remains queryable, a payload-free uniqueness tombstone retains the scoped
@@ -1873,16 +1887,21 @@ The project-scoped DIF capability remains available with the same bounded
 values and a project-bound `url`. A chunk request is multipart: each `file` or
 `file_gzip` part is named by its lowercase SHA-1 checksum. A DIF assembly
 request is a JSON map from the full-file SHA-1 checksum to
-`{name, debug_id?, chunks}`; its response is the same checksum map with
-`{state, missingChunks, detail?, dif?}` and does not require release or
-distribution fields. DIF `state` uses only `not_found`, `created`,
-`assembling`, `ok`, and `error`. Missing chunks produce non-terminal
-`not_found`; once all chunks are available but assembly is still running, the
-state is non-terminal `assembling`. A newly registered DIF returns terminal
+`{name, debug_id?, chunks}`; its response is the same checksum map and does
+not require release or distribution fields. Every result contains exactly
+`state` and `missingChunks`, plus state-specific fields: `not_found` and
+`assembling` omit both `detail` and `dif`; `created` and `ok` omit `detail`
+and require `dif`; and `error` requires non-null bounded safe `detail` and
+omits `dif`. Neither field is emitted as `null`. DIF `state` uses only
+`not_found`, `created`, `assembling`, `ok`, and `error`. Missing chunks produce
+non-terminal `not_found` with a non-empty `missingChunks` array; once all
+chunks are available but assembly is still running, the state is non-terminal
+`assembling` with an empty array. A newly registered DIF returns terminal
 `created`; an already registered matching DIF or a later successful poll of a
 completed assembly returns terminal `ok`. Terminal owner failure produces
-`error`. Neither `created` nor `ok` is a pending state. An optional `dif` uses
-the exact pinned `DebugInfoFile` fields defined above. An artifact-bundle
+`error` with an empty `missingChunks` array. Neither `created` nor `ok` is a
+pending state. A required `dif` uses the exact pinned `DebugInfoFile` fields
+defined above. An artifact-bundle
 assembly request contains `{checksum, chunks, projects, version?, dist?}`;
 the pinned client supplies no filename, so the adapter derives the artifact's
 logical filename deterministically as `artifact-bundle-<checksum>` using the
@@ -2020,6 +2039,15 @@ ordering tuple strictly before the requested release's tuple, using the fixed
 Release DTO below. If no candidate matches, it returns the standard `404
 not_found` body without disclosing another release.
 
+For project-scoped release list and detail reads, the release remains visible
+only when the route project is currently readable by the principal, and the
+Release DTO's `projects` array is filtered to associated projects for which the
+principal has current read authority. The route project must remain in the
+filtered array; otherwise the route returns indistinguishable `404 not_found`.
+The same filtering applies to the `previous-with-commits` result after its
+candidate and project-scope checks. No project-scoped response includes an
+unreadable project's ID, slug, or name.
+
 Every `<version>` in a release path is one RFC 3986 URI path segment. Clients
 percent-encode the UTF-8 bytes of the version, including reserved bytes such as
 `/`, `?`, `#`, and `%`; `+` is a literal plus in a path and is not decoded as a
@@ -2080,8 +2108,9 @@ the original successful result, while reusing it with a different body returns
 `409 conflict`.
 An identical no-key retry also returns the original Deployment DTO with `200`.
 The first successful `POST` for a new identity returns `201` with the fixed
-Deployment DTO; `dateFinished` equals `timestamp`, and `dateStarted` is `null`
-unless native deployment data supplies it. Deployment records history only;
+Deployment DTO; `dateFinished` equals `timestamp`, and `dateStarted` is always
+`null`. The request has no start-time field and no native deployment source is
+consulted. Deployment records history only;
 they do not grant deployment authority, execute deployment work, or activate
 unsupported release-health behavior.
 
@@ -2233,7 +2262,8 @@ exercise:
   subsequent Envelope `attachment-ref` binding to the event ID, including the
   canonical lowercase UUID v7 upload ID, event-unbound creation metadata,
   same-project binding authorization, and rejection of cross-project binding;
-- empty, unsupported-only, supported-only, and mixed Envelopes, including an
+- empty, unsupported-only, attachment-only, supported-only, and mixed Envelopes,
+  including unassociated-attachment exclusion, and an
   envelope-level event ID on an excluded-only Envelope, all expecting `200`
   with a zero-length response body, plus eventless empty/client-report retries
   with the same client `X-Request-ID`, different client IDs, and no client ID;
@@ -2245,8 +2275,9 @@ exercise:
 - nested identity/gzip item payloads at and over the decoded 20,000,000-byte
   item and 50,000,000-byte aggregate limits, with no partial persistence;
 - duplicate, case-variant, malformed, and conflicting event IDs, including
-  acceptance-record retirement while the canonical event remains queryable and
-  uniqueness-tombstone enforcement; equivalent payloads with different
+  acceptance-record retirement while the canonical event remains queryable,
+  identical retries after environment retirement, and uniqueness-tombstone
+  enforcement; equivalent payloads with different
   compression, JSON ordering, or excluded metadata; message-only and
   stacktrace-only error events, exception events, deterministic multi-entry
   Event DTO serialization and ordering, invalid levels, event items with no
@@ -2255,8 +2286,8 @@ exercise:
   chunks, interrupted assembly, optional and conflicting DIF idempotency keys,
   retries, polling, and lost responses, including non-terminal `not_found` and
   `assembling`, newly created terminal `created`, and duplicate/polled terminal
-  `ok` DIF states, plus identical DIF bytes submitted with alternate valid
-  chunk partitions;
+  `ok` DIF states with exact state-specific `detail`/`dif` presence, plus
+  identical DIF bytes submitted with alternate valid chunk partitions;
 - collection credentials in `X-Sentry-Auth`, DSN query parameters, and DSN
   URLs, including percent-decoding, duplicate parameters, missing/unknown
   members, route-project mismatches, and conflicting sources;
@@ -2277,7 +2308,8 @@ exercise:
   WHATWG default-port and host-case canonicalization, normalized duplicate
   rejection, and read-back cases;
 - suspended project deletion with the minimal `deletion_target.name`, the
-  current strong `ETag`, exact `X-Confirm-Project-Name`/`If-Match` reuse, and
+  current strong `ETag` and project-generation headers, exact
+  `X-Confirm-Project-Name`/`If-Match`/`X-Watchtower-Project-Generation` reuse, and
   no broader project DTO disclosure, plus authorized polling of that exact
   deletion operation while suspended, the pending Support release gate, and
   rejection of unrelated operation status reads; deletion also covers its
@@ -2308,7 +2340,8 @@ exercise:
   fixed Release DTO responses or `404 not_found` for
   `/previous-with-commits/`, including repeated project filters from 1 through
   100, deterministic over-limit `413` responses, skipped no-commit releases,
-  deterministic ordering/tie-breaking, no-match behavior, and the pinned
+  deterministic ordering/tie-breaking, normalized project/environment array
+  ordering, inaccessible-project filtering, no-match behavior, and the pinned
   sentry-cli parsing workflow;
 - release creation, metadata update, and finalization with the exact request
   bodies, nullable fields, mutually exclusive combinations, canonical digests,
@@ -2370,10 +2403,12 @@ exercise:
   organization-scoped project slugs;
 - organization/project reads, creation, update, deletion, DSN issuance,
   rotation/revocation, issue/event reads, resolve/reopen/ignore/mute/next-release,
-  release requests without client idempotency keys, and deployment workflows;
+  release requests without client idempotency keys, and deployment workflows
+  with an always-null `dateStarted`;
 - operation polling with `202 pending`, `200 succeeded`, `200 failed`, the
-  top-level `410 operation_expired` error, unknown-operation `404`, and
-  owner-outage `503` responses;
+  top-level `410 operation_expired` error at and after the exact
+  `completed_at + 24h` cutoff, unknown-operation `404`, and owner-outage `503`
+  responses;
 - malformed management JSON versus malformed Envelope JSON, with
   `invalid_request` and `invalid_envelope` respectively;
 - single- and multi-entry DIF assembly retries using the canonical sorted
