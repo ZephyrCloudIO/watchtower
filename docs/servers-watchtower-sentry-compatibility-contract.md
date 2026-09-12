@@ -237,7 +237,7 @@ to a native route.
 | `/api/<project_id>/store/` | `POST` | Collection-only DSN | Supported legacy JSON error path required by a pinned client. The body is converted to one error event and follows Envelope admission semantics. Successful admission returns `200` with a zero-length body and request-ID headers. |
 | `/api/<project_id>/minidump/` | `POST` | Collection-only DSN | Supported for pinned crash workflows whose fixture specifies the non-Envelope minidump path. `multipart/form-data` and the pinned client field names are accepted. Successful admission returns `200` with a zero-length body and request-ID headers. |
 | `/api/<project_id>/upload/` | `POST` | Collection-only DSN | Supported pinned Native large-attachment TUS creation route. A valid integer `Upload-Length` from `0` through `20,000,000`, `Tus-Resumable: 1.0.0`, and `Upload-Metadata: sentry <base64({"attachment_type":"event.minidump"})>` request returns `201` with a project-bound `Location`, `Tus-Resumable: 1.0.0`, and `Upload-Offset: 0`; a zero-length upload is created directly as `complete-unbound`, while a positive-length upload is pending. Neither creation path accepts attachment bytes. |
-| `/api/<project_id>/upload/<upload_id>` | `HEAD`, `PATCH` | Collection-only DSN bound to the upload | Supported pinned Native TUS offset and append workflow. `HEAD` requires request `Tus-Resumable: 1.0.0` and, on success, returns `200` with an empty body and `Tus-Resumable: 1.0.0`, `Upload-Offset`, and `Upload-Length` response headers. Missing or unsupported `Tus-Resumable` returns `412 precondition_failed`; a missing, expired, already-bound, or inaccessible upload returns `404 not_found`, and invalid authentication returns `401 invalid_authentication`. `PATCH` requires `Tus-Resumable: 1.0.0`, `Upload-Offset`, and `application/offset+octet-stream`, appends only at the expected offset, and returns `204` with an empty body, `Tus-Resumable: 1.0.0`, and the new `Upload-Offset`. A stale or mismatched offset returns `409 conflict` with the current `Upload-Offset`; bytes that would exceed `Upload-Length` return `413 payload_too_large` with the current `Upload-Offset`. Both failures use the standard JSON error body and atomically append no bytes. Reaching the declared length transitions the upload to `complete-unbound`; it remains subject to attachment and project limits and is not accepted until the subsequent Envelope binds it to an event. |
+| `/api/<project_id>/upload/<upload_id>` | `HEAD`, `PATCH` | Collection-only DSN bound to the upload | Supported pinned Native TUS offset and append workflow. `HEAD` requires request `Tus-Resumable: 1.0.0` and, on success, returns `200` with an empty body and `Tus-Resumable: 1.0.0`, `Upload-Offset`, and `Upload-Length` response headers. Missing or unsupported `Tus-Resumable` returns `412 precondition_failed`; a missing, expired, already-bound, or inaccessible upload returns `404 not_found`, and invalid authentication returns `401 invalid_authentication`. A failed `HEAD` has no response body or `Content-Type`; it returns only its status, `Tus-Resumable: 1.0.0`, request-ID headers, and `Content-Length: 0`, with no `Upload-Offset` or `Upload-Length`. `PATCH` requires `Tus-Resumable: 1.0.0`, `Upload-Offset`, and `application/offset+octet-stream`, appends only at the expected offset, and returns `204` with an empty body, `Tus-Resumable: 1.0.0`, and the new `Upload-Offset`. A stale or mismatched offset returns `409 conflict` with the current `Upload-Offset`; bytes that would exceed `Upload-Length` return `413 payload_too_large` with the current `Upload-Offset`. `PATCH` failures use the standard JSON error body and atomically append no bytes. Reaching the declared length transitions the upload to `complete-unbound`; it remains subject to attachment and project limits and is not accepted until the subsequent Envelope binds it to an event. |
 | `/api/<project_id>/security-report/` | `POST` | Collection-only DSN | Explicitly unsupported in v1; returns `501 unsupported_capability` with no persistence side effect because security reports are not error telemetry. |
 | Any other `/api/<project_id>/...` ingestion route | Any | Any | `404` or `405` according to whether the path or method is unknown; no side effect. |
 
@@ -252,17 +252,31 @@ Collection admission evaluates the project lifecycle state and environment
 retirement fence before parsing or persisting a new request. An `active`
 project follows the route-specific behavior above, including `200` with an
 empty body for a structurally valid, non-conflicting Envelope. A `disabled`
-project returns `403 permission_denied` with detail `Project collection is
-disabled.`; a `deleting` project returns `409 conflict` with detail `Project
-deletion is in progress.`; and a `deleted` project returns `404 not_found`.
+project returns `403 permission_denied` with detail `Permission denied.`; a
+`deleting` project returns `409 conflict` with detail `The request conflicts
+with the current resource state.`; and a `deleted` project returns `404
+not_found`.
 These lifecycle responses apply to collection and upload admission, and every
 rejected request persists no payload, acceptance record, attachment bytes, or
 operation state.
 
+Disablement also applies to management mutations. Authorized `GET` project,
+DSN, issue, event, release, commit, release-file, chunk-capability, and
+operation-status reads remain available, while a disabled project's project
+settings `PUT`, DSN issue/rotation/revocation, issue status `PUT`, release
+create/update/finalize, release-file upload/deletion, chunk upload, DIF or
+artifact assembly, and deployment creation return `403 permission_denied`
+with detail `Permission denied.` and create no side effect. The compatibility
+project `DELETE` remains available as the authorized lifecycle deletion flow;
+internal retention and purge continue normally. A capability read may return
+its normal metadata, but every upload or assembly URL for a disabled project
+still applies these write rules.
+
 Before accepting an error event, Ingest applies the API-owned environment
 retirement tombstone and generation fence. If the event's `environment` names
 an environment that is retired for the project, collection returns `409
-conflict` with detail `Environment is retired.` and persists no payload,
+conflict` with detail `The request conflicts with the current resource state.`
+and persists no payload,
 acceptance record, attachment bytes, or operation state. The adapter never
 silently drops the event or automatically re-registers that name. Data already
 accepted before retirement finishes normally; only an authorized reactivation
@@ -285,6 +299,26 @@ uploaded bytes only
 as an attachment of that event. A completed upload never becomes a standalone
 event or attachment, and an unreferenced completed upload expires without
 durable customer-payload acceptance.
+
+The reference attachment payload is a closed JSON object with exactly these
+two members:
+
+```json
+{
+  "url": "https://example.invalid/api/project/upload/upload-id",
+  "path": "event.minidump"
+}
+```
+
+Both `url` and `path` are required strings; duplicate or unknown members are
+invalid. `url` is an absolute HTTP(S) URL whose value must equal the TUS
+creation response's `Location` header byte-for-byte. `path` is a non-empty
+relative UTF-8 logical path beneath that upload, with no leading slash,
+backslash, query, fragment, control character, empty segment, `.` segment, or
+`..` segment. It is metadata for the bytes addressed by `url`, not an
+independent URL and never a selector for another upload. A missing, malformed,
+mismatched, or otherwise invalid reference object returns `400
+invalid_envelope` before binding.
 
 Browser-origin requests to the Envelope route require an exact match against
 the project's configured browser-origin allowlist. A request without `Origin`
@@ -450,6 +484,17 @@ request returns only the pending deletion operation and never a resource DTO.
 Organization deletion, suspension removal, token issuance, and all other
 changes remain unavailable.
 
+The pending deletion operation is held at `awaiting_support_release` while the
+organization remains suspended. No destructive lifecycle command or purge may
+start until Support releases that exact customer-authorized project scope
+through the restricted internal support flow. At release, API rechecks the
+requester's current Owner/Admin role, five-minute authentication freshness and
+policy, exact project target, expected resource version, confirmations,
+idempotency binding, and pending request state. A stale or changed check keeps
+the operation pending and requires the customer to reauthenticate and
+reconfirm the same request; Support cannot widen the scope or originate a
+deletion.
+
 There is one restricted read exception to the suspension fence. A `GET`
 `/api/0/operations/<operation_id>/` request may return the normal operation
 status DTO while suspended only when the caller is the current Owner/Admin user
@@ -548,7 +593,7 @@ payloads into internal messages.
 | Project create/update/delete | Organization scope, the exact project mutation body defined below, current authorization, observed version for settings, `X-Confirm-Project-Name` for delete, and idempotency key for create/delete | Resource alias and canonical-safe DTO, or `202` operation ID while lifecycle barriers remain pending |
 | DSN issue/rotate/revoke | Project scope, the exact closed issuance body or empty/bodyless mutation shape below, current Manage authority, and a required idempotency key | `201` issuance or `200` rotation returns the fixed DSN DTO; `204` revocation has an empty body; management-token plaintext is never returned |
 | Issue/event read or status transition | Tenant-unique issue alias or tenant/project-scoped event alias, bounded filters or status, and current credential | The fixed Issue or Event DTO below, request ID, and cursor link when paginated |
-| Release mutation | Organization/project scope, release version, bounded metadata, and canonical request identity; an `Idempotency-Key` may additionally bind the request | Release alias/version, operation state, and request ID |
+| Release mutation | Organization/project scope, release version, bounded metadata, and canonical request identity; an `Idempotency-Key` may additionally bind the request | `201` for a new release or `200` for duplicate/update/finalization, with the direct Release DTO and request-ID headers; no operation state |
 | Release artifact upload | Project/release version scope, logical filename, optional distribution, bounded bytes, artifact type, and management credential | Artifact/file/checksum identity, upload or assembly operation ID, and `202` pending state when asynchronous |
 | DIF chunk/assembly upload | Organization or project capability scope for chunks, project scope for assembly, a checksum-keyed request map of one to 256 entries whose lowercase full-file SHA-1 keys each map to `name`, optional `debug_id`, and ordered chunks, bounded bytes, and management credential | DIF checksum/debug identities, assembly operation ID, and `202` pending state when asynchronous |
 | Release file deletion | Exact project/release scope, required `file_id`, current Manage authority, required observed resource version, and a required idempotency key | `204` with an empty body after durable deletion; repeating the same target is the same successful no-op |
@@ -736,6 +781,19 @@ with metadata members or sent as `null`. The path version is authoritative and
 These exact combinations are the only accepted release update/finalization
 bodies; successful retries use the existing release idempotency rules.
 
+Release mutations are synchronous and return the direct Release DTO, never an
+Operation DTO. A new `POST` release returns `201` with the Release DTO,
+`Content-Type: application/json`, `X-Request-ID`,
+`X-Watchtower-Request-ID`, and a `Location` header naming the canonical
+release resource. An idempotent duplicate or lost-response retry of that
+`POST` returns `200` with the same Release DTO and request-ID headers, but no
+`Location` header. A successful metadata `PUT` or finalization `PUT`, whether
+initial or repeated, returns `200` with the Release DTO and the two request-ID
+headers. These successful responses have no `Retry-After` and no operation
+status; `202` is never used for release create, update, or finalization.
+Conflicting content, stale lifecycle state, or unavailable owners use the
+standard error statuses and bodies without creating a second release result.
+
 DSN responses never contain `secret`, `clientSecret`, management-token
 plaintext, or any other credential field, including as a nullable field. A
 successful DSN rotation returns the same fixed DSN DTO with the new public DSN.
@@ -847,11 +905,13 @@ transition, duplicate IDs, an empty ID set, more than 100 IDs, and an
 unbounded update-all request are invalid and produce no mutation.
 
 Bulk transitions are all-or-nothing. The adapter validates and authorizes every
-target before changing any issue. A missing or inaccessible target returns
-`404 not_found`; a `current_status` mismatch returns `409 conflict`; and an
-owner or dependency outage returns `503 unavailable`; each result produces no
-partial update. A successful one- to 100-ID request returns `200` with the
-direct array of updated Issue DTOs in the submitted ID order.
+target before changing any issue. After resolving each target alias, the
+adapter requires its canonical project identity to equal the project resolved
+from the route. A missing, inaccessible, or route-project-mismatched target
+returns `404 not_found`; a `current_status` mismatch returns `409 conflict`;
+and an owner or dependency outage returns `503 unavailable`; each result
+produces no partial update. A successful one- to 100-ID request returns `200`
+with the direct array of updated Issue DTOs in the submitted ID order.
 
 ### Operation status DTO and state machine
 
@@ -901,12 +961,15 @@ client requires polling; it never claims processing completion.
 ### Compatibility error bodies and mapping
 
 Every direct management or ingestion error other than the documented suspension
-response uses this exact JSON object:
+response uses this exact JSON object. The sole bodyless error exception is a
+failed TUS `HEAD`: its HTTP status and headers are authoritative, with
+`Content-Length: 0`, `Tus-Resumable: 1.0.0`, and request-ID headers, and it has
+neither `Content-Type` nor a JSON error body.
 
 ```json
 {
   "code": "invalid_request",
-  "detail": "The request body is invalid.",
+  "detail": "The request is invalid.",
   "request_id": "canonical-lowercase-uuid-v7",
   "field_errors": [
     { "field": "version", "reason": "required" }
@@ -949,6 +1012,31 @@ codes while preserving the pinned client's expected HTTP status family.
 | `rate_limited` | 429 | A principal, organization, project, collection, or artifact quota was exhausted |
 | `unavailable` | 503 | Authorization, quota, owner, lifecycle, or processing dependency cannot be evaluated safely |
 | `deadline_exceeded` | 504 | A bounded synchronous operation exceeded its deadline without being reported complete |
+
+The `detail` member is also closed by code so fixtures can compare complete
+error bodies. Unless a route explicitly documents the suspension response
+exception above, the canonical details are:
+
+| Code | Exact `detail` |
+| --- | --- |
+| `invalid_authentication` | `Authentication is required.` |
+| `permission_denied` | `Permission denied.` |
+| `not_found` | `The requested resource was not found.` |
+| `method_not_allowed` | `The requested method is not allowed.` |
+| `invalid_request` | `The request is invalid.` |
+| `operation_expired` | `The operation result has expired.` |
+| `precondition_failed` | `The request precondition failed.` |
+| `unsupported_media_type` | `The media type is not supported.` |
+| `invalid_compression` | `The request compression is invalid.` |
+| `invalid_multipart` | `The multipart request is invalid.` |
+| `invalid_envelope` | `The Envelope is invalid.` |
+| `internal_error` | `Internal server error.` |
+| `unsupported_capability` | `The requested capability is not supported.` |
+| `conflict` | `The request conflicts with the current resource state.` |
+| `payload_too_large` | `The request payload is too large.` |
+| `rate_limited` | `Rate limit exceeded.` |
+| `unavailable` | `The service is temporarily unavailable.` |
+| `deadline_exceeded` | `The request deadline was exceeded.` |
 
 Runtime boundary codes `unknown`, `internal`, and `data_loss` map to the
 deterministic `500 internal_error` response. Its pinned-client error shape
@@ -1328,32 +1416,48 @@ management schemas remain the explicit exception.
   required client key before mutation; reusing a supplied key with different
   content returns `409`.
 - Pinned release create/update/finalize and deployment requests do not require
-  `Idempotency-Key`. When absent, the adapter derives a retry identity from
-  `(tenant_id, operation, target_scope, canonical_request_body_digest)` and a
-  lost response resumes the identical operation. When supplied, the client key
-  binds to the same identity and a reuse with different content returns `409`.
-  No retry identity includes credentials or unrestricted payloads.
+  `Idempotency-Key`. For release creation and deployment, an absent key uses
+  `(tenant_id, operation, target_scope, canonical_request_body_digest)`. For
+  release metadata updates and finalization, it additionally includes the
+  observed monotonic release generation:
+  `(tenant_id, operation, target_scope, observed_release_generation,
+  canonical_request_body_digest)`. A lost-response retry against the same
+  generation resumes the identical operation; a later legitimate mutation has
+  a new identity even when its body matches an older request. When supplied,
+  the client key binds to the first observed generation and the same identity;
+  reusing it with different content or scope returns `409`. No retry identity
+  includes credentials or unrestricted payloads.
 - Duplicate or out-of-order asynchronous messages are handled by the owning
   component's idempotent command/reconciliation contract. The adapter never
   invents a second canonical event or bypasses a lifecycle fence.
 
 ### Pagination and rate-limit headers
 
-List endpoints return bounded arrays with the upstream-compatible `Link`
-header and opaque cursor parameters when the pinned client expects them. When a
-next page exists, the `Link` header contains a next entry whose URL carries the
-opaque `cursor` and whose parameters include exactly `rel="next"` and
-`results="true"`; a response without another page has no next entry. A cursor
-binds to the original tenant, project, principal, filters, sort order,
-and authorization revision. The default keyset ordering is fixed per route:
+Every exposed list endpoint returns a direct array of at most 100 records and
+accepts only its route-specific filters plus the opaque `cursor` and `limit`
+parameters. `limit` is one decimal integer from `1` through `100`, defaulting
+to `100`; a malformed, repeated, or out-of-range value returns
+`400 invalid_request`. List endpoints return the upstream-compatible `Link`
+header. When a next page exists, the `Link` header contains a next entry whose
+URL carries the opaque `cursor` and whose parameters include exactly
+`rel="next"` and `results="true"`; a response without another page has no
+next entry. A cursor binds to the original tenant, project, principal,
+filters, page size, sort order, and authorization revision. The default keyset
+ordering is fixed per route:
 
 | List route | Ordering, including tie-breaker |
 | --- | --- |
-| Organization lists | `dateCreated ASC`, then organization `id ASC` |
-| Project lists | `dateCreated ASC`, then project `id ASC` |
-| Issue lists | `lastSeen DESC`, then issue `id ASC` |
-| Issue-event and project-event lists | `dateReceived DESC`, then external event ID `eventID ASC` |
-| Organization- and project-scoped release lists | `dateCreated DESC`, then release `version ASC` |
+| `GET /api/0/organizations/` | `dateCreated ASC`, then organization `id ASC` |
+| `GET /api/0/organizations/<organization>/projects/` | `dateCreated ASC`, then project `id ASC` |
+| `GET /api/0/projects/<organization>/<project>/keys/` | `dateCreated ASC`, then DSN `id ASC` |
+| `GET /api/0/projects/<organization>/<project>/issues/` | `lastSeen DESC`, then issue `id ASC` |
+| `GET /api/0/issues/<issue>/events/` | `dateReceived DESC`, then external event ID `eventID ASC` |
+| `GET /api/0/projects/<organization>/<project>/events/` | `dateReceived DESC`, then external event ID `eventID ASC` |
+| `GET /api/0/organizations/<organization>/releases/` | `dateCreated DESC`, then release `version ASC`, then release `id ASC` |
+| `GET /api/0/projects/<organization>/<project>/releases/` | `dateCreated DESC`, then release `version ASC`, then release `id ASC` |
+| `GET /api/0/organizations/<organization>/releases/<version>/commits/` | commit `id ASC` |
+| `GET /api/0/projects/<organization>/<project>/releases/<version>/files/` | `dateCreated ASC`, then artifact `id ASC` |
+| `GET /api/0/organizations/<organization>/releases/<version>/deploys/` | `dateFinished DESC`, then deployment `id ASC` |
 
 The first page establishes a read snapshot and its immutable high-water mark;
 the opaque cursor carries that snapshot, the last complete ordering tuple, and
@@ -1554,10 +1658,13 @@ request is a JSON map from the full-file SHA-1 checksum to
 `{name, debug_id?, chunks}`; its response is the same checksum map with
 `{state, missingChunks, detail?, dif?}` and does not require release or
 distribution fields. DIF `state` uses only `not_found`, `created`,
-`assembling`, `ok`, and `error`; missing chunks produce `not_found`, pending
-assembly produces `assembling`, successful creation/completion produces
-`created`/`ok`, and terminal owner failure produces `error`. An optional `dif`
-uses the exact pinned `DebugInfoFile` fields defined above. An artifact-bundle
+`assembling`, `ok`, and `error`. Missing chunks produce non-terminal
+`not_found`; once all chunks are available but assembly is still running, the
+state is non-terminal `assembling`. A newly registered DIF returns terminal
+`created`; an already registered matching DIF or a later successful poll of a
+completed assembly returns terminal `ok`. Terminal owner failure produces
+`error`. Neither `created` nor `ok` is a pending state. An optional `dif` uses
+the exact pinned `DebugInfoFile` fields defined above. An artifact-bundle
 assembly request contains `{checksum, chunks, projects, version?, dist?}`;
 the pinned client supplies no filename, so the adapter derives the artifact's
 logical filename deterministically as `artifact-bundle-<checksum>` using the
@@ -1887,6 +1994,8 @@ exercise:
   append, stale-offset `409` responses and current
   offsets, overflow `413` responses, atomic no-append behavior for both
   failures, incomplete-upload retention, finalization at the declared length,
+  failed-`HEAD` status/header-only responses with `Content-Length: 0`, the
+  exact closed `{url,path}` reference object and relative-path validation,
   ordinary `attachment_length` range/equality checks, reference-length checks
   against dereferenced upload bytes rather than reference JSON bytes, and
   subsequent Envelope `attachment-ref` binding to the event ID;
@@ -1904,7 +2013,9 @@ exercise:
   compression, JSON ordering, or excluded metadata;
   new and duplicate chunks with exact `200` empty responses, conflicting
   chunks, interrupted assembly, optional and conflicting DIF idempotency keys,
-  retries, polling, and lost responses;
+  retries, polling, and lost responses, including non-terminal `not_found` and
+  `assembling`, newly created terminal `created`, and duplicate/polled terminal
+  `ok` DIF states;
 - collection credentials in `X-Sentry-Auth`, DSN query parameters, and DSN
   URLs, including percent-decoding, duplicate parameters, missing/unknown
   members, route-project mismatches, and conflicting sources;
@@ -1926,14 +2037,15 @@ exercise:
 - suspended project deletion with the minimal `deletion_target.name`, the
   current strong `ETag`, exact `X-Confirm-Project-Name`/`If-Match` reuse, and
   no broader project DTO disclosure, plus authorized polling of that exact
-  deletion operation while suspended and rejection of unrelated operation
-  status reads;
+  deletion operation while suspended, the pending Support release gate, and
+  rejection of unrelated operation status reads;
 - pagination using the documented per-route order and tie-breaker, snapshot
   consistency under concurrent inserts/updates, cursor binding, malformed and
   expired cursor `400` results, stale cursor `403` results, cross-tenant cursor
   `404` results, rate-limit headers, exact
-  `rel="next"`/`results="true"`/`cursor` Link parameters, unknown fields, and
-  every safe error class with the exact error-body member rules;
+  `rel="next"`/`results="true"`/`cursor` Link parameters, `limit` bounds,
+  DSN-key, release-file, release-commit, and deployment lists, unknown fields,
+  and every safe error class with the exact error-body member and detail rules;
 - exact organization/project DTO bodies, including nullable platform,
   organization compatibility booleans, required deployment finish times,
   canonical aliases, origin arrays, omitted unknown fields, and list/detail
@@ -1946,7 +2058,7 @@ exercise:
   `id` query parameters from 1 through 100, bounded current-status filters,
   direct input-ordered bulk response arrays,
   all-or-nothing precondition failures, and rejection of
-  scalar/query-only/unbounded updates;
+  scalar/query-only/unbounded updates and route-project-mismatched IDs;
 - release `/commits/` direct arrays containing exactly `{ "id": string }`,
   fixed Release DTO responses or `404 not_found` for
   `/previous-with-commits/`, including repeated project filters, skipped
@@ -1954,7 +2066,9 @@ exercise:
   and the pinned sentry-cli parsing workflow;
 - release creation, metadata update, and finalization with the exact request
   bodies, nullable fields, mutually exclusive combinations, canonical digests,
-  and rejection of unknown or misplaced fields;
+  observed-generation retry identities, exact `201`/`200` DTO responses and
+  headers, no `202` operation responses, and rejection of unknown or misplaced
+  fields;
 - project creation and browser-origin update with the exact closed request
   bodies, canonical creation digest, required idempotency, nullable platform,
   origin validation, and rejection of unknown members;
@@ -1978,7 +2092,8 @@ exercise:
 - active, disabled, deleting, and deleted project collection admission with
   the exact `200`, `403 permission_denied`, `409 conflict`, and `404
   not_found` results, retired-environment `409 conflict`, and no persistence
-  for rejected requests;
+  for rejected requests, plus authorized disabled-project reads and blocked
+  management writes;
 - chunk requests at and over the advertised `maxRequestSize`, including
   duplicate and rejected parts, with `413` and no partial persistence for an
   over-limit request, `400` for overlong scalar fields, plus
