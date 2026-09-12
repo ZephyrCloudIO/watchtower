@@ -396,7 +396,7 @@ the allowlist, or a project with no configured allowlist, receives
 | `/api/0/` | `GET` authentication/capability read required by sentry-cli; it returns the exact safe compatibility response defined in Capability negotiation. Mutations and unlisted methods are rejected. |
 | `/api/0/organizations/` | `GET` organization reads for the authenticated management credential, limited to that credential's owning organization; pagination and current authorization apply. Organization creation, deletion, membership, team, SSO, and broad settings administration are not exposed through Sentry compatibility. |
 | `/api/0/organizations/<organization>/` | `GET` organization read. Unknown or unauthorized organizations return indistinguishable `404`. |
-| `/api/0/organizations/<organization>/projects/` | `GET` project list and `POST` project creation using the exact request body below. Creation returns the pending Operation DTO defined in Project mutation responses until all required owners and Jobs acknowledge enablement. |
+| `/api/0/organizations/<organization>/projects/` | `GET` project list filtered to projects currently readable by the credential, and `POST` project creation using the exact request body below. Creation returns the pending Operation DTO defined in Project mutation responses until all required owners and Jobs acknowledge enablement. |
 | `/api/0/projects/<organization>/<project>/` | `GET` project read, `PUT` supported project settings including the browser-origin allowlist, and bodyless `DELETE` project deletion. Project settings and deletion require the current strong `If-Match` plus `X-Watchtower-Project-Generation`; deletion additionally requires a current Owner/Admin user session recently reauthenticated within five minutes under applicable organization SSO/MFA conditions, `X-Confirm-Project-Name` containing the exact current project name, idempotency, lifecycle fences, and never reports success before authoritative completion. |
 | `/api/0/projects/<organization>/<project>/keys/` | `GET` DSN metadata/public DSNs and `POST` issuance using the exact closed body and `201` response below. Plaintext management tokens are never returned. |
 | `/api/0/projects/<organization>/<project>/keys/<key_id>/` | `PUT` rotation with the empty JSON object `{}` and `200` DSN response, and bodyless `DELETE` revocation with `204`; both use the exact idempotency rules below and never return a secret. |
@@ -656,6 +656,14 @@ read receives the ordinary suspension response.
   organization when it is currently readable, or the normal empty/suspended
   result; it never enumerates another organization. The compatibility adapter
   does not add a general user-session flow for multi-organization listing.
+- `GET /api/0/organizations/<organization>/projects/` applies current project
+  read authorization before snapshot ordering and pagination. An Owner/Admin
+  organization principal sees every currently readable project in that
+  organization; an explicitly project-scoped personal or service credential
+  sees only projects in its current readable grants. Projects outside that
+  scope are omitted rather than represented by a DTO or an authorization
+  error, and an empty readable set returns the normal empty direct array. The
+  authorization check is repeated for every page.
 - The adapter accepts the pinned clients' `X-Sentry-Auth`, DSN query parameters,
   `Authorization: Bearer`, and `X-Sentry-Token` spellings, plus the native
   authenticated user session required for project deletion, only when they
@@ -677,9 +685,12 @@ no duplicate names, surrounding whitespace, quoted values, or empty values.
 It requires `sentry_version=7` and `sentry_key=<public-key>` and may contain
 the bounded diagnostic `sentry_client=<client>`; `sentry_secret` and unknown
 members are invalid. Query-string credentials use one `sentry_key` parameter
-and, when present, one `sentry_version=7` parameter; query values are
-percent-decoded once as UTF-8, and duplicate or malformed parameters are
-invalid.
+and, when present, one `sentry_version=7` parameter and one bounded diagnostic
+`sentry_client` parameter. Query values are percent-decoded once as UTF-8. The
+query `sentry_client` uses the same bounded value grammar as the header form
+and is diagnostic only; it does not affect authorization, persistence, or the
+payload digest. Duplicate or malformed `sentry_key`, `sentry_version`, or
+`sentry_client` parameters, and unknown query credential members, are invalid.
 
 A DSN URL credential is an absolute `http` or `https` URL whose user-info has
 one percent-decoded public-key username and no password. Its final path
@@ -888,11 +899,12 @@ keys. The canonical request identity is the RFC 8785 canonical-JSON digest of
 the normalized body shown below; omitted optional members remain omitted, while
 an explicit `null` is retained and means clear the corresponding nullable
 metadata. The `Idempotency-Key`, when supplied, binds to this digest but is not
-included in it. Only the single-release detail response (`GET
-/api/0/organizations/<organization>/releases/<version>/`) includes the strong
-resource `ETag`; organization- and project-scoped release list
-responses omit `ETag`, and a collection response ETag is never accepted as the
-observed version for `If-Match`.
+included in it. The single-release detail response (`GET
+/api/0/organizations/<organization>/releases/<version>/`) and every successful
+release creation, duplicate, metadata update, and finalization response
+include the strong resource `ETag`. Organization- and project-scoped release
+list responses omit `ETag`, and a collection response ETag is never accepted
+as the observed version for `If-Match`.
 Release metadata and finalization `PUT` requests require that exact observed
 ETag in `If-Match`; creation has no prior version and does not require it.
 
@@ -1026,7 +1038,7 @@ an extension surface.
 | Event | `groupID` | Nullable issue compatibility alias |
 | Event | `message` | Nullable string |
 | Event | `title` | Required string derived from the normalized event by the deterministic rule below |
-| Event | `culprit` | Nullable string |
+| Event | `culprit` | Nullable string derived by the deterministic projection below |
 | Event | `dateCreated` | Required RFC 3339 UTC string derived from the accepted event `timestamp`; when `timestamp` is omitted, this equals `dateReceived` |
 | Event | `dateReceived` | Required RFC 3339 UTC string derived from the canonical `accepted_at` instant; this field is authoritative for event-list ordering |
 | Event | `platform` | Nullable string |
@@ -1048,6 +1060,16 @@ top-level `message`; each `exception.values` element in array order, checking
 `function` then `filename`; and `metadata.value`, `metadata.type`,
 `metadata.filename`, then `metadata.function`. Missing, non-string, and empty
 candidates are skipped. If no candidate remains, `title` is the empty string.
+
+`Event.culprit` is a nullable projection of the normalized event. The adapter
+takes the first non-empty NFC-normalized string candidate in this order:
+accepted top-level `culprit`; accepted top-level `transaction`; each
+`stacktrace.frames` element in array order, checking `function` then
+`filename`; and `metadata.function` then `metadata.filename`. Missing,
+non-string, and empty candidates are skipped. If no candidate remains,
+`culprit` is `null`. The selected value is emitted only in the Event and Issue
+DTO projections; the accepted `culprit` and `transaction` fields remain part
+of the normalized event and payload digest.
 
 `Event.contexts` is always present as an object. When the accepted normalized
 event omits `contexts` or supplies explicit `null`, the adapter treats it as an
@@ -1546,8 +1568,8 @@ excluded, or future item. Their values are not type-checked, persisted,
 returned, used for authorization, or included in the payload digest. Duplicate
 object member names remain invalid under the general JSON framing rule. An
 `event` payload may contain the pinned
-client's `event_id`, `timestamp`, `platform`, `level`, `message`, `exception`,
-`stacktrace`, `release`, `dist`, `environment`, `tags`, `contexts`,
+client's `event_id`, `timestamp`, `platform`, `level`, `message`, `culprit`,
+`transaction`, `exception`, `stacktrace`, `release`, `dist`, `environment`, `tags`, `contexts`,
 `breadcrumbs`, `sdk`, `user`, `debug_meta`, and bounded event metadata. The
 event item's `event_id` is required for a supported event.
 
@@ -1564,14 +1586,17 @@ either `null` or an object containing exactly nullable bounded NFC-normalized
 string members `name` and `version`; unknown members inside this object are
 rejected and omitted members serialize as `null`. `trace` is either `null` or
 an object containing required `trace_id` and `public_key` strings plus optional
-nullable `sampled` boolean and `transaction` string members. `trace_id` uses the
+nullable `sampled`, `transaction`, `release`, `environment`, and `sample_rate`
+members. `sampled` accepts either a boolean or one of the bounded strings
+`true`, `false`, `1`, or `0`; `transaction`, `release`, and `environment` are
+bounded NFC-normalized strings when non-null; and `sample_rate` is a finite
+JSON number from `0` through `1` inclusive when non-null. `trace_id` uses the
 32-character hexadecimal trace-ID grammar and is normalized to lowercase;
-`public_key` is a bounded non-empty string and `transaction` is a bounded
-NFC-normalized string when non-null. Unknown members inside `trace`, duplicate
-members anywhere, null values where a non-null value is required, wrong shapes,
-malformed timestamps or IDs, invalid DSNs, and DSN/project mismatches return
-`400 invalid_envelope` before acceptance. These transport headers are bounded
-metadata and remain outside the payload digest.
+`public_key` is a bounded non-empty string. Unknown members inside `trace`,
+duplicate members anywhere, null values where a non-null value is required,
+wrong shapes, malformed timestamps or IDs, invalid DSNs, and DSN/project
+mismatches return `400 invalid_envelope` before acceptance. These transport
+headers are bounded metadata and remain outside the payload digest.
 
 `attachment` requires bounded bytes and may carry `filename`, `content_type`,
 `attachment_type`, and the integer `attachment_length`. When present,
@@ -1710,7 +1735,7 @@ management schemas remain the explicit exception.
   | --- | --- |
   | `event_id` | Required 32-character hexadecimal string, lowercased. |
   | `timestamp` | Optional finite JSON number of Unix seconds, represented by its RFC 8785 canonical number form; non-finite values and strings are invalid. |
-  | `platform`, `level`, `message`, `release`, `dist`, `environment` | Optional bounded UTF-8 strings or `null`; strings are NFC-normalized, and `level` is lowercased. Missing and explicit `null` are omitted from the normalized object. |
+  | `platform`, `level`, `message`, `culprit`, `transaction`, `release`, `dist`, `environment` | Optional bounded UTF-8 strings or `null`; strings are NFC-normalized, and `level` is lowercased. Missing and explicit `null` are omitted from the normalized object. |
   | `tags` | Optional object whose keys and values are bounded UTF-8 strings; both are NFC-normalized, and the object keys are sorted by RFC 8785 canonical order. |
   | `contexts` | Optional `null` or bounded JSON object. An explicit `null` is treated as absent; object keys are NFC-normalized and sorted, and nested arrays preserve order. |
   | `breadcrumbs` | Optional ordered array of bounded objects. Array order is preserved and every nested object/value uses the recursive bounded-value rules below. |
@@ -2101,8 +2126,18 @@ chunks are available but assembly is still running, the state is non-terminal
 `created`; an already registered matching DIF or a later successful poll of a
 completed assembly returns terminal `ok`. Terminal owner failure produces
 `error` with an empty `missingChunks` array. Neither `created` nor `ok` is a
-pending state. A required `dif` uses the exact pinned `DebugInfoFile` fields
-defined above. An artifact-bundle
+pending state. Each checksum-keyed DIF assembly identity records an immutable
+`assembly_accepted_at` and `assembly_expires_at = assembly_accepted_at + 24h`
+when it is first accepted. Matching retries, polls, and chunk uploads do not
+extend that lifetime. While `now < assembly_expires_at`, missing chunks remain
+non-terminal `not_found`; at the exact boundary `now >= assembly_expires_at`,
+any still-missing or expired requested chunk terminalizes that entry as
+`error` with the exact bounded detail `DIF assembly expired before all chunks were available.`,
+its unique missing chunk names sorted in lowercase lexicographic order, and no
+`dif` member. That terminal result is stable for later identical polls and a
+later chunk upload never reopens it. A DIF POST returns `202` while any entry
+is non-terminal and `200` once every entry is terminal. A required `dif` uses
+the exact pinned `DebugInfoFile` fields defined above. An artifact-bundle
 assembly request contains `{checksum, chunks, projects, version?, dist?}`;
 the pinned client supplies no filename, so the adapter derives the artifact's
 logical filename deterministically as `artifact-bundle-<checksum>` using the
@@ -2260,13 +2295,18 @@ query parameter with one to 100 unique values. More than 100 values returns
 project alias resolved only within the authenticated organization; an unknown,
 cross-organization, or otherwise inaccessible alias returns the
 indistinguishable `404 not_found`, and any other query parameter returns `400
-invalid_request`. When the filter is omitted, the candidate project scope is
-the intersection of the current release's associated projects and the
-projects currently readable by the principal; when supplied, it is the
-validated requested project set. A candidate release must be in the same
-organization, be associated with at least one readable project in that scope,
-differ from the requested release, and have both `commitCount > 0` and a
-non-null `lastCommit`; releases without commits are skipped. Candidates are
+invalid_request`. When the filter is omitted, an associated current release uses
+the intersection of its associated projects and the projects currently readable
+by the principal as the candidate project scope. An unassociated current
+release is eligible only for an organization-level Owner/Admin principal, and
+its candidate scope is the organization-level release visibility set. When a
+project filter is supplied, the candidate scope is the validated requested
+project set and only associated candidates may qualify. With no explicit
+project filter, a candidate release must either be associated with at least one
+readable project in scope or be unassociated and visible to the same
+organization-level Owner/Admin principal. Every candidate must be in the same
+organization, differ from the requested release, and have both `commitCount > 0`
+and a non-null `lastCommit`; releases without commits are skipped. Candidates are
 ordered by `dateCreated ASC`, then
 `version ASC`, then `id ASC`. The route returns the candidate with the greatest
 ordering tuple strictly before the requested release's tuple, using the fixed
@@ -2554,20 +2594,24 @@ exercise:
   compression, JSON ordering, or excluded metadata; message-only and
   stacktrace-only error events, exception events, deterministic multi-entry
   Event DTO serialization and ordering, deterministic Event `title` candidate
-  precedence and empty fallback, `timestamp` to `dateCreated` mapping,
+  precedence and empty fallback, deterministic Event `culprit` precedence and
+  null fallback, `timestamp` to `dateCreated` mapping,
   `accepted_at` to `dateReceived` mapping, missing-timestamp fallback,
   nanosecond precision/range rejection, nullable level mapping, deterministic
   tag-array serialization, invalid levels, event items with no
   error signal, strict `user`/`sdk` type validation and null/missing/unknown
   member mapping, recognized Envelope `event_id`/`dsn`/`sent_at`/`sdk`/`trace`
-  header shapes, ignored unknown top-level members, rejected unknown nested
+  header shapes, dynamic-sampling `trace` fields including string/boolean
+  `sampled`, ignored unknown top-level members, rejected unknown nested
   `sdk`/`trace` members, invalid-shape rejection, and NFC-normalized key
   collisions before hashing;
 - new and duplicate chunks with exact `200` empty responses, conflicting
   chunks, interrupted assembly, optional and conflicting DIF idempotency keys,
   retries, polling, and lost responses, including non-terminal `not_found` and
-  `assembling`, newly created terminal `created`, and duplicate/polled terminal
-  `ok` DIF states with exact state-specific `detail`/`dif` presence, plus
+  `assembling`, the immutable 24-hour DIF deadline and exact-boundary
+  terminalization, stable expiry errors and missing-chunk ordering, newly
+  created terminal `created`, and duplicate/polled terminal `ok` DIF states
+  with exact state-specific `detail`/`dif` presence, plus
   identical DIF bytes submitted with alternate valid chunk partitions or names,
   asserting first-write-wins for the registered logical name;
 - collection credentials in `X-Sentry-Auth`, DSN query parameters, and DSN
@@ -2638,7 +2682,8 @@ exercise:
   100, deterministic over-limit `413` responses, skipped no-commit releases,
   deterministic ordering/tie-breaking, normalized project/environment array
   ordering, readable-project candidate filtering before selection,
-  inaccessible-project filtering, the same visibility gate for organization
+  inaccessible-project filtering, visible unassociated candidates for
+  organization-level Owner/Admin principals, the same visibility gate for organization
   `/commits/` and `/deploys/` reads, no-match behavior, and the pinned
   sentry-cli parsing workflow, including organization release list/detail
   filtering for readable projects and unassociated-release organization
@@ -2647,7 +2692,8 @@ exercise:
   bodies, nullable fields, mutually exclusive combinations, canonical digests,
   observed-generation retry identities carried by required `If-Match` ETags,
   lost-response retries, stale-generation conflicts, exact `201`/`200` DTO
-  responses and headers, no `202` operation responses, and rejection of
+  responses and headers including strong mutation ETags and list-response ETag
+  omission, no `202` operation responses, and rejection of
   unknown or misplaced fields, mixed-authority project lists, all-or-nothing
   project authorization, and the Owner/Admin requirement when `projects` is
   omitted or empty;
@@ -2658,6 +2704,9 @@ exercise:
   `200`/`202` Project and Operation DTO states, duplicate behavior, generation
   headers and stale-generation rejection, ordinary alias reads without a
   generation input, response headers, and rejection of unknown members;
+- organization project lists with organization-wide and explicitly
+  project-scoped credentials, filtering before pagination, per-page
+  authorization rechecks, and empty readable results;
 - issue queries with NFC plus Unicode 15.1 default case folding, `ß`/`ss`,
   locale-independent Turkish case behavior, and folded Unicode-scalar
   substring matching over only the Issue `title` and `culprit` projections,
