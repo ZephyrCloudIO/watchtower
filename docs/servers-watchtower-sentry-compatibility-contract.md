@@ -403,7 +403,7 @@ the allowlist, or a project with no configured allowlist, receives
 | `/api/0/organizations/<organization>/releases/` | `GET` release list and `POST` release creation. Release reads/updates/finalization use the exact sentry-cli request fields and idempotency rules. |
 | `/api/0/projects/<organization>/<project>/releases/` | `GET` release list scoped to a project, as used by sentry-cli. Release creation remains organization-scoped. |
 | `/api/0/organizations/<organization>/releases/<version>/` | `GET` and `PUT` release metadata. Release deletion is unsupported. |
-| `/api/0/organizations/<organization>/releases/<version>/commits/` | `GET` a direct array of commit objects, each containing exactly `{ "id": string }`, required by `sentry-cli info`; commit association writes are unsupported. |
+| `/api/0/organizations/<organization>/releases/<version>/commits/` | `GET` a direct array of commit objects, each containing exactly `{ "id": string }`, required by `sentry-cli info`; the organization-scoped release visibility predicate applies before any commit ID is returned, and commit association writes are unsupported. |
 | `/api/0/organizations/<organization>/releases/<version>/previous-with-commits/` | `GET` the fixed Release DTO below for the deterministic previous release selected by the project-filter rules below, or `404 not_found` when no previous release is available, subject to project and tenant scope. |
 | `/api/0/projects/<organization>/<project>/releases/<version>/files/` | `GET` file listing and `POST` upload using the exact multipart protocol below. Source maps and debug files are handled by the artifact authority. |
 | `/api/0/projects/<organization>/<project>/releases/<version>/files/<file_id>/` | `GET` the one release file identified by `file_id`, returning its Artifact DTO and current strong `ETag`; `DELETE` performs idempotent failed-upload cleanup using that exact observed ETag. Deletion never bypasses lifecycle rules. |
@@ -413,7 +413,7 @@ the allowlist, or a project with no configured allowlist, receives
 | `/api/0/projects/<organization>/<project>/files/difs/assemble/` | `POST` DIF assembly with the pinned sentry-cli request map. The response reports each digest's `state`, `missingChunks`, bounded `detail`, and registered DIF when complete. Polling repeats this request with the same body and optional idempotency key. |
 | `/api/0/organizations/<organization>/artifactbundle/assemble/` | `POST` source-map/artifact-bundle assembly with `checksum`, ordered `chunks`, `projects`, optional `version`, and optional `dist`; repeated identical POSTs poll the same assembly and return the exact per-project artifact-bundle response defined below. `202` remains pending until artifact processing completes. `checksum` is the lowercase SHA-1 of the ordered decompressed chunk bytes defined below. |
 | `/api/0/operations/<operation_id>/` | `GET` Watchtower compatibility polling extension for project/lifecycle/artifact operations that return an operation ID and do not have an upstream polling request. The operation ID is canonical UUID v7, tenant-scoped, non-reusable, and returns the defined operation status DTO and state machine below. |
-| `/api/0/organizations/<organization>/releases/<version>/deploys/` | `GET` and `POST` deployment records. Deployment records are release metadata and do not schedule deployment work. |
+| `/api/0/organizations/<organization>/releases/<version>/deploys/` | `GET` and `POST` deployment records. The organization-scoped release visibility predicate applies before any Deployment DTO is returned; deployment records are release metadata and do not schedule deployment work. |
 | Any other `/api/0/...` route | Any | An unknown path returns safe `404` with no persistence side effect; an unsupported method on a known supported path returns `405`; explicitly unsupported capabilities are listed below and return `501`. |
 
 Both organization-scoped and project-scoped chunk upload URLs accept the
@@ -524,7 +524,7 @@ ASCII bytes; either limit returns `400 invalid_request` before persistence.
 Project mutation responses are deterministic. Every JSON response has
 `Content-Type: application/json`, `X-Request-ID`, and
 `X-Watchtower-Request-ID`. A pending response is `202` with the exact pending
-Operation DTO, `Location` equal to its `status_url`, and `Retry-After`; a
+Operation DTO, `Location` equal to its `status_url`, and `Retry-After: 5`; a
 terminal operation response is `200` with the exact succeeded Operation DTO
 and no `Retry-After`. The operation result for a successful non-destructive
 mutation is the complete Project DTO; the result for deletion is `null`.
@@ -1001,8 +1001,8 @@ an extension surface.
 | Event | `message` | Nullable string |
 | Event | `title` | Required string |
 | Event | `culprit` | Nullable string |
-| Event | `dateCreated` | Required RFC 3339 UTC string |
-| Event | `dateReceived` | Required RFC 3339 UTC string |
+| Event | `dateCreated` | Required RFC 3339 UTC string derived from the accepted event `timestamp`; when `timestamp` is omitted, this equals `dateReceived` |
+| Event | `dateReceived` | Required RFC 3339 UTC string derived from the canonical `accepted_at` instant; this field is authoritative for event-list ordering |
 | Event | `platform` | Nullable string |
 | Event | `level` | Nullable enum: `fatal`, `error`, `warning`, `info`, or `debug`; emitted as `null` when the normalized event omitted `level` |
 | Event | `tags` | Required array of objects containing required string fields `key` and `value`, plus optional string `query`; one object is emitted per normalized tag in RFC 8785 canonical key order, `key` and `value` use the normalized tag member, `query` is always omitted because normalized tags have no query metadata, and the array is empty when no tags are present |
@@ -1013,6 +1013,18 @@ an extension surface.
 | Event | `dist` | Nullable string |
 | Event | `entries` | Required array of objects containing exactly string `type` and bounded JSON `data` |
 | Event | `metadata` | Required object containing exactly nullable string fields `type`, `value`, `filename`, and `function` |
+
+For an accepted event item, `dateReceived` is the canonical `accepted_at`
+instant recorded by Ingest, not the client-supplied event time. When present,
+the event `timestamp` is a finite JSON number of Unix seconds in the inclusive
+range `0` through `253402300799.999999999` (from 1970-01-01T00:00:00Z through
+9999-12-31T23:59:59.999999999Z) with no more than nine fractional decimal
+digits. The adapter converts it to `dateCreated` using the canonical UTC
+representation `YYYY-MM-DDTHH:mm:ss.sssssssssZ`; a missing `timestamp` uses
+the same `accepted_at` instant for `dateCreated`. A non-finite, negative,
+out-of-range, or sub-nanosecond timestamp rejects the Envelope with `400
+invalid_envelope`. Event lists order by `dateReceived DESC`, then external
+event ID, regardless of `dateCreated`.
 
 `Issue.statusDetails` is a closed object. A valid ignore contributes the
 non-negative integer `ignoreCount`, RFC 3339 UTC `ignoreUntil`, non-negative
@@ -1058,7 +1070,7 @@ payload_too_large` before lookup. `cursor` is the opaque cursor from `Link`;
 
 | Parameter | Grammar and semantics |
 | --- | --- |
-| `query` | One non-empty UTF-8 literal, with no query-language operators; Unicode-default-case-folded substring matching is applied to issue title, culprit, and message. |
+| `query` | One non-empty UTF-8 literal, with no query-language operators; Unicode-default-case-folded substring matching is applied to the issue `title` and `culprit` projections. |
 | `status` | One of `resolved`, `unresolved`, or `ignored`; it filters the current issue status. |
 | `environment` | One to 100 unique non-empty environment strings; repeated values are ORed, while different parameter names are ANDed. |
 | `cursor` | One opaque, URL-safe cursor returned by the contract's `Link` header; it cannot be combined with a different route scope or filter set. |
@@ -1074,10 +1086,12 @@ For `query` matching, the adapter computes
 `match_key(value) = NFC(DefaultCaseFold(NFC(value)))` using the Unicode 15.1
 full default case-folding table, independently of locale or database
 collation. It tests whether the folded query is a contiguous Unicode scalar
-sequence in the folded issue `title`, `culprit`, or `message`; null fields do
-not match. Full folds may expand characters, so `ß` and `ss` match one another
-after folding. Locale-specific mappings are not applied: `I` folds to `i`,
-`İ` folds to `i` followed by a combining dot, and dotless `ı` remains distinct.
+sequence in the folded issue `title` or `culprit`; null fields do not match.
+The `message` field on an individual Event DTO is not an issue-level query
+projection and never participates in issue-list matching. Full folds may
+expand characters, so `ß` and `ss` match one another after folding.
+Locale-specific mappings are not applied: `I` folds to `i`, `İ` folds to `i`
+followed by a combining dot, and dotless `ı` remains distinct.
 
 The issue `project` object uses the same field types as the project DTO but
 contains no organization or lifecycle metadata. `PUT` status transitions accept
@@ -1138,11 +1152,10 @@ non-destructive operation but is `null` for a succeeded destructive operation
 non-null result contains only the bounded resource or artifact DTO
 for the originating operation. A successful destructive operation is terminal
 by `status: "succeeded"` and never returns a deleted resource DTO. An error
-contains the standard `code`, `detail`, and `request_id` members plus optional
-bounded field errors; it never contains owner diagnostics, secrets, or payload
-data.
+contains exactly the standard `code`, `detail`, and `request_id` members; it
+never contains field errors, owner diagnostics, secrets, or payload data.
 
-The status URL returns `202` for `pending` with `Retry-After`, and `200` for
+The status URL returns `202` for `pending` with `Retry-After: 5`, and `200` for
 `succeeded` and `failed`. A terminal operation result is retained for exactly
 24 hours after its `completed_at` instant. Define `expires_at` as
 `completed_at + 24h`: a status read returns the terminal Operation DTO while
@@ -1398,11 +1411,11 @@ The smaller applicable limit wins. A request that exceeds a byte, decoded-
 payload, multipart-count, or explicit assembly-cardinality limit returns `413`
 with a safe code and request ID; it is not partially accepted. A scalar field
 that exceeds its own bounded length, such as an issue filter or browser origin,
-returns `400 invalid_request` with field-specific details instead of `413`.
-Existing organization, project, collection, artifact, and API quotas remain
-authoritative in addition to these protocol limits. Rate-limit exhaustion
-returns `429` and `Retry-After`; inability to evaluate the relevant quota
-returns `503`.
+returns `400 invalid_request` with the exact generic error object defined
+above, never field-specific details or `field_errors`. Existing organization,
+project, collection, artifact, and API quotas remain authoritative in addition
+to these protocol limits. Rate-limit exhaustion returns `429` and
+`Retry-After`; inability to evaluate the relevant quota returns `503`.
 
 For every multipart request, the decompressed byte total across all parts and
 multipart framing must remain at or below `100,000,000` bytes. The adapter
@@ -1485,6 +1498,26 @@ client's `event_id`, `timestamp`, `platform`, `level`, `message`, `exception`,
 `stacktrace`, `release`, `dist`, `environment`, `tags`, `contexts`,
 `breadcrumbs`, `sdk`, `user`, `debug_meta`, and bounded event metadata. The
 event item's `event_id` is required for a supported event.
+
+The recognized envelope-header schemas are closed. `event_id`, when present,
+is a non-null 32-character ASCII hexadecimal string using the event-ID grammar
+above and is normalized to lowercase. `dsn`, when present, is a non-null
+absolute HTTP(S) DSN URL using the DSN URL grammar above; its public key and
+project alias must match the authenticated collection DSN and route project.
+`sent_at`, when present, is a non-null RFC 3339 UTC instant and is normalized
+to the canonical nine-fraction-digit UTC representation. `sdk` is either
+`null` or an object containing exactly nullable bounded NFC-normalized string
+members `name` and `version`; omitted members serialize as `null`.
+`trace` is either `null` or an object containing required `trace_id` and
+`public_key` strings plus optional nullable `sampled` boolean and `transaction`
+string members. `trace_id` uses the 32-character hexadecimal trace-ID grammar
+and is normalized to lowercase; `public_key` is a bounded non-empty string and
+`transaction` is a bounded NFC-normalized string when non-null. Unknown or
+duplicate members, null values where a non-null value is required, wrong
+shapes, malformed timestamps or IDs, invalid DSNs, and DSN/project mismatches
+return `400 invalid_envelope` before acceptance. These transport headers are
+bounded metadata and remain outside the payload digest.
+
 `attachment` requires bounded bytes and may carry `filename`, `content_type`,
 `attachment_type`, and the integer `attachment_length`. When present,
 `attachment_length` is an integer from `0` through `20,000,000` inclusive. For
@@ -1595,6 +1628,12 @@ management schemas remain the explicit exception.
 - Management `202` means an operation is durably accepted and pending. A
   response is not rendered as completed until the owning lifecycle or artifact
   authority reports terminal success.
+- Every pending management or artifact `202` response, including an initial
+  operation response, an operation-status poll, a release-file upload, DIF
+  assembly, or artifact-bundle assembly, includes the exact decimal-seconds
+  header `Retry-After: 5`. Terminal `200` responses do not include this
+  pending-operation header. This fixed polling delay is independent of the
+  separate quota-derived `Retry-After` values for `429` and `503` responses.
 - Successful responses include a safe request ID and, where the upstream
   client expects it, the preserved external event ID. `X-Request-ID` is echoed
   or generated as a canonical lowercase UUID v7 and `X-Watchtower-Request-ID`
@@ -1906,7 +1945,7 @@ from the decompressed `file` bytes, not multipart framing or compressed bytes.
 The upload identity is
 `(tenant_id, project_id, release_version, dist_or_null, type, name)`. A first
 accepted upload returns `202` with the pending Operation DTO, a `Location`
-header equal to its `status_url`, and `Retry-After`. Polling that operation
+header equal to its `status_url`, and `Retry-After: 5`. Polling that operation
 returns `200` with `status: "succeeded"` and the registered Artifact DTO in
 `result`, or `status: "failed"` with the standard bounded operation error.
 Retries with the same identity and checksum resume the same operation or
@@ -2017,9 +2056,10 @@ requested alias, the state uses the same three values, detail is nullable safe
 text, and artifact is either `null` or the complete Artifact DTO whose
 `project` equals that alias.
 
-A pending response is `202` with top-level `state: "pending"`, the currently
-missing chunks, `detail: null`, and one pending/null project result per input
-project. A successful terminal response is `200` with `state: "succeeded"`, an
+A pending response is `202` with `Retry-After: 5`, top-level `state: "pending"`,
+the currently missing chunks, `detail: null`, and one pending/null project
+result per input project. A successful terminal response is `200` with
+`state: "succeeded"`, an
 empty `missingChunks` array, `detail: null`, and one succeeded project result
 with its registered Artifact DTO for every input project. A terminal owner
 failure is `200` with `state: "failed"`, a non-null safe top-level detail, and
@@ -2139,6 +2179,12 @@ returned as indistinguishable `404 not_found` for detail. An unassociated
 release is visible only to a principal with organization-level `Owner` or
 `Admin` authority. No organization-scoped Release DTO exposes an unreadable
 project's ID, slug, or name.
+The same eligibility predicate applies before every organization-scoped
+release subresource read, including `/commits/` and `/deploys/`: an associated
+release requires at least one currently readable associated project, while an
+unassociated release requires organization-level `Owner` or `Admin` authority.
+An ineligible release returns indistinguishable `404 not_found` before commit
+IDs or Deployment DTO metadata are selected or serialized.
 For `previous-with-commits`, readable-project scope is applied before candidate
 ordering and selection, so a candidate associated only with unreadable
 projects is not eligible and produces the standard `404 not_found` when no
@@ -2387,10 +2433,14 @@ exercise:
   enforcement; equivalent payloads with different
   compression, JSON ordering, or excluded metadata; message-only and
   stacktrace-only error events, exception events, deterministic multi-entry
-  Event DTO serialization and ordering, nullable level mapping, deterministic
+  Event DTO serialization and ordering, `timestamp` to `dateCreated` mapping,
+  `accepted_at` to `dateReceived` mapping, missing-timestamp fallback,
+  nanosecond precision/range rejection, nullable level mapping, deterministic
   tag-array serialization, invalid levels, event items with no
   error signal, strict `user`/`sdk` type validation and null/missing/unknown
-  member mapping, and NFC-normalized key collisions before hashing;
+  member mapping, strict Envelope `event_id`/`dsn`/`sent_at`/`sdk`/`trace`
+  header schemas and invalid-shape rejection, and NFC-normalized key collisions
+  before hashing;
 - new and duplicate chunks with exact `200` empty responses, conflicting
   chunks, interrupted assembly, optional and conflicting DIF idempotency keys,
   retries, polling, and lost responses, including non-terminal `not_found` and
@@ -2442,6 +2492,8 @@ exercise:
   consistency;
 - exact issue/event DTO bodies, nullable fields, omitted unknown fields,
   omission of `permalink`, and strict `user`/`sdk` serialization,
+  canonical Event `dateCreated`/`dateReceived` timestamp mappings and exact
+  invalid-timestamp behavior,
   every `statusDetails` member's exact type, nullability, and status-dependent
   presence condition, including Actor and reprocessing-info shapes,
   list/detail/status-transition consistency, tenant-unique issue aliases, CLI
@@ -2460,7 +2512,8 @@ exercise:
   100, deterministic over-limit `413` responses, skipped no-commit releases,
   deterministic ordering/tie-breaking, normalized project/environment array
   ordering, readable-project candidate filtering before selection,
-  inaccessible-project filtering, no-match behavior, and the pinned
+  inaccessible-project filtering, the same visibility gate for organization
+  `/commits/` and `/deploys/` reads, no-match behavior, and the pinned
   sentry-cli parsing workflow, including organization release list/detail
   filtering for readable projects and unassociated-release organization
   authority;
@@ -2480,7 +2533,8 @@ exercise:
   response headers, and rejection of unknown members;
 - issue queries with NFC plus Unicode 15.1 default case folding, `ß`/`ss`,
   locale-independent Turkish case behavior, and folded Unicode-scalar
-  substring matching; Envelope items carrying arbitrary `item_count` or
+  substring matching over only the Issue `title` and `culprit` projections,
+  including message-only non-matches; Envelope items carrying arbitrary `item_count` or
   `item_headers` values on supported and excluded types, confirming they are
   ignored and do not alter acceptance or the payload digest;
 - DSN issuance with required name and nullable platform, empty-object rotation,
@@ -2512,7 +2566,8 @@ exercise:
   staging reuse for disabled targets, and `403` at disabled-project assembly;
 - chunk requests at and over the advertised `maxRequestSize`, including
   duplicate and rejected parts, with `413` and no partial persistence for an
-  over-limit request, `400` for overlong scalar fields, platform-token grammar,
+  over-limit request, `400` for overlong scalar fields with the exact generic
+  body and no `field_errors`, platform-token grammar,
   exact scalar byte boundaries, recursive event depth/member/array boundaries,
   and URL/text limits, plus
   DIF/artifact-bundle assembly cardinality at and over each explicit digest,
@@ -2530,7 +2585,8 @@ exercise:
   rotation/revocation, issue/event reads, resolve/reopen/ignore/mute/next-release,
   release requests without client idempotency keys, and deployment workflows
   with an always-null `dateStarted`;
-- operation polling with `202 pending`, `200 succeeded`, `200 failed`, the
+- operation polling with `202 pending` and exact `Retry-After: 5`, `200
+  succeeded`, `200 failed`, the
   top-level `410 operation_expired` error at and after the exact
   `completed_at + 24h` cutoff, unknown-operation `404`, and owner-outage `503`
   responses;
@@ -2539,8 +2595,9 @@ exercise:
 - single- and multi-entry DIF assembly retries using the canonical sorted
   checksum-keyed request-map digest, excluding the idempotency key and
   preserving chunk order;
-- artifact-bundle polling with exact pending `202`, ordered per-project
-  results for one and 100 projects, all-or-nothing successful/failed terminal
+- artifact-bundle polling with exact pending `202` and `Retry-After: 5`,
+  ordered per-project results for one and 100 projects, all-or-nothing
+  successful/failed terminal
   states, sorted missing-chunk arrays for missing/expired terminal failures,
   empty arrays for other terminal failures, safe details, and nullability;
 - deployment writes with the closed JSON body, omitted/null normalization,
