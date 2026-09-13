@@ -399,11 +399,15 @@ accepted event in that same tenant and project. It evaluates the existing
 Envelope idempotency identity
 `(tenant_id, project_id, external_event_id, payload_digest)` before rejecting
 the upload state. An exact retry whose retained acceptance record already
-bound the same upload and attachment digest to the same event returns the
+bound the same upload ID and attachment digest to the same event returns the
 original acceptance, even when the upload is now `bound`; it does not create a
 second attachment or transition. The retained binding record includes the
 upload ID, event ID, payload digest, attachment digest and length, and original
-acceptance. A retry with the same event ID and a different digest remains the
+acceptance. If the same Envelope identity matches a retained acceptance but
+references a different upload ID, the adapter returns `409 conflict` without
+creating a second binding or attachment transition; the original binding
+remains authoritative and the other upload remains `complete-unbound` subject
+to expiry. A retry with the same event ID and a different digest remains the
 documented `409 conflict`; an otherwise unmatched `bound` upload remains
 inaccessible. Only a first acceptance requires `complete-unbound` with the
 declared length, and it atomically transitions that state to `bound` while
@@ -535,13 +539,20 @@ headers, no `Content-Type`, and no JSON error body. The conceptual error remains
 `unsupported_capability`. Unknown paths return `404`, while an unsupported
 method on a known supported path returns `405`.
 
-Organization path slugs are globally unique compatibility aliases and are
-resolved before tenant selection. Project path slugs are compatibility aliases
-unique within their organization and are resolved only after the canonical
-tenant is selected. Ordinary organization and project reads use these path
-aliases and current authorization without supplying an expected resource
-generation; project generation matching is a mutation precondition only for
-the project settings and deletion requests that carry
+Organization path slugs are globally unique compatibility aliases. Every
+`<organization>` occurrence is one RFC 3986 URI path segment: clients
+percent-encode the slug's UTF-8 bytes, including reserved bytes such as `/`,
+`?`, `#`, and `%`; `+` is a literal plus in a path and is not decoded as a
+space. The adapter segments the raw path before decoding exactly once,
+rejects malformed escapes, invalid UTF-8, controls, and an empty decoded slug
+with `400 invalid_request`, then resolves the decoded slug globally before
+tenant selection. Query-string bytes and a second decode can never alter the
+organization alias. Project path slugs are compatibility aliases unique within
+their organization and are resolved only after the canonical tenant is
+selected. Ordinary organization and project reads use these path aliases and
+current authorization without supplying an expected resource generation;
+project generation matching is a mutation precondition only for the project
+settings and deletion requests that carry
 `X-Watchtower-Project-Generation`. A project slug cannot select a resource in
 another tenant. A deleted resource's slug may be reused only after deletion
 completes and only by a new resource generation. A replacement receives a new
@@ -637,9 +648,14 @@ Project mutation responses are deterministic. Every JSON response has
 `Content-Type: application/json`, `X-Request-ID`, and
 `X-Watchtower-Request-ID`. A pending response is `202` with the exact pending
 Operation DTO, `Location` equal to its `status_url`, and `Retry-After: 5`; a
-terminal operation response is `200` with the exact succeeded Operation DTO
-and no `Retry-After`. The operation result for a successful non-destructive
-mutation is the complete Project DTO; the result for deletion is `null`.
+terminal operation response is `200` with the exact terminal Operation DTO and
+no `Retry-After`. A successful terminal operation has `status: "succeeded"`;
+its result for a non-destructive mutation is the complete Project DTO, while
+the result for deletion is `null`. If a project creation, update, or deletion
+fails after becoming pending because of an owner, lifecycle, or artifact
+dependency, the terminal response instead has `status: "failed"`,
+`result: null`, and the standard non-null Operation `error` object; it never
+reports the mutation as a successful Project DTO result.
 
 | Mutation | Initial request | Pending poll or duplicate | Terminal or completed duplicate |
 | --- | --- | --- | --- |
@@ -902,7 +918,7 @@ are omitted, never emitted as `null`, and never become an extension surface.
 | Organization | `dateCreated` | Required UTC timestamp serialized exactly as `YYYY-MM-DDTHH:mm:ss.sssssssssZ` |
 | Organization | `isEarlyAdopter` | Required boolean, always `false` in the compatibility representation |
 | Organization | `require2FA` | Required boolean, always `false` in the compatibility representation |
-| Project | `id` | Required non-empty string compatibility alias; never a Watchtower canonical ID |
+| Project | `id` | Required canonical lowercase UUID v7 API-owned persistent project identifier; never a compatibility alias |
 | Project | `slug` | Required string compatibility alias |
 | Project | `name` | Required string |
 | Project | `platform` | Nullable string; `null` means no platform is configured |
@@ -2900,7 +2916,7 @@ unsupported release-health behavior.
   and internal
   resource identities are canonical lowercase UUID v7 values at Watchtower
   boundaries and PostgreSQL `uuid` when persisted by their owner.
-- Sentry project IDs, release versions, and event IDs are
+- Sentry project IDs supplied in compatibility routes, release versions, and event IDs are
   compatibility aliases or scoped external identifiers. Issue IDs and short
   IDs are globally unique compatibility aliases across tenants and are never
   reused across project generations. Organization slugs are globally
