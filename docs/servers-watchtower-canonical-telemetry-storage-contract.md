@@ -1397,7 +1397,7 @@ issues:
 | Issue | Remaining authority |
 | --- | --- |
 | #15 | [Control-plane resources, WorkOS authentication, authorization, roles, project lifecycle, credentials, non-export quotas, and detailed audit access](servers-watchtower-control-plane-contract.md) |
-| #16 | Sentry-compatible routes, DTOs, request semantics, and protocol compatibility mappings |
+| #16 | [Sentry-compatible routes, DTOs, request semantics, and protocol compatibility mappings](servers-watchtower-sentry-compatibility-contract.md) |
 | #17 | Ingestion admission, capacity behavior, and detailed durable raw-to-processing handoff |
 | #18 | Normalization, privacy processing, enrichment, and processing policy |
 | #19 | Error grouping, issue aggregates, and issue lifecycle |

@@ -22,8 +22,9 @@ commands to `watchtower-api`, and native or compatible queries to
 `watchtower-query`. It does not own business behavior.
 
 Sentry-compatible event ingestion and management APIs preserve the upstream
-routes and request semantics required by the supported interface. Native
-Watchtower business APIs use `/api/v1`.
+routes and request semantics required by the
+[`Sentry compatibility contract`](servers-watchtower-sentry-compatibility-contract.md).
+Native Watchtower business APIs use `/api/v1`.
 
 Initial synchronous component calls use unary Protobuf-over-HTTP under
 `/internal/v1`. Internal streaming, gRPC, and Connect RPC are not part of
