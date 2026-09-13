@@ -236,7 +236,7 @@ to a native route.
 | `/api/<project_id>/envelope/` | `OPTIONS` | Collection-only DSN in the DSN query parameters or DSN URL, project alias, and request `Origin` | Supported only for a configured project-origin CORS preflight. The DSN authenticates and tenant-binds the project alias before the allowlist is read. Returns `204` with no persistence side effect; missing or invalid DSN authentication receives `401 invalid_authentication`, while a missing, malformed, or disallowed origin, including a project with no configured allowlist, receives `403 permission_denied` with no CORS allow headers. |
 | `/api/<project_id>/store/` | `POST` | Collection-only DSN | Supported legacy JSON error path required by a pinned client. The body is converted to one error event and follows Envelope admission semantics. Malformed JSON, an invalid body shape, or invalid required event fields return `400 invalid_envelope` with no acceptance side effect. Successful admission returns `200` with a zero-length body and request-ID headers. |
 | `/api/<project_id>/minidump/` | `POST` | Collection-only DSN | Supported for pinned crash workflows whose fixture specifies the non-Envelope minidump path. `multipart/form-data` and the pinned client field names are accepted. Successful admission returns `200` with a zero-length body and request-ID headers. |
-| `/api/<project_id>/upload/` | `POST` | Collection-only DSN | Supported pinned Native large-attachment TUS creation route. A valid integer `Upload-Length` from `0` through `20,000,000`, `Tus-Resumable: 1.0.0`, and `Upload-Metadata: sentry <base64({"attachment_type":"event.minidump"})>` request returns `201` with an absolute HTTP(S), project-bound `Location` containing a canonical lowercase UUID v7 `upload_id`, `Tus-Resumable: 1.0.0`, and `Upload-Offset: 0`; a zero-length upload is created directly as `complete-unbound`, while a positive-length upload is pending. Neither creation path accepts attachment bytes. A pending upload has a fixed 24-hour lifetime beginning at creation. |
+| `/api/<project_id>/upload/` | `POST` | Collection-only DSN | Supported pinned Native large-attachment TUS creation route. A valid integer `Upload-Length` from `0` through `20,000,000`, `Tus-Resumable: 1.0.0`, and `Upload-Metadata: sentry <base64({"attachment_type":"event.minidump"})>` request returns `201` with an absolute HTTP(S), project-bound `Location` containing a canonical lowercase UUID v7 `upload_id`, `Tus-Resumable: 1.0.0`, and `Upload-Offset: 0`; a zero-length upload is created directly as `complete-unbound`, while a positive-length upload is pending. Neither creation path accepts attachment bytes. A pending upload has a fixed 24-hour lifetime beginning at creation and consumes the project-scoped TUS staging slot/byte reservation defined by #17. |
 | `/api/<project_id>/upload/<upload_id>` | `HEAD`, `PATCH` | Collection-only DSN bound to the upload | Supported pinned Native TUS offset and append workflow. `HEAD` requires request `Tus-Resumable: 1.0.0` and, on success, returns `200` with an empty body and `Tus-Resumable: 1.0.0`, `Upload-Offset`, and `Upload-Length` response headers. Missing or unsupported `Tus-Resumable` returns `412 precondition_failed`; a missing, expired, already-bound, or inaccessible upload returns `404 not_found`, and invalid authentication returns `401 invalid_authentication`. A failed `HEAD` has no response body or `Content-Type`; it returns only its status, `Tus-Resumable: 1.0.0`, request-ID headers, and `Content-Length: 0`, with no `Upload-Offset` or `Upload-Length`. `PATCH` requires `Tus-Resumable: 1.0.0`, `Upload-Offset`, and `application/offset+octet-stream`, appends only at the expected offset, and returns `204` with an empty body, `Tus-Resumable: 1.0.0`, and the new `Upload-Offset`. A stale or mismatched offset returns `409 conflict` with the current `Upload-Offset`; bytes that would exceed `Upload-Length` return `413 payload_too_large` with the current `Upload-Offset`. Every `PATCH` response, including precondition, authentication, not-found, stale-offset, and overflow failures, includes `Tus-Resumable: 1.0.0`; failed `PATCH` requests retain the standard JSON error body and atomically append no bytes. Reaching the declared length transitions the upload to `complete-unbound`; it remains subject to attachment and project limits and is not accepted until the subsequent Envelope binds it to an event. |
 | `/api/<project_id>/security-report/` | `POST` | Collection-only DSN | Explicitly unsupported in v1; returns `501 unsupported_capability` with no persistence side effect because security reports are not error telemetry. |
 | Any other `/api/<project_id>/...` ingestion route | Any | Any | `404` or `405` according to whether the path or method is unknown; no side effect. An unknown-path `HEAD` is status/header-only as defined below. |
@@ -258,8 +258,12 @@ error remains `method_not_allowed`. The route-specific values are:
 | `/api/<project_id>/upload/<upload_id>` | `HEAD, PATCH` |
 
 The explicitly unsupported `/api/<project_id>/security-report/` route retains
-its `501 unsupported_capability` result for every method and does not use this
-`405` rule. Unknown paths remain `404` and do not emit `Allow`.
+its `501 unsupported_capability` result for `POST`. Other non-`HEAD` methods
+on that known path return `405 method_not_allowed` with `Allow: POST`; `HEAD`
+returns the bodyless `501` status/header-only response with
+`Content-Length: 0`, no `Content-Type`, and no JSON body. Unknown paths remain
+`404` and do not emit `Allow`; an unknown-path `HEAD` uses the same bodyless
+status/header-only rule.
 
 `project_id` is a compatibility alias accepted only at the adapter boundary.
 It resolves to one canonical lowercase UUID v7 project identity within the
@@ -1716,14 +1720,18 @@ same cross-transport event-ID compatibility record as Envelope and legacy
 digest, source protocol metadata, and canonical event reference. The #17 raw
 admission fence governs whether it is still an admission duplicate or conflict:
 it lasts seven days from first acceptance and is not extended by a retry. For
-minidumps, `minidump_digest` remains the transport payload digest while #17
-also compares the decompressed original crash content for raw admission. A
-matching scoped event ID and raw content within the active fence returns the
-original `200` empty-body acceptance; different bytes or metadata return
-`409 conflict` without a second acceptance. After the raw fence expires, the same
-event ID may begin a new acceptance generation; query retention does not
-extend the Ingest admission fence. The Ingest acceptance record retains the
-digest and identity for the raw-handoff acceptance horizon.
+minidumps, `minidump_digest` is also #17's `admission_content_digest`: it
+includes the decompressed dump bytes, normalized Crashpad annotations, and
+normalized Sentry metadata while excluding multipart boundaries, part ordering,
+and transport compression. A matching scoped event ID and digest within the
+active raw fence returns the original `200` empty-body acceptance; different
+dump bytes or metadata return `409 conflict` without a second acceptance.
+After the seven-day raw fence expires, the same event ID still cannot create a
+new public generation while the older canonical event's alias remains
+queryable; the compatibility record remains authoritative until the
+query-retention alias fence expires. The Ingest admission tombstone retains the
+non-payload digest and identity through the raw fence even if raw state has
+already retired.
 
 ### Explicit limits
 
@@ -2196,18 +2204,24 @@ tie-breaker.
   `(tenant_id, project_id, source_protocol, external_event_id,
   admission_generation, admission_content_digest)`. Its minimal duplicate and
   conflict fence lasts seven days from first acceptance and is not extended by
-  retries. `admission_content_digest` compares decompressed original supported
-  event bytes, so JSON whitespace and member-order changes are different raw
-  content; transport authentication, compression, and framing are excluded.
+  retries. For Envelope and legacy `store`, `admission_content_digest` compares
+  decompressed original supported event bytes, so JSON whitespace and
+  member-order changes are different raw content; multipart minidumps use the
+  deterministic `minidump_digest` preimage defined above. Transport
+  authentication, compression, and framing are excluded.
   A matching identity returns the original acceptance, while different raw
   content under the active event-ID fence returns `409 conflict` with no new
   acceptance or charge. The #16 semantic `payload_digest` remains recorded for
   compatibility and downstream canonical processing, but it does not extend
   or replace the raw admission fence. These checks occur after complete
   structural validation and before the environment retirement fence or any
-  new acceptance side effect. After seven days, the same external event ID may
-  create a new acceptance generation; query retention does not preserve an
-  Ingest duplicate or conflict guarantee.
+  new acceptance side effect. After seven days, raw duplicate/conflict state
+  may expire, but the same external event ID cannot create a new public
+  generation while the older canonical event remains queryable. The
+  compatibility record continues to own the alias through the effective query
+  retention cutoff; matching retries resolve to that record and conflicting
+  content returns `409 conflict`. Only after that alias fence expires may a new
+  public acceptance generation reuse the event ID.
 - An accepted Envelope with no retained supported event item uses a separate
   no-op/client-report retry identity when the caller supplied a valid canonical
   `X-Request-ID`: `(tenant_id, project_id, client_request_id, payload_digest)`.
@@ -2977,15 +2991,18 @@ unsupported release-health behavior.
   `(tenant_id, project_id, external_event_id)`. Two projects may use the same
   event ID without collision or disclosure, and source protocol is retained as
   bounded identity metadata. The record stores the accepted transport digest
-  and canonical event reference for the current admission generation; it is a
-  compatibility projection, not a lifetime deduplication fence. The separate
-  #17 raw-admission duplicate and conflict fence lasts seven days from first
-  acceptance and is not extended by retries. After that fence expires, the same
-  event ID may begin a new acceptance generation and the compatibility
-  projection may point to that current generation while older canonical data
-  remains governed by Query and retention. An event ID is never a canonical
-  Watchtower primary key. An event ID carried only by an empty or excluded-only
-  Envelope is not registered and may be reused by a later supported event.
+  and canonical event reference for the current admission generation. It is a
+  compatibility projection, not the raw seven-day deduplication fence, but it
+  also owns the public alias while the referenced canonical event remains
+  queryable, for 90 days by default or the shorter effective query-retention
+  cutoff. The separate #17 raw-admission duplicate and conflict fence lasts
+  seven days from first acceptance and is not extended by retries. A matching
+  retry resolves to the retained compatibility record; conflicting content or
+  an attempted new public generation returns `409 conflict`. The projection
+  cannot point to a later generation until the older alias fence expires. An
+  event ID is never a canonical Watchtower primary key. An event ID carried
+  only by an empty or excluded-only Envelope is not registered and may be
+  reused by a later supported event.
 - API owns control-plane, project, DSN, release, artifact, operation, and audit
   authority. Ingest owns raw accepted records and recoverable handoff. Processor
   owns processing, canonical telemetry, symbolication, and derived issue data.
@@ -3092,9 +3109,10 @@ exercise:
   bounded fields, deterministic `400 invalid_request` no-side-effect failures,
   the successful `200` zero-length acknowledgement, and shared
   cross-transport event-ID compatibility with Envelope/store ingestion,
-  seven-day raw-admission duplicate/conflict behavior, new acceptance after
-  the raw fence expires while the canonical event remains queryable, and
-  conflicting admission content returning `409`;
+  deterministic `minidump_digest` equality across multipart boundary and part
+  ordering changes, metadata/dump changes returning `409`, seven-day
+  raw-admission duplicate/conflict behavior, and alias retention preventing a
+  new public generation while the canonical event remains queryable;
 - `sdk.native.crash` using the exact multipart minidump request and
   `sdk.native.tus-minidump` using the separate TUS creation/append and Envelope
   `attachment-ref` binding workflow;
@@ -3118,6 +3136,8 @@ exercise:
   and failed `PATCH`, atomic no-append behavior for both failures,
   incomplete-upload retention, finalization at the declared length,
   the 24-hour pending and complete-unbound lifetimes, no extension by append,
+  project-scoped staging byte/count exhaustion, idempotent release on expiry,
+  and conversion on binding,
   and exact `now >= expires_at` behavior,
   failed-`HEAD` status/header-only responses with `Content-Length: 0`, the
   exact closed `{url,path}` reference object and relative-path validation,
