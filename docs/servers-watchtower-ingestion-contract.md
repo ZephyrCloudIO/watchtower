@@ -119,11 +119,17 @@ relative path. The reference JSON length is not the attachment byte length.
 | Minidump | `multipart/form-data` with a boundary | identity, gzip |
 | TUS `PATCH` | `application/offset+octet-stream` | identity only |
 
-Unsupported `Content-Encoding` is `415 unsupported_media_type`; a malformed
-gzip stream is `400 invalid_compression`; malformed multipart boundaries are
+Collection authentication is the first admission step. Ingest authenticates
+the current project-scoped collection DSN before validating the content
+encoding or type, decoding the body, or evaluating the post-authentication
+project and lifecycle lookup. Unsupported `Content-Encoding` is
+`415 unsupported_media_type`; a malformed gzip stream is
+`400 invalid_compression`; malformed multipart boundaries are
 `400 invalid_multipart`; and a mismatched or unsupported content type is
-`415 unsupported_media_type`. These failures occur before payload persistence,
-quota reservation, lookup, or environment registration.
+`415 unsupported_media_type`. After authentication, these failures occur
+before payload persistence, quota reservation, project lookup, or environment
+registration, so an invalid DSN retains the #16 `401 invalid_authentication`
+precedence even when the body is malformed.
 
 Envelope framing is newline-delimited JSON headers followed by item payloads.
 The envelope header is required. An item with `length` uses authoritative
@@ -499,9 +505,9 @@ The request-to-handoff states are:
 | Transport decoded | Content type, encoding, framing, decoded bytes, duration, concurrency, and memory bounds hold. | `400`/`413`/`415`/`invalid_compression`/`invalid_multipart`/`504` as applicable. |
 | Unit validated | Supported event, crash, attachment, or no-op shape is valid; unsupported items have no allocated payload retention. | `400 invalid_envelope` or `400 invalid_request` for invalid units; valid exclusions remain eligible for bounded no-op success. |
 | Identity checked | Deduplication, event content, parent, upload, environment, and lifecycle generations are checked. | `200` duplicate, `409 conflict`, or continued admission. |
-| Quota reserved | API-owned policy and Ingest reservation state agree for the unit; reservation is scoped and idempotent. | `429 rate_limited`, `503 unavailable`, or continued admission. |
+| Quota reserved | API-owned policy and Ingest reservation state agree for the unit, including no-op/client-report capacity where applicable; reservation is scoped and idempotent. | `429 rate_limited`, `503 unavailable`, or continued admission. |
 | Raw staged and verified | For a payload-bearing unit, the immutable S3 object is complete and its SHA-256 and exact byte size match the accepted content. A valid no-op or client-report unit allocates no raw object and instead carries only bounded metadata. | No payload-bearing success is reported before verification. Failed or uncertain attempts are cleaned or reconciled. |
-| Acceptance committed | For a payload-bearing unit, PostgreSQL acceptance metadata, final quota charge state, dedup/attachment identity, and transactional outbox commit together. For a no-op or client-report unit, bounded acceptance metadata and a recoverable no-op handoff commit without a raw object. | `200` with empty body and request IDs. |
+| Acceptance committed | For a payload-bearing unit, PostgreSQL acceptance metadata, final quota charge state, dedup/attachment identity, and transactional outbox commit together. For a no-op or client-report unit, bounded acceptance metadata, its no-op admission reservation/charge state, and a recoverable no-op handoff commit without a raw object. | `200` with empty body and request IDs. |
 | Handoff pending/published | Outbox publication to MSK is retryable and carries only bounded protocol-neutral metadata or an owner-issued raw reference. | Public success remains valid; no synchronous Processor visibility is claimed. |
 | Processor dispositioned | Processor has durably completed or terminally rejected the handoff and Ingest has durably recorded the disposition. | No later public response is generated; raw retirement follows the disposition/fence contract. |
 | Expired/fenced/quarantined | Retention, deletion, or permanent-failure fence prevents stale fetch, disposition, replay, and resurrection. | New requests map to the appropriate #16 `401`, `403`, `409`, or `503`; no payload revival. |
@@ -509,9 +515,10 @@ The request-to-handoff states are:
 For a payload-bearing unit, public success means only that the immutable raw
 object, verified digest and size, acceptance metadata, final reservation/charge
 state, and recoverable outbox are committed. For a valid no-op or client-report
-unit, public success means that its bounded acceptance metadata, final quota
-state where applicable, and recoverable no-op handoff are committed; it has no
-raw object, payload digest/size, or payload reference. Neither form of success
+unit, public success means that its bounded acceptance metadata, committed
+`no_op_admission` reservation/charge state, and recoverable no-op handoff are
+committed; it has no raw object, payload digest/size, or payload reference.
+Neither form of success
 means MSK publication, Processor completion, normalization, grouping,
 symbolication, canonical storage, or Query visibility.
 
@@ -542,8 +549,8 @@ by exactly that many payload bytes. The manifest has schema
     {
       "kind": "attachment",
       "content_type": "application/octet-stream",
-      "filename": "optional-name",
-      "attachment_type": "optional-type",
+      "filename": "example.log",
+      "attachment_type": "event.attachment",
       "length": 456,
       "sha256": "lowercase-hex-sha256-of-this-payload"
     },
@@ -570,10 +577,17 @@ by exactly that many payload bytes. The manifest has schema
 }
 ```
 
-The event section contains the validated decompressed event bytes and each
-attachment section contains the validated decoded or dereferenced attachment
-bytes, and a minidump section contains the validated decompressed
-`upload_file_minidump` bytes. A minidump descriptor's `metadata` is the exact
+The event section contains the RFC 8785 canonical-JSON bytes for the retained,
+normalized event object after the adapter boundary removes unknown event
+members; it never contains the original decompressed event bytes. Within an
+ordinary attachment descriptor, `filename`, `content_type`, and
+`attachment_type` are serialized only when present in the accepted metadata.
+An absent field is omitted entirely, never encoded as `null`, an empty string,
+or a default value. Present fields and all retained descriptors use their
+accepted values in the canonical manifest. Each attachment section contains
+the validated decoded or dereferenced attachment bytes, and a minidump section
+contains the validated decompressed `upload_file_minidump` bytes. A minidump
+descriptor's `metadata` is the exact
 normalized `watchtower.sentry.minidump.v1` digest object, including the Sentry
 event context and Crashpad annotation map, so all validated multipart inputs
 needed by Processor are retained in the raw object rather than only in
@@ -594,10 +608,10 @@ Acceptance metadata for payload-bearing units records the object key, digest,
 size, container schema, `accepted_at`, tenant, project, raw-unit `watchtower_id`,
 parent linkage where applicable, source protocol/format version, dedup
 generation, retention cutoff, quota reservation/charge identity, and outbox
-state. No-op and
-client-report records omit payload object key, digest, size, and reference and
-retain only their bounded diagnostics and handoff state. No incomplete object
-or unverified digest is a payload-bearing accepted record.
+state. No-op and client-report records omit payload object key, digest, size,
+and reference and retain only their bounded diagnostics, no-op admission
+reservation/charge state, and handoff state. No incomplete object or
+unverified digest is a payload-bearing accepted record.
 
 The versioned raw handoff family includes protocol-neutral initial-unit and
 later-attachment variants. Payload-bearing variants carry project scope,
@@ -641,11 +655,32 @@ Staging exhaustion returns `429 rate_limited`; an unavailable or stale staging
 policy returns `503 unavailable`. These reservations are separate from error
 quantity and final attachment-byte charges.
 
+The project policy also includes a project-scoped `no_op_admission` count
+budget, rate budget, and rate window with a policy generation. The class applies
+to every durably accepted empty, unsupported-only, client-report-only, or
+uncorrelated attachment-only unit. Ingest reserves one count and consumes the
+configured rate capacity after duplicate resolution and before acceptance,
+keyed by tenant, project, no-op/client-report retry identity, and policy
+generation. A matching durable duplicate reuses its reservation and consumes
+neither another count nor another rate unit. For an event-bearing request,
+auxiliary no-op or client-report reservations commit or roll back atomically
+with the event result.
+
+The count reservation remains held while the acceptance metadata, no-op
+handoff/outbox, or retry tombstone remains live. Terminal handoff plus expiry
+and confirmed physical cleanup release it exactly once; delayed or failed
+cleanup continues to consume the project count budget. Rate capacity expires
+at the configured window and is reconciled by the same reservation identity.
+Exhausted no-op count or rate capacity returns `429 rate_limited`; an absent,
+stale, or unsafe no-op policy returns `503 unavailable`. No-op admission
+reservations are separate from error-quantity and final attachment-byte
+charges, and they cannot be bypassed by the shared safe-backlog limit.
+
 The admission sequence is:
 
 1. Resolve a matching durable duplicate before creating a new reservation.
-2. Reserve the applicable error quantity and/or attachment bytes with an
-   idempotent reservation identity.
+2. Reserve the applicable error quantity, attachment bytes, and/or
+   `no_op_admission` capacity with an idempotent reservation identity.
 3. Before the acceptance transaction, revalidate the reservation generation,
    project/organization state, DSN authorization revision, environment
    generation, retention/deletion fence, and security-projection freshness.
@@ -655,10 +690,14 @@ The admission sequence is:
    never assume rollback and never charge a retry twice.
 
 Error quantity limits and quantities are owned by #19. Protocol limits are
-owned by #16. Ingest owns attachment-byte charge mechanics and the reservation
-fence, but it does not invent #19's quantity values. Rejections, exclusions,
-conflicts, and duplicates add no charge. Processing failure, quarantine, and
-retention expiry do not refund a durable accepted charge.
+owned by #16. API owns the project policy generation; the #17 operating
+contract supplies the required `no_op_admission` count, rate, and rate-window
+values without defining numeric product defaults. Ingest owns attachment-byte
+and no-op admission reservation mechanics and their fences, but it does not
+invent #19's quantity values. Rejections, exclusions, conflicts, and
+duplicates add no charge or new reservation. Processing failure, quarantine,
+and retention expiry do not refund a durable accepted charge; no-op reservation
+release follows the cleanup lifecycle above.
 
 Accepted work may accumulate only within configured safe backlog count, bytes,
 and age. When safe capacity is exhausted, new work returns `503 unavailable`
@@ -672,7 +711,8 @@ Required operating values are implementation gates, not defaults in this
 contract. Before implementation, the owning operating contract must record and
 load-validate request deadline, maximum concurrent requests, maximum concurrent
 decoders/decompressors, bounded decoded-memory budget, project TUS staging
-byte/count budgets and reservation reconciliation, retry base/max/jitter,
+byte/count budgets, project no-op/client-report admission count/rate/window
+budgets and reservation reconciliation, retry base/max/jitter,
 reconciliation cadence, quarantine count/bytes/age, backlog count/bytes/age,
 and `Retry-After` derivation. Missing or invalid values prevent startup.
 Load testing must verify that malformed, oversized, compressed, slow, or
@@ -751,7 +791,7 @@ recorded and testable:
 | --- | --- | --- |
 | Supported protocol formats, routes, limits, and compatibility responses | #16 | The exact values restated in this contract. |
 | Error quantity limits and collection quantity semantics | #19 | Error-unit quantities and their authoritative quota windows. |
-| Operating values | #17 operating contract | Deadlines, concurrency, decoder/decompressor limits, memory, TUS staging byte/count budgets, backlog, quarantine, retry, reconciliation, and alert thresholds. |
+| Operating values | #17 operating contract | Deadlines, concurrency, decoder/decompressor limits, memory, TUS staging byte/count budgets, no-op/client-report admission count/rate/window budgets, backlog, quarantine, retry, reconciliation, and alert thresholds. |
 
 The verification specification must use synthetic fixtures and prove:
 
@@ -770,9 +810,11 @@ The verification specification must use synthetic fixtures and prove:
 - equal and different attachment identities, initial-attachment-set duplicate
   and conflict behavior, attachment-before-parent, pre-processing attachment
   delivery, expired/deleted parents, TUS binding, and parent retention cutoffs;
-- reservation races, one-charge duplicate handling, TUS staging byte/count
-  exhaustion, delayed-cleanup reservation retention, deletion-confirmed
-  release/conversion, quota exhaustion, environment
+- authentication precedence over malformed transport, reservation races,
+  one-charge duplicate handling, TUS staging byte/count exhaustion,
+  no-op/client-report count/rate exhaustion and per-project isolation,
+  duplicate reservation reuse, delayed-cleanup reservation retention,
+  deletion-confirmed release/conversion, quota exhaustion, environment
   registration/retirement/reactivation races, unsafe enforcement, service
   overload, and bounded Retry-After behavior;
 - failures before and after S3 verification, PostgreSQL/outbox commit, MSK
@@ -781,8 +823,10 @@ The verification specification must use synthetic fixtures and prove:
   conflicting dispositions;
 - bounded decoding, decompression, duration, concurrency, memory, no-op and
   client-report acceptance without a raw object, client-report cardinality
-  mapping, deterministic multipart minidump digests with retained metadata,
-  deterministic `RawUnitContainerV1` framing/digests, completed-disposition
+  mapping, no-op reservation lifecycle and operating-value validation,
+  deterministic multipart minidump digests with retained metadata,
+  deterministic `RawUnitContainerV1` framing/digests with unknown event-member
+  removal and absent attachment-field omission, completed-disposition
   tombstones, backlog, quarantine, mandatory
   Processor-outage expiry sweeps, retention expiry, and deletion behavior; and
 - safe logs/traces/metrics, immediate risk paging, mTLS/ACL isolation,
