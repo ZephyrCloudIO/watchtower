@@ -48,7 +48,7 @@ the component contract without updating it.
 | Canonical telemetry, authoritative data classes, and storage model | #14, [`canonical telemetry and storage model`](servers-watchtower-canonical-telemetry-storage-contract.md) |
 | Control plane, roles, authorization, WorkOS behavior, and credential lifecycle | #15, [`control plane and authorization`](servers-watchtower-control-plane-contract.md) |
 | Sentry routes, DTOs, request semantics, and compatibility matrix | #16, [`Sentry compatibility contract`](servers-watchtower-sentry-compatibility-contract.md) |
-| Ingestion admission and durable raw-to-processing handoff | #17, `ingestion admission and durable handoff` |
+| Ingestion admission and durable raw-to-processing handoff | #17, [`ingestion admission and durable handoff`](servers-watchtower-ingestion-contract.md) |
 | Normalization, privacy, enrichment, and processing policy | #18, `telemetry processing and privacy` |
 | Error intelligence, grouping, and issue lifecycle | #19, `error intelligence and issue lifecycle` |
 | Releases, artifacts, and symbolication details | #20, `releases artifacts and symbolication` |
@@ -81,6 +81,11 @@ defines the supported upstream baseline, client and workflow matrix, endpoint
 catalog, wire semantics, deviations, conformance fixtures, and troubleshooting
 guidance. Query semantics, issue lifecycle, processing, artifacts, and native
 storage remain owned by their downstream contracts.
+
+The [ingestion contract](servers-watchtower-ingestion-contract.md) defines the
+admission units, authorization and lifecycle fences, quota reservation,
+deduplication, raw acceptance, and recoverable handoff that consume the #16
+wire boundary without making processing or query visibility synchronous.
 
 `docs/servers-watchtower-control-plane-contract.md` defines native control-plane
 authorization and credential policy. Compatible adapters must apply that policy;

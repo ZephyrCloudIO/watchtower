@@ -357,14 +357,16 @@ Other operation IDs remain subject to ordinary authorization and lifecycle
 rules.
 
 After bounded transport decoding, event parsing, and complete structural
-validation, Ingest normalizes the identity of a retained supported event item
-and performs the event idempotency lookup before applying the API-owned
-environment retirement tombstone and generation fence. A matching acceptance
-record or payload-free uniqueness tombstone returns the original acceptance,
-and the same event ID with a different digest returns `409 conflict`, even
-when the environment has since been retired. If no prior identity exists, the
-retirement fence is then applied before persistence or durable acceptance. An
-empty, unsupported-only, or attachment-only Envelope retains no supported
+validation, Ingest applies the raw admission identity and seven-day content
+comparison owned by the
+[`ingestion admission and durable handoff contract`](servers-watchtower-ingestion-contract.md).
+The raw comparison uses decompressed original bytes; #16's semantic
+`payload_digest` remains the compatibility and downstream canonical digest.
+A matching admission record returns the original acceptance, while different
+raw content under the active scoped event-ID fence returns `409 conflict`,
+even when the environment has since been retired. If no prior identity exists,
+the retirement fence is then applied before persistence or durable acceptance.
+An empty, unsupported-only, or attachment-only Envelope retains no supported
 event identity and follows the separate no-op/client-report retry rules below;
 its validated envelope-level event ID remains bounded request metadata and is
 not reserved by this lookup. A new event whose
@@ -395,20 +397,22 @@ stores no event ID and the pinned creation metadata remains only
 `attachment_type`. At binding, the adapter authorizes the collection DSN for
 the same tenant and project, requires the `Location` to resolve to that
 project-bound upload, and requires the Envelope/event ID to identify the
-accepted event in that same tenant and project. It evaluates the existing
-Envelope idempotency identity
-`(tenant_id, project_id, external_event_id, payload_digest)` before rejecting
-the upload state. An exact retry whose retained acceptance record already
+accepted event in that same tenant and project. It evaluates the #17 raw
+admission identity and attachment identity before transitioning the upload;
+the #16 Envelope identity
+`(tenant_id, project_id, external_event_id, payload_digest)` remains bounded
+compatibility metadata. An exact retry whose retained acceptance record already
 bound the same upload ID and attachment digest to the same event returns the
 original acceptance, even when the upload is now `bound`; it does not create a
 second attachment or transition. The retained binding record includes the
 upload ID, event ID, payload digest, attachment digest and length, and original
-acceptance. If the same Envelope identity matches a retained acceptance but
-references a different upload ID, the adapter returns `409 conflict` without
-creating a second binding or attachment transition; the original binding
-remains authoritative and the other upload remains `complete-unbound` subject
-to expiry. A retry with the same event ID and a different digest remains the
-documented `409 conflict`; an otherwise unmatched `bound` upload remains
+acceptance. If the same raw admission identity matches a retained acceptance
+but references a different upload ID, or if the attachment identity differs,
+the adapter returns `409 conflict` without creating a second binding or
+attachment transition; the original binding remains authoritative and the
+other upload remains `complete-unbound` subject to expiry. A retry with the
+same event ID and different raw content remains the documented `409 conflict`
+under the #17 comparison; an otherwise unmatched `bound` upload remains
 inaccessible. Only a first acceptance requires `complete-unbound` with the
 declared length, and it atomically transitions that state to `bound` while
 retaining the uploaded bytes only as an attachment of that event. A completed
@@ -1706,17 +1710,20 @@ strings defined above. Annotation keys and object keys use RFC 8785 ordering, an
 the minidump hash is over decompressed bytes rather than multipart framing or
 compressed bytes. A missing `sentry` part or missing/malformed `event_id`
 returns `400 invalid_request` before acceptance. Minidump submissions use the
-same cross-transport event-ID uniqueness record as Envelope and legacy `store`
-ingestion. That record is keyed by
+same cross-transport event-ID compatibility record as Envelope and legacy
+`store` ingestion. That record is keyed by
 `(tenant_id, project_id, external_event_id)`, stores the accepted transport
-payload digest and canonical event reference, and remains authoritative through
-the full query-retention horizon even after the raw minidump acceptance record
-expires. For minidumps, `minidump_digest` is the transport payload digest: a
-matching event ID and digest returns the original `200` empty-body acceptance,
-while an existing event ID with a different digest, bytes, annotations, or
-metadata—including one accepted through another event-bearing transport—returns
-`409 conflict` without creating a second canonical event. The Ingest acceptance
-record retains the digest and identity for the raw-handoff acceptance horizon.
+digest, source protocol metadata, and canonical event reference. The #17 raw
+admission fence governs whether it is still an admission duplicate or conflict:
+it lasts seven days from first acceptance and is not extended by a retry. For
+minidumps, `minidump_digest` remains the transport payload digest while #17
+also compares the decompressed original crash content for raw admission. A
+matching scoped event ID and raw content within the active fence returns the
+original `200` empty-body acceptance; different bytes or metadata return
+`409 conflict` without a second acceptance. After the raw fence expires, the same
+event ID may begin a new acceptance generation; query retention does not
+extend the Ingest admission fence. The Ingest acceptance record retains the
+digest and identity for the raw-handoff acceptance horizon.
 
 ### Explicit limits
 
@@ -2185,27 +2192,22 @@ tie-breaker.
   attachment bytes contribute through their SHA-256 and size. Empty,
   unsupported-only, and attachment-only Envelopes use `event: null`, an empty
   attachment array, and an empty client-report array.
-- A retained supported event submission is idempotent by the tuple
-  `(tenant_id, project_id, external_event_id, payload_digest)`, recorded in the
-  one cross-transport event-ID uniqueness record shared by Envelope, legacy
-  `store`, and minidump ingestion. The record is keyed by
-  `(tenant_id, project_id, external_event_id)` and stores the accepted transport
-  payload digest and canonical event reference. A matching tuple returns the
-  original acceptance; the same event ID with a different digest returns `409`
-  and is not merged or durably accepted. These idempotency checks apply only when the
-  Envelope retains a supported event item, occur after complete structural
-  validation and before the environment retirement fence or any new acceptance
-  side effect, so this
-  `409 conflict` is the explicit exception to the otherwise universal `200`
-  Envelope acknowledgement. If the raw acceptance record retires while the
-  canonical event remains queryable, the shared uniqueness record remains
-  authoritative through the full query-retention horizon. During that horizon,
-  a matching retry returns the original
-  acceptance without creating another event, while a different digest returns
-  `409 conflict`; the event-detail route resolves the one retained canonical
-  event. Only after the shared record and query-retention horizon expire does
-  this contract make no historical deduplication or conflicting-digest
-  guarantee.
+- A retained supported event submission uses the #17 raw admission identity:
+  `(tenant_id, project_id, source_protocol, external_event_id,
+  admission_generation, admission_content_digest)`. Its minimal duplicate and
+  conflict fence lasts seven days from first acceptance and is not extended by
+  retries. `admission_content_digest` compares decompressed original supported
+  event bytes, so JSON whitespace and member-order changes are different raw
+  content; transport authentication, compression, and framing are excluded.
+  A matching identity returns the original acceptance, while different raw
+  content under the active event-ID fence returns `409 conflict` with no new
+  acceptance or charge. The #16 semantic `payload_digest` remains recorded for
+  compatibility and downstream canonical processing, but it does not extend
+  or replace the raw admission fence. These checks occur after complete
+  structural validation and before the environment retirement fence or any
+  new acceptance side effect. After seven days, the same external event ID may
+  create a new acceptance generation; query retention does not preserve an
+  Ingest duplicate or conflict guarantee.
 - An accepted Envelope with no retained supported event item uses a separate
   no-op/client-report retry identity when the caller supplied a valid canonical
   `X-Request-ID`: `(tenant_id, project_id, client_request_id, payload_digest)`.
@@ -2971,12 +2973,17 @@ unsupported release-health behavior.
   resource generation, while canonical IDs and other scoped external
   identifiers are never reused across generations.
 - Supported event IDs from Envelope, legacy `store`, and minidump ingestion use
-  one cross-transport uniqueness record keyed by
+  one cross-transport compatibility record keyed by
   `(tenant_id, project_id, external_event_id)`. Two projects may use the same
-  event ID without collision or disclosure. The record stores the accepted
-  transport payload digest and canonical event reference, remains authoritative
-  while the canonical event is queryable, and prevents a second canonical event
-  or incompatible retry across transports. An event ID is never a canonical
+  event ID without collision or disclosure, and source protocol is retained as
+  bounded identity metadata. The record stores the accepted transport digest
+  and canonical event reference for the current admission generation; it is a
+  compatibility projection, not a lifetime deduplication fence. The separate
+  #17 raw-admission duplicate and conflict fence lasts seven days from first
+  acceptance and is not extended by retries. After that fence expires, the same
+  event ID may begin a new acceptance generation and the compatibility
+  projection may point to that current generation while older canonical data
+  remains governed by Query and retention. An event ID is never a canonical
   Watchtower primary key. An event ID carried only by an empty or excluded-only
   Envelope is not registered and may be reused by a later supported event.
 - API owns control-plane, project, DSN, release, artifact, operation, and audit
@@ -3084,9 +3091,10 @@ exercise:
   body-only `application/octet-stream` requests, and unlisted file parts,
   bounded fields, deterministic `400 invalid_request` no-side-effect failures,
   the successful `200` zero-length acknowledgement, and shared
-  cross-transport event-ID uniqueness with Envelope/store ingestion, including
-  retries after raw acceptance expiry while the canonical event remains
-  queryable and conflicting payload digests returning `409`;
+  cross-transport event-ID compatibility with Envelope/store ingestion,
+  seven-day raw-admission duplicate/conflict behavior, new acceptance after
+  the raw fence expires while the canonical event remains queryable, and
+  conflicting admission content returning `409`;
 - `sdk.native.crash` using the exact multipart minidump request and
   `sdk.native.tus-minidump` using the separate TUS creation/append and Envelope
   `attachment-ref` binding workflow;
@@ -3143,10 +3151,11 @@ exercise:
   items being ignored while recognized item types return `415
   unsupported_media_type`;
 - duplicate, case-variant, malformed, and conflicting event IDs, including
-  acceptance-record retirement while the canonical event remains queryable,
-  identical retries after environment retirement, and uniqueness-tombstone
-  enforcement; equivalent payloads with different
-  compression, JSON ordering, or excluded metadata; message-only and
+  seven-day admission-fence expiry while the canonical event remains
+  queryable, identical retries after environment retirement, and deletion
+  fencing; raw-byte differences such as compression-independent whitespace
+  or JSON ordering conflicts at admission while equivalent semantic
+  `payload_digest` values remain deterministic downstream; message-only and
   stacktrace-only error events, exception events, deterministic multi-entry
   Event DTO serialization and ordering, deterministic Event `title` candidate
   precedence and empty fallback, deterministic Event `culprit` precedence and

@@ -16,6 +16,10 @@ authoritative in
 This contract selects the canonical data and storage decisions those contracts
 leave to downstream ownership. A downstream contract may refine behavior in
 its assigned domain but must not move ownership across the component boundary.
+The [`ingestion admission and durable handoff contract`](servers-watchtower-ingestion-contract.md)
+refines raw acceptance units, admission identity, quota reservation, and
+Ingest recovery without changing this contract's storage ownership or
+retention fences.
 
 ## Canonical Model
 
@@ -96,7 +100,7 @@ canonical telemetry.
 
 | Data class | Writer and authority | Storage boundary | Lifecycle |
 | --- | --- | --- | --- |
-| Raw accepted records and attachments | Ingest; authoritative for raw acceptance | Encrypted immutable S3 objects plus Ingest PostgreSQL acceptance metadata and outbox state | Seven days from `accepted_at` by default; a project policy may shorten this cutoff but never extend it, and raw state may remain only until Processor durably confirms handoff completion or Ingest durably records class-default or shortened-policy expiry within that cutoff; never customer-downloadable |
+| Raw accepted records and attachments | Ingest; authoritative for raw acceptance units under the [ingestion contract](servers-watchtower-ingestion-contract.md) | Encrypted immutable S3 objects plus Ingest PostgreSQL acceptance metadata and outbox state | Seven days from `accepted_at` by default; a project policy may shorten this cutoff but never extend it, and raw state may remain only until Processor durably confirms handoff completion or Ingest durably records class-default or shortened-policy expiry within that cutoff; never customer-downloadable |
 | Normalized records | Processor; authoritative only as processing input | Processor-owned encrypted S3 replay-batch prefix, with separate class metadata | Retained as needed for replay; when raw may retire after a successful handoff, a verified normalized representation has a retention floor through the applicable raw-retention cutoff even if a class policy is shorter, and is never retained longer than 90 days |
 | Enriched records | Processor; authoritative only as processing input | Processor-owned encrypted S3 replay-batch prefix, with separate class metadata | Retained only as needed for replay, no longer than 90 days |
 | Canonical telemetry | Processor; authoritative for the four signal histories | Four independent ClickHouse canonical table families | Immutable history for 90 days from `accepted_at` |
@@ -434,10 +438,10 @@ Storage changes use local storage transactions, transactional outboxes,
 versioned messages, idempotent retry, and reconciliation. There are no
 distributed transactions and no best-effort cross-store writes.
 
-Ingest acknowledgement means only that durable raw acceptance and durable
-handoff have succeeded. It does not mean that canonical telemetry or a Query
-projection is visible. Canonical and Query visibility are asynchronous and
-eventually consistent.
+Ingest acknowledgement means only that the ingestion contract's durable raw
+acceptance unit and recoverable handoff have succeeded. It does not mean that
+canonical telemetry or a Query projection is visible. Canonical and Query
+visibility are asynchronous and eventually consistent.
 
 The existing versioned message envelope remains authoritative for message
 identity, producer, tenant/project context, event time, causation,
@@ -1398,7 +1402,7 @@ issues:
 | --- | --- |
 | #15 | [Control-plane resources, WorkOS authentication, authorization, roles, project lifecycle, credentials, non-export quotas, and detailed audit access](servers-watchtower-control-plane-contract.md) |
 | #16 | [Sentry-compatible routes, DTOs, request semantics, and protocol compatibility mappings](servers-watchtower-sentry-compatibility-contract.md) |
-| #17 | Ingestion admission, capacity behavior, and detailed durable raw-to-processing handoff |
+| #17 | [Ingestion admission, capacity behavior, and detailed durable raw-to-processing handoff](servers-watchtower-ingestion-contract.md) |
 | #18 | Normalization, privacy processing, enrichment, and processing policy |
 | #19 | Error grouping, issue aggregates, and issue lifecycle |
 | #21 | Query routes, query language, read semantics, limits, freshness, and error exploration |
