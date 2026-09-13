@@ -75,9 +75,13 @@ Processor handoff. Each upload nevertheless reserves one project-scoped
 including a slot for a zero-length upload. The reservation is keyed by the
 upload ID and covers both `pending` and `complete-unbound` states; `PATCH`
 cannot exceed it or extend it. Binding atomically converts the reservation to
-the final attachment-byte charge. Expiry, deletion, or a lifecycle fence
-releases it. Exhausted staging capacity returns `429 rate_limited`; an
-unavailable staging-capacity projection returns `503 unavailable`.
+the final attachment-byte charge. Logical expiry blocks `HEAD`, `PATCH`, and
+binding, but does not release the reservation while the staging record or its
+bytes still exist. Confirmed physical deletion, including lifecycle cleanup,
+releases the slot and bytes exactly once; delayed or failed cleanup therefore
+continues to consume the project staging budget. Exhausted staging capacity
+returns `429 rate_limited`; an unavailable staging-capacity projection returns
+`503 unavailable`.
 
 For `/api/<project_id>/security-report/`, `POST` returns `501
 unsupported_capability`; another non-`HEAD` method returns `405
@@ -181,10 +185,11 @@ survive as acceptance metadata.
 An event item with a valid ID but no error signal is individually excluded as
 `not_error_event`. An invalid recognized field, invalid event shape, invalid
 attachment length, invalid client report, or malformed supported item rejects
-the whole request with the route-appropriate #16 error. Empty, unsupported-only,
-and attachment-only Envelopes are valid bounded no-ops: they persist no
-customer payload bytes, but their bounded acceptance/no-op metadata and
-recoverable no-op handoff are recorded.
+the whole request with the route-appropriate #16 error. Empty,
+unsupported-only, client-report-only, and attachment-only Envelopes that do not
+use the correlated later-attachment shape defined by #16 are valid bounded
+no-ops: they persist no customer payload bytes, but their bounded
+acceptance/no-op metadata and recoverable no-op handoff are recorded.
 
 Exclusion diagnostics contain only bounded item type, exclusion reason, count,
 tenant/project scope, request ID, and correlation ID. They never contain item
@@ -219,7 +224,7 @@ its route-specific `Allow`, and unknown paths emit no `Allow` header.
 | `permission_denied` | 403 | Valid credential but disabled/suspended project or organization, or insufficient scope. |
 | `not_found` | 404 | Unknown or inaccessible resource, upload, or route. |
 | `method_not_allowed` | 405 | Known route with an unsupported method. |
-| `invalid_request` | 400 | Invalid minidump/store request, field, alias, or TUS input. |
+| `invalid_request` | 400 | Invalid minidump request, field, alias, or TUS input. |
 | `precondition_failed` | 412 | Missing or unsupported `Tus-Resumable`. |
 | `unsupported_media_type` | 415 | Unsupported content type or encoding. |
 | `invalid_compression` | 400 | Malformed or undecodable gzip. |
@@ -363,26 +368,29 @@ global uniqueness.
 
 The raw admission identity is the tuple
 `(tenant_id, project_id, source_protocol, external_event_id)` together with
-the seven-day admission generation. The first accepted event ID installs a
-minimal raw deduplication record for seven days from its first `accepted_at`.
-Retries do not extend that period. A matching event ID and matching content
-reuses the original acceptance; a different content digest is `409 conflict`.
+the admission generation and its effective raw-retention cutoff. The first
+accepted event ID installs a minimal raw deduplication record through the
+earlier of the seven-day default cutoff and the active project's raw-retention
+cutoff, measured from its first `accepted_at`. Retries do not extend that
+period. A matching event ID and matching content digest reuses the original
+acceptance; a different content digest is `409 conflict`.
 The public external event ID is also an alias fence: the compatibility record
 continues to own that alias while its canonical event remains queryable, for
 90 days by default or the shorter effective query-retention cutoff. A matching
 retry while that alias is retained resolves to the existing compatibility
 record; conflicting content or an attempted new generation returns `409
 conflict`. The compatibility projection cannot replace the alias until the
-older canonical event leaves query visibility. The seven-day raw fence and
+older canonical event leaves query visibility. The effective raw fence and
 this query-retention alias fence are independent; a new public acceptance
 generation may use the external event ID only after both have expired.
 
 When the raw handoff completes, raw objects, acceptance metadata, outbox state,
 and payload references may retire according to the storage contract, but an
-Ingest-owned non-payload admission tombstone remains through the seven-day raw
-fence. It stores the scoped event identity, admission generation, content
-digest, original acceptance result, and applicable cutoff. Parent-binding and
-attachment identity state remains alongside it until the same parent cutoff.
+Ingest-owned non-payload admission tombstone remains through the effective
+raw-retention cutoff. It stores the scoped event identity, admission
+generation, content digest, original acceptance result, and applicable cutoff.
+Parent-binding and attachment identity state remains alongside it until the
+same parent cutoff.
 This state contains no customer payload, credentials, or usable storage
 reference; deletion and lifecycle fences supersede it and cannot be reopened
 by retry or restore. A supported protocol that permits a missing event ID
@@ -420,8 +428,8 @@ minidump bytes, normalized annotations, or Sentry metadata produce a different
 digest and therefore `409 conflict` under the active fence. Attachment content
 is compared through its own identity, not folded into an ordinary event-body
 identity. The #16 `payload_digest` remains the semantic RFC 8785 digest for
-compatibility and downstream canonical processing; it does not widen the raw
-seven-day deduplication fence or turn byte-different event retries into
+compatibility and downstream canonical processing; it does not widen the
+effective raw-admission fence or turn byte-different event retries into
 duplicates.
 
 An attachment identity is `(parent_acceptance_id, filename/name,
@@ -439,16 +447,19 @@ must be the eligible current parent, and the upload must be the matching
 project-bound upload. An exact retry of an existing binding reuses it; a
 different upload or digest for the same binding identity is `409 conflict`.
 
-Later attachments require a current collection DSN and an existing authorized
-parent acceptance less than seven days old. They may arrive before the parent
-has completed processing, because parent processing order is asynchronous, but
-they may not arrive before the parent acceptance exists. A parent that is
-deleted, expired, fenced, or outside its seven-day window cannot receive an
-attachment. A later attachment never extends the parent or its deduplication
-window; its raw cutoff is the earlier of its own applicable raw-retention
-cutoff and the parent's remaining raw-retention cutoff. Parent linkage is
-resolved by the eligible scoped parent acceptance, never by an unscoped event
-ID or stale historical record.
+Later attachments use the exact #16 correlation shape: an Envelope header with
+a normalized `event_id`, exactly one `attachment` item, no `event` item, and no
+other supported item. The item may contain ordinary decoded bytes or the
+supported TUS reference. They require a current collection DSN and an existing
+authorized parent acceptance within its effective raw-retention cutoff. They
+may arrive before the parent has completed processing, because parent
+processing order is asynchronous, but they may not arrive before the parent
+acceptance exists. A parent that is deleted, expired, fenced, or outside its
+effective cutoff cannot receive an attachment. A later attachment never
+extends the parent or its deduplication window; its raw cutoff is the earlier
+of its own applicable raw-retention cutoff and the parent's remaining
+raw-retention cutoff. Parent linkage is resolved by the eligible scoped parent
+acceptance, never by an unscoped event ID or stale historical record.
 
 ## Durable acceptance and handoff state machine
 
@@ -482,10 +493,54 @@ Payload-bearing raw objects use the canonical storage path:
 environment/component/tenant/project/accepted-date/<watchtower-uuid-v7>
 ```
 
+Each payload-bearing object is a deterministic `RawUnitContainerV1`, not the
+original request. Its bytes consist of the ASCII magic
+`WATCHTOWER-RAW-UNIT` followed by one NUL byte, one-byte version `1`, a
+four-byte big-endian manifest length, an RFC 8785 canonical-JSON manifest, and,
+for each manifest item in order, a four-byte big-endian section length followed
+by exactly that many payload bytes. The manifest has schema
+`watchtower.raw-unit.v1` and one descriptor per retained payload:
+
+```json
+{
+  "schema": "watchtower.raw-unit.v1",
+  "items": [
+    {
+      "kind": "event",
+      "content_type": "application/json",
+      "length": 123,
+      "sha256": "lowercase-hex-sha256-of-this-payload"
+    },
+    {
+      "kind": "attachment",
+      "content_type": "application/octet-stream",
+      "filename": "optional-name",
+      "attachment_type": "optional-type",
+      "length": 456,
+      "sha256": "lowercase-hex-sha256-of-this-payload"
+    }
+  ]
+}
+```
+
+The event section contains the validated decompressed event bytes and each
+attachment section contains the validated decoded or dereferenced attachment
+bytes. The event descriptor precedes attachment descriptors, which are sorted
+by the canonical descriptor bytes; exact duplicate attachment identities are
+coalesced before serialization. Excluded item payloads and client-report-only
+metadata are never placed in the container. The object digest is the lowercase
+SHA-256 of the complete container bytes, including framing, manifest, and all
+sections, and its size is the complete byte length. Per-item digests cover only
+their respective payload sections. `admission_content_digest` and the #16
+semantic `payload_digest` remain separate identities. `RawPayloadReferenceV1`
+identifies this schema version so Processor can verify and decode it across the
+supported handoff compatibility window.
+
 Acceptance metadata for payload-bearing units records the object key, digest,
-size, `accepted_at`, tenant, project, raw-unit `watchtower_id`, parent linkage
-where applicable, source protocol/format version, dedup generation, retention
-cutoff, quota reservation/charge identity, and outbox state. No-op and
+size, container schema, `accepted_at`, tenant, project, raw-unit `watchtower_id`,
+parent linkage where applicable, source protocol/format version, dedup
+generation, retention cutoff, quota reservation/charge identity, and outbox
+state. No-op and
 client-report records omit payload object key, digest, size, and reference and
 retain only their bounded diagnostics and handoff state. No incomplete object
 or unverified digest is a payload-bearing accepted record.
@@ -495,9 +550,10 @@ later-attachment variants. Payload-bearing variants carry project scope,
 tenant UUID, raw-unit UUID, parent UUID when applicable, accepted time, source
 protocol and format version, content/attachment digests, retention and policy
 generations, correlation/idempotency context, and an opaque owner-issued
-`RawPayloadReferenceV1`. A no-op handoff carries bounded disposition metadata
-and no payload reference. Messages contain no Sentry DTO, DSN, credential,
-private key, unrestricted payload, or usable S3 grant.
+`RawPayloadReferenceV1` for the `RawUnitContainerV1` object. A no-op handoff
+carries bounded disposition metadata and no payload reference. Messages contain
+no Sentry DTO, DSN, credential, private key, unrestricted payload, or usable S3
+grant.
 
 MSK uses the canonical storage settings: replication factor `3`,
 `min.insync.replicas=2`, producer `acks=all`, and seven-day log retention.
@@ -524,7 +580,9 @@ generation. Ingest owns an idempotent `tus_staging` reservation keyed by
 tenant, project, upload ID, and policy generation. Creation reserves one slot
 and the declared upload bytes before any staging write; append uses only that
 reservation. Binding converts it to the final attachment reservation, while
-expiry, deletion, cancellation, and lifecycle fencing release it exactly once.
+logical expiry, cancellation, and lifecycle fencing stop access but retain the
+staging reservation until the bytes and staging record are physically deleted;
+deletion-confirmation reconciliation releases it exactly once.
 Staging exhaustion returns `429 rate_limited`; an unavailable or stale staging
 policy returns `503 unavailable`. These reservations are separate from error
 quantity and final attachment-byte charges.
@@ -652,22 +710,24 @@ The verification specification must use synthetic fixtures and prove:
   stale, and concurrently revoked DSNs, including 60-second projection and
   immediate-fence boundaries;
 - concurrent identical event IDs, conflicting decompressed bytes, compressed
-  retries, whitespace changes, protocol scope, seven-day expiry without retry
-  extension, query-retention alias fencing while canonical events remain
+  retries, whitespace changes, protocol scope, effective raw-cutoff expiry
+  without retry extension, query-retention alias fencing while canonical events remain
   queryable, missing IDs, and deletion/restore fencing;
 - equal and different attachment identities, attachment-before-parent,
   pre-processing attachment delivery, expired/deleted parents, TUS binding,
   and parent retention cutoffs;
 - reservation races, one-charge duplicate handling, TUS staging byte/count
-  exhaustion and release/conversion, quota exhaustion, environment
+  exhaustion, delayed-cleanup reservation retention, deletion-confirmed
+  release/conversion, quota exhaustion, environment
   registration/retirement/reactivation races, unsafe enforcement, service
   overload, and bounded Retry-After behavior;
 - failures before and after S3 verification, PostgreSQL/outbox commit, MSK
   publication, Processor fetch/processing, disposition acknowledgement,
   shutdown, restore, orphan cleanup, quarantine, duplicate delivery, and
   conflicting dispositions;
-- bounded decoding, decompression, duration, concurrency, memory, no-op
-  acceptance without a raw object, deterministic multipart minidump digests,
+- bounded decoding, decompression, duration, concurrency, memory, no-op and
+  client-report acceptance without a raw object, deterministic multipart
+  minidump digests, deterministic `RawUnitContainerV1` framing/digests,
   completed-disposition tombstones, backlog, quarantine, mandatory
   Processor-outage expiry sweeps, retention expiry, and deletion behavior; and
 - safe logs/traces/metrics, immediate risk paging, mTLS/ACL isolation,
@@ -688,7 +748,8 @@ no-op handoff; error units are atomic; concurrent duplicates reuse one
 acceptance and one charge; conflicts reject content; public event aliases stay
 unique while canonical events are queryable; later attachments obey parent
 authorization, identity, deduplication, and retention rules; TUS staging is
-bounded and released or converted exactly once; quota, unsafe, and overload
+bounded, retained through delayed cleanup, and released or converted exactly
+once after deletion confirmation; quota, unsafe, and overload
 failures have distinguishable retry behavior; accepted work remains recoverable
 through its retention cutoff; and all handoffs remain versioned,
 protocol-neutral, tenant-scoped, and compatible with the existing fetch,
