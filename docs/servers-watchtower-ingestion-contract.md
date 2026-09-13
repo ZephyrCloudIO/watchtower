@@ -121,15 +121,19 @@ relative path. The reference JSON length is not the attachment byte length.
 
 Collection authentication is the first admission step. Ingest authenticates
 the current project-scoped collection DSN before validating the content
-encoding or type, decoding the body, or evaluating the post-authentication
-project and lifecycle lookup. Unsupported `Content-Encoding` is
+encoding or type or decoding the body. For an authenticated current DSN,
+Ingest then resolves the tenant, project, organization lifecycle, and security
+authority before validating the transport. A disabled project or suspended
+organization returns `403 permission_denied`, and a deleting project returns
+`409 conflict`; only an active project and organization continue to transport
+validation and body decoding. Unsupported `Content-Encoding` is
 `415 unsupported_media_type`; a malformed gzip stream is
 `400 invalid_compression`; malformed multipart boundaries are
 `400 invalid_multipart`; and a mismatched or unsupported content type is
-`415 unsupported_media_type`. After authentication, these failures occur
-before payload persistence, quota reservation, project lookup, or environment
-registration, so an invalid DSN retains the #16 `401 invalid_authentication`
-precedence even when the body is malformed.
+`415 unsupported_media_type`. After authentication and lifecycle admission,
+these transport failures occur before payload persistence, quota reservation,
+or environment registration, so an invalid DSN retains the #16
+`401 invalid_authentication` precedence even when the body is malformed.
 
 Envelope framing is newline-delimited JSON headers followed by item payloads.
 The envelope header is required. An item with `length` uses authoritative
@@ -170,9 +174,12 @@ before durable acceptance, and overage is never partially accepted.
 | Crashpad scalar annotation | 256 UTF-8 bytes after NFC normalization |
 
 Every JSON value, including ignored extensible values, is at nesting level 16
-or below. Recursive objects have at most 256 members and arrays at most 1,024
-elements. Decoded bytes, decompressed nested item bytes, multipart framing,
-and rejected or duplicate parts count toward their applicable limits.
+or below. Recursive event objects and other schemas that explicitly declare
+these recursive cardinality bounds have at most 256 members per object and
+1,024 elements per array. Unknown extensible objects and arrays do not inherit
+those bounds; they remain subject to the global nesting and decoded-byte
+limits. Decoded bytes, decompressed nested item bytes, multipart framing, and
+rejected or duplicate parts count toward their applicable limits.
 
 ### Supported and excluded items
 
@@ -397,8 +404,8 @@ earlier of the seven-day default cutoff and the active project's raw-retention
 cutoff, measured from its first `accepted_at`. Retries do not extend that
 period. A matching event ID and matching content digest reuses the original
 acceptance only when an initial error unit also has the same initial attachment
-identity set; a different content digest or attachment identity set is `409
-conflict`.
+identity multiset, including occurrence multiplicity; a different content
+digest or attachment identity multiset is `409 conflict`.
 The public external event ID is also an alias fence: the compatibility record
 continues to own that alias while its canonical event remains queryable, for
 90 days by default or the shorter effective query-retention cutoff. A matching
@@ -422,6 +429,11 @@ by retry or restore. A supported protocol that permits a missing event ID
 creates a new identity for every submission; later attachment association then
 requires that protocol's supported correlation identifier. Current #16 v1
 supported error and minidump paths require an event ID.
+
+For a no-op or client-report unit, the payload-free acceptance record or retry
+tombstone retains the semantic `payload_digest` needed for the supplied
+`X-Request-ID` retry identity while omitting the raw-object key, digest, size,
+and reference.
 
 For raw admission comparison, Ingest computes an
 `admission_content_digest` after complete structural validation. For Envelope
@@ -458,18 +470,21 @@ effective raw-admission fence or turn byte-different event retries into
 duplicates.
 
 For an initial error unit, the event ID and event-byte
-`admission_content_digest` are compared together with the canonical sorted set
-of initial attachment identities. Each set member uses the attachment identity
-fields `(filename/name, content_type, attachment_type, sha256(content_bytes))`
-defined below, with the candidate event as the parent; an empty set is also
-part of the comparison. The attachment set is not folded into the ordinary
-event-byte digest, but a set mismatch is still a conflicting initial unit and
+`admission_content_digest` are compared together with the canonical sorted
+multiset of initial attachment identities. Each multiset member uses the
+attachment identity fields `(filename/name, content_type, attachment_type,
+sha256(content_bytes))` defined below, with the candidate event as the parent;
+an empty multiset is also part of the comparison. The attachment multiset is
+not folded into the ordinary event-byte digest, but a multiset mismatch,
+including a multiplicity change, is still a conflicting initial unit and
 cannot be silently dropped or charged as a separate unseen attachment.
 
 An attachment identity is `(parent_acceptance_id, filename/name,
 content_type, attachment_type, sha256(content_bytes))`, using the decoded
-ordinary bytes or completed TUS bytes. Equal identity is an idempotent
-duplicate and adds no object or charge. Equal name and type with a different
+ordinary bytes or completed TUS bytes. An equal identity on a retry of the
+same accepted unit is an idempotent duplicate and adds no new object or
+charge. Duplicate occurrences within one initial unit remain separate
+multiset members and are not coalesced. Equal name and type with a different
 content hash is a distinct immutable attachment, subject to parent and quota
 rules. Attachment length is checked against decoded or dereferenced bytes,
 never against compressed bytes or the TUS reference JSON.
@@ -488,12 +503,14 @@ supported TUS reference. They require a current collection DSN and an existing
 authorized parent acceptance within its effective raw-retention cutoff. They
 may arrive before the parent has completed processing, because parent
 processing order is asynchronous, but they may not arrive before the parent
-acceptance exists. A parent that is deleted, expired, fenced, or outside its
-effective cutoff cannot receive an attachment. A later attachment never
-extends the parent or its deduplication window; its raw cutoff is the earlier
-of its own applicable raw-retention cutoff and the parent's remaining
-raw-retention cutoff. Parent linkage is resolved by the eligible scoped parent
-acceptance, never by an unscoped event ID or stale historical record.
+acceptance exists. A missing or inaccessible scoped parent returns `404
+not_found` with no attachment acceptance side effect. A known parent that is
+deleted, expired, fenced, or outside its effective cutoff returns `409
+conflict`. A later attachment never extends the parent or its deduplication
+window; its raw cutoff is the earlier of its own applicable raw-retention
+cutoff and the parent's remaining raw-retention cutoff. Parent linkage is
+resolved by the eligible scoped parent acceptance, never by an unscoped event
+ID or stale historical record.
 
 ## Durable acceptance and handoff state machine
 
@@ -504,7 +521,7 @@ The request-to-handoff states are:
 | Received/authenticating | Route, method, DSN source, tenant, project, lifecycle, and security authority are bounded and checked. | #16 authentication/lifecycle mapping. |
 | Transport decoded | Content type, encoding, framing, decoded bytes, duration, concurrency, and memory bounds hold. | `400`/`413`/`415`/`invalid_compression`/`invalid_multipart`/`504` as applicable. |
 | Unit validated | Supported event, crash, attachment, or no-op shape is valid; unsupported items have no allocated payload retention. | `400 invalid_envelope` or `400 invalid_request` for invalid units; valid exclusions remain eligible for bounded no-op success. |
-| Identity checked | Deduplication, event content, parent, upload, environment, and lifecycle generations are checked. | `200` duplicate, `409 conflict`, or continued admission. |
+| Identity checked | Deduplication, event content, parent, upload, environment, and lifecycle generations are checked. | `200` duplicate, `404 not_found` for a missing or inaccessible resource, `409 conflict` for a known fenced or lifecycle-conflicting state, or continued admission. |
 | Quota reserved | API-owned policy and Ingest reservation state agree for the unit, including no-op/client-report capacity where applicable; reservation is scoped and idempotent. | `429 rate_limited`, `503 unavailable`, or continued admission. |
 | Raw staged and verified | For a payload-bearing unit, the immutable S3 object is complete and its SHA-256 and exact byte size match the accepted content. A valid no-op or client-report unit allocates no raw object and instead carries only bounded metadata. | No payload-bearing success is reported before verification. Failed or uncertain attempts are cleaned or reconciled. |
 | Acceptance committed | For a payload-bearing unit, PostgreSQL acceptance metadata, final quota charge state, dedup/attachment identity, and transactional outbox commit together. For a no-op or client-report unit, bounded acceptance metadata, its no-op admission reservation/charge state, and a recoverable no-op handoff commit without a raw object. | `200` with empty body and request IDs. |
@@ -517,7 +534,9 @@ object, verified digest and size, acceptance metadata, final reservation/charge
 state, and recoverable outbox are committed. For a valid no-op or client-report
 unit, public success means that its bounded acceptance metadata, committed
 `no_op_admission` reservation/charge state, and recoverable no-op handoff are
-committed; it has no raw object, payload digest/size, or payload reference.
+committed; it has no raw object or raw-object key, digest, or size, and no
+payload reference; its semantic `payload_digest` remains available for the
+no-op/client-report retry identity.
 Neither form of success
 means MSK publication, Processor completion, normalization, grouping,
 symbolication, canonical storage, or Query visibility.
@@ -594,9 +613,10 @@ needed by Processor are retained in the raw object rather than only in
 acceptance metadata. Multipart boundaries, part ordering, transport
 compression, DSNs, and request IDs are not retained. The event descriptor
 precedes attachment and minidump descriptors, which are sorted by canonical
-descriptor bytes; exact duplicate attachment identities are coalesced before
-serialization. Excluded item payloads and client-report-only metadata are never
-placed in the container. The object digest is the lowercase SHA-256 of the
+descriptor bytes; duplicate attachment identities are retained as separate
+sorted multiset entries, with one descriptor and section per occurrence.
+Excluded item payloads and client-report-only metadata are never placed in the
+container. The object digest is the lowercase SHA-256 of the
 complete container bytes, including framing, manifest, metadata, and all
 sections, and its size is the complete byte length. Per-item digests cover only
 their respective payload sections. `admission_content_digest` and the #16
@@ -608,10 +628,11 @@ Acceptance metadata for payload-bearing units records the object key, digest,
 size, container schema, `accepted_at`, tenant, project, raw-unit `watchtower_id`,
 parent linkage where applicable, source protocol/format version, dedup
 generation, retention cutoff, quota reservation/charge identity, and outbox
-state. No-op and client-report records omit payload object key, digest, size,
-and reference and retain only their bounded diagnostics, no-op admission
+state. No-op and client-report records omit the payload object key,
+raw-object digest, size, and reference, but retain the semantic
+`payload_digest` alongside their bounded diagnostics, no-op admission
 reservation/charge state, and handoff state. No incomplete object or
-unverified digest is a payload-bearing accepted record.
+unverified raw-object digest is a payload-bearing accepted record.
 
 The versioned raw handoff family includes protocol-neutral initial-unit and
 later-attachment variants. Payload-bearing variants carry project scope,
@@ -807,13 +828,15 @@ The verification specification must use synthetic fixtures and prove:
   retries, whitespace changes, protocol scope, effective raw-cutoff expiry
   without retry extension, query-retention alias fencing while canonical events remain
   queryable, missing IDs, and deletion/restore fencing;
-- equal and different attachment identities, initial-attachment-set duplicate
-  and conflict behavior, attachment-before-parent, pre-processing attachment
-  delivery, expired/deleted parents, TUS binding, and parent retention cutoffs;
+- equal and different attachment identities, initial-attachment multiset
+  duplicate and conflict behavior, attachment-before-parent `404` handling,
+  pre-processing attachment delivery, known expired/deleted/fenced parent
+  `409` handling, TUS binding, and parent retention cutoffs;
 - authentication precedence over malformed transport, reservation races,
   one-charge duplicate handling, TUS staging byte/count exhaustion,
-  no-op/client-report count/rate exhaustion and per-project isolation,
-  duplicate reservation reuse, delayed-cleanup reservation retention,
+  no-op/client-report count/rate exhaustion and per-project isolation, repeated
+  no-op retries with the same semantic digest, and changed-digest `409`
+  conflicts; duplicate reservation reuse, delayed-cleanup reservation retention,
   deletion-confirmed release/conversion, quota exhaustion, environment
   registration/retirement/reactivation races, unsafe enforcement, service
   overload, and bounded Retry-After behavior;
