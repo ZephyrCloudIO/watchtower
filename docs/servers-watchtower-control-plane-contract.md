@@ -14,6 +14,9 @@ internal handoffs, revocation fences, and coordinated release behavior.
 workload authentication, and diagnostics.
 `docs/servers-watchtower-canonical-telemetry-storage-contract.md` owns storage,
 retention, lifecycle barriers, audit durability, and restore-independent fences.
+`docs/servers-watchtower-ingestion-contract.md` consumes this contract's
+collection authorization, lifecycle, environment, and quota policy to define
+Ingest admission units, reservation fences, and durable raw acceptance.
 This contract supplies the control-plane policy consumed at those boundaries;
 it does not relax their safeguards. The project index owns downstream scope.
 
@@ -23,7 +26,7 @@ it does not relax their safeguards. The project index owns downstream scope.
 - An organization is exactly one tenant. Its Watchtower organization UUID is the canonical `tenant_id`; there is no separate tenant resource or translated tenant identifier. Each project belongs to exactly one such organization, and its immutable owning organization UUID is the `tenant_id` used in storage, messages, projections, authorization predicates, and deletion scope. A user may have memberships in multiple tenants but is not itself a tenant. WorkOS organization IDs are external references, never canonical tenant IDs.
 - Organizations own projects. Teams are organization-scoped groups granting project access; multiple teams may access one project. Direct user grants are also supported.
 - Teams have no separate administrator role. Owner and Admin manage teams and memberships.
-- Environment names register automatically on first collection. Manage may hide them from the normal list; renaming, environment data deletion, and environment-level authorization are unsupported. Hidden active registrations still count toward limits. Owner/Admin may retire a registration to reclaim its slot without deleting historical data, and explicitly permit that name again through the registration lifecycle below.
+- Environment names register automatically on first valid collection through the Ingest admission contract. Manage may hide them from the normal list; renaming, environment data deletion, and environment-level authorization are unsupported. Hidden active registrations still count toward limits. Owner/Admin may retire a registration to reclaim its slot without deleting historical data, and explicitly permit that name again through the registration lifecycle below.
 - Repository-owned identifiers are canonical lowercase UUID v7 values, persisted as PostgreSQL `uuid`. Organization slugs are globally unique; team and project slugs are unique within their organization. Slugs may change; display names need not be unique.
 - Project organization ownership is immutable. Project transfers and organization merges are unsupported.
 - Recreating a deleted resource requires a new ID and credentials, with no inherited data or permissions. Names and slugs may be reused only after deletion completes.
@@ -305,7 +308,7 @@ Operational upper bounds are independent of billing. Operator sets upper bounds;
 - Watchtower-owned preauthentication entry points enforce 60 requests per IP per preceding minute and five per normalized target per preceding 15 minutes. Hide account existence.
 - Rate-limit responses include `Retry-After`.
 - If enforcement cannot be evaluated safely, return 503. Security paths operate only when their independent budget can be verified; no unrestricted fallback is allowed.
-- Signal-specific collection/query quantities belong to their owning domain contracts. Existing export-specific limits remain authoritative.
+- Signal-specific collection/query quantities belong to their owning domain contracts. Issue #17 owns Ingest's reservation, final-commit fence, and attachment-byte charging mechanics; #19 owns error quantity values. Existing export-specific limits remain authoritative.
 
 ## Operators and support
 
@@ -498,7 +501,7 @@ audit boundary without granting consumers direct access to API persistence.
 - Before implementation, record numeric latency, availability, throughput, capacity, and cost targets in the follow-up operating contract. Do not imply an agreed numeric SLO here.
 - Before release, complete non-production verification, threat-model review, operator/support runbooks, and customer authentication, credential, retention, deletion, and recovery documentation.
 - Follow the existing six-unit release train, bounded N/N-1 compatibility, and expand/contract changes. Rollback must not restore revoked authorization, deleted resources, erased context, or obsolete recovery secrets.
-- [#16](servers-watchtower-sentry-compatibility-contract.md) owns Sentry routes/DTOs and compatible error mapping; #17 owns admission details; #18–#20 own processing, grouping, and artifact behavior; #21 and #23–#27 own query and signal semantics; #22 owns detailed web design; #28/#29 own notification execution and background orchestration.
+- [#16](servers-watchtower-sentry-compatibility-contract.md) owns Sentry routes/DTOs and compatible error mapping; [#17](servers-watchtower-ingestion-contract.md) owns admission details, reservation fences, and durable raw handoff; #18–#20 own processing, grouping, and artifact behavior; #21 and #23–#27 own query and signal semantics; #22 owns detailed web design; #28/#29 own notification execution and background orchestration.
 
 ## Interface Responsibility Matrix
 
@@ -513,6 +516,7 @@ routes. No owner may fulfill a request by reading another owner's persistence.
 | Native reads, exports, and operation visibility | Query's public reads with API-owned authority and consumer projections; user web and external clients | Current authorized scope and resource state; operation ID for unfinished work; no resource-existence disclosure across unauthorized scopes |
 | Security snapshots and changes | API to Ingest, Query, and applicable internal owners | Initial complete snapshot, authorization revision and the runtime envelope's project/organization/account/staff scope; freshness enforcement; consumer-owned applied state |
 | Immediate revocation | API to every affected public owner through existing `AuthorizationRevocationFenceV1` | Durable pre-commit intent, monotonic revision, scope and correlation; all affected owner fences acknowledged before successful authoritative revocation |
+| Collection admission and quota reservation | API policy and security authority to Ingest; detailed behavior in the ingestion contract | Current project-scoped DSN, lifecycle/environment generation, security revision, quota policy generation, idempotent reservation identity, and final acceptance/charge outcome |
 | Project lifecycle and retention | API and existing owner/Jobs lifecycle barriers | Generation-matched prepare/activate/enablement acknowledgements; durable pending operation; no premature success or destructive rollback |
 | Settings application | API to applicable domain consumers | Stored version and consumer-specific application result; retries do not overwrite a newer observed version; special security/lifecycle barriers still apply |
 | Staff role provisioning and revocation | API; internal staff web and affected enforcement surfaces | Current StaffAdmin, recent reauthentication, no self-change or last-admin removal; audited first registration, monotonic revocation and reconciliation before staff access |

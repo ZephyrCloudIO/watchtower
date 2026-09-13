@@ -20,7 +20,10 @@ deployment units:
 The six units use one coordinated release train. They receive and roll back
 the same release, but retain independent scaling, readiness, and failure
 domains. Detailed product decisions are owned by the downstream contracts
-listed in `docs/project-watchtower.md`.
+listed in `docs/project-watchtower.md`, including the
+[`ingestion admission and durable handoff contract`](servers-watchtower-ingestion-contract.md)
+for Ingest's admission units, quota reservations, raw acceptance, and
+recoverable handoff behavior.
 
 ## Boundary Invariants
 
@@ -91,7 +94,9 @@ The allowed protocol and data-flow direction is:
 
 1. Browsers and external clients reach public routes through the shared L7
    routing layer. They cannot reach internal messages or RPCs.
-2. Ingest accepts telemetry and consumes API-published changes for local
+2. Ingest accepts telemetry according to the
+   [`ingestion admission and durable handoff contract`](servers-watchtower-ingestion-contract.md)
+   and consumes API-published changes for local
    authorization-related projections. For a revocation that affects
    telemetry-write permission, Ingest also durably installs the matching
    `AuthorizationRevocationFenceV1` revision and rejects affected public
@@ -370,6 +375,9 @@ until capacity is recovered. Ingest does not retire the raw object, acceptance
 metadata, or handoff outbox until it durably records the matching terminal
 Processor disposition or its own expiry fence from `RawRetentionExpiryV1`,
 whether the fence basis is class-default or an active shortened policy.
+The exact acceptance-unit, quota-reservation, duplicate, exclusion, and public
+response rules are owned by the ingestion contract; this boundary continues to
+own component ownership and failure isolation.
 
 Processor owns asynchronous normalization, privacy processing, enrichment,
 symbolication execution, canonical telemetry, processing state, derived
@@ -409,7 +417,9 @@ Native public business routes use `/api/v1`. Sentry-compatible routes retain
 the upstream route and request behavior required by the
 [`Sentry compatibility contract`](servers-watchtower-sentry-compatibility-contract.md).
 That contract owns the exact endpoint, wire, and client compatibility matrices;
-this contract continues to own component routing and data boundaries.
+the [`ingestion contract`](servers-watchtower-ingestion-contract.md) owns the
+admission and raw-handoff behavior behind those routes, and this contract
+continues to own component routing and data boundaries.
 
 Initial synchronous component calls use unary Protobuf-over-HTTP under
 `/internal/v1`. Internal streaming, gRPC, and Connect RPC are not part of
