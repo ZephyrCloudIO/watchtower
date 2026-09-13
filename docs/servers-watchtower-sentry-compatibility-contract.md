@@ -975,7 +975,7 @@ only representation of an absent nullable Release timestamp.
 | DIF | `missingChunks` | Required array of unique lowercase 40-character hexadecimal SHA-1 values sorted in lexicographic order; empty when complete |
 | DIF | `detail` | Nullable bounded safe processing detail |
 | DIF | `dateCreated` | Required UTC timestamp serialized exactly as `YYYY-MM-DDTHH:mm:ss.sssssssssZ` |
-| DSN | `id` | Required non-empty string compatibility alias; never a Watchtower canonical ID |
+| DSN | `id` | Required canonical lowercase UUID v7 repository-owned persistent DSN-key identity |
 | DSN | `name` | Required string |
 | DSN | `public` | Required public DSN key string |
 | DSN | `projectId` | Required project compatibility alias string |
@@ -1635,6 +1635,19 @@ exactly one `sentry` part are required, and each allowed annotation part
 (`prod`, `ver`, `ptype`, `plat`, or `guid`) may occur at most once. Duplicate
 permitted parts, missing required parts, and unlisted multipart file parts return
 `400 invalid_request` before acceptance, digest construction, or persistence.
+Each allowed annotation part is a scalar form-data part with
+`Content-Disposition: form-data; name="<key>"` and no filename, and its part
+`Content-Type` must be exactly `text/plain; charset=utf-8`. A missing or
+mismatched annotation part media type returns `415 unsupported_media_type`; a
+filename or any other annotation-part disposition returns `400 invalid_request`.
+The raw part body must contain one or more Unicode scalar values encoded as
+strict UTF-8 and must be at most 256 UTF-8 bytes after NFC normalization. An
+empty body, invalid UTF-8, a value that normalizes to empty, or an over-limit
+value returns `400 invalid_request` before acceptance, digest construction, or
+persistence. The adapter decodes the bytes exactly once, NFC-normalizes the
+result, and inserts that normalized string as the JSON string value in the
+`annotations` map; it never replaces invalid bytes or preserves a byte string
+outside JSON string semantics.
 A body-only raw-minidump request is not admitted; `application/octet-stream` is
 rejected as an unsupported media type. The legacy `store` body is JSON and must
 contain the pinned error-event fields needed to construct one event; malformed
@@ -1666,7 +1679,8 @@ required non-null string and must match the external Event DTO identifier.
 when absent and, when present, is a bounded non-null string. Explicit `null`
 for any of those three members is invalid, so omission is the only absent-field
 representation in the digest preimage. The member contains no request ID, DSN,
-or transport metadata. Annotation keys and object keys use RFC 8785 ordering, and
+or transport metadata. The annotation values are the decoded NFC-normalized
+strings defined above. Annotation keys and object keys use RFC 8785 ordering, and
 the minidump hash is over decompressed bytes rather than multipart framing or
 compressed bytes. A missing `sentry` part or missing/malformed `event_id`
 returns `400 invalid_request` before acceptance. The retry identity is
@@ -2391,13 +2405,17 @@ release and its project associations must be created through the release
 management route first. Existing project authorization and lifecycle rules
 still apply after this release check, including `403` for a disabled target.
 When `version` is absent, the artifact has `release: null` and uses the
-explicit versionless identity `(project, null release, dist, artifact type,
-logical filename)`. Because the pinned artifact-bundle request has no filename
+explicit versionless identity `(canonical_project_uuid, null release, dist,
+artifact type, logical filename)`. The accepted assembly identity additionally
+retains each resolved project's canonical UUID and non-reusable generation, so
+a project-slug replacement cannot reuse the deleted project's assembly or
+artifact identity. Because the pinned artifact-bundle request has no filename
 field,
 the adapter uses the deterministic synthetic name
 `artifact-bundle-<checksum>` (the lowercase 40-character bundle SHA-1) for the
 Artifact DTO and this identity. Release-associated artifacts are content-addressed and idempotent
-within `(project, release-or-null, dist, artifact type, logical filename)`; an
+within `(canonical_project_uuid, release-or-null, dist, artifact type, logical
+filename)`; an
 absent `dist` is a distinct identity value from any supplied distribution.
 Identical content within the same identity is a successful duplicate, while
 conflicting content within that identity is `409`. Different distributions may
@@ -2547,7 +2565,9 @@ logical filename deterministically as `artifact-bundle-<checksum>` using the
 lowercase 40-character bundle checksum. Absent `version` selects the
 versionless identity above. `projects` is required and must contain one to
 100 unique project aliases. Each alias is resolved only within the
-authenticated organization. The adapter validates cardinality, uniqueness,
+authenticated organization. After resolution, the adapter retains the ordered
+target list of `(canonical_project_uuid, project_generation)` pairs alongside
+the requested aliases. The adapter validates cardinality, uniqueness,
 tenant-scoped alias resolution, and authorization before checksum
 verification, project lookup, operation creation, assembly, or persistence;
 an empty or duplicate list returns `400 invalid_request`, an over-limit list
@@ -2566,10 +2586,19 @@ all chunks are available, the adapter computes the checksum before artifact
 registration. A mismatch terminalizes the accepted assembly as `failed` with a
 safe detail, no artifact or project registration, and no missing chunks; it is
 not converted into a synchronous `400` after pending acceptance. A repeated
-normalized assembly request,
-including its checksum, ordered chunks, version, distribution, and ordered
-project list, is an idempotent duplicate. The same checksum and bytes may be
-registered under a different release, distribution, or project list; those
+normalized assembly request is an idempotent duplicate only when its checksum,
+ordered chunks, version, distribution, and ordered resolved project target list
+all match, where each target is the same
+`(canonical_project_uuid, project_generation)` pair. The accepted assembly
+identity is `(tenant_id, checksum, ordered_chunks, version_or_null,
+dist_or_null, ordered_resolved_targets)`, where the resolved targets are part
+of the identity rather than only the submitted aliases.
+If a project slug was deleted and reused, a request that resolves to a new
+canonical UUID or generation does not match the old pending or terminal
+assembly: it is evaluated as a fresh assembly against the current chunks and
+returns the normal `202` pending or `200` terminal result without replaying or
+resuming the old assembly. The same checksum and bytes may be
+registered under a different release, distribution, or resolved project-target list; those
 are distinct artifact registrations rather than conflicts. A checksum
 conflict is reserved for a checksum-addressed value whose stored bytes
 differ, or for an existing artifact identity requested with different bytes;
@@ -2852,10 +2881,10 @@ unsupported release-health behavior.
 
 ## Identity, aliases, and storage ownership
 
-- Organization, project, operation, artifact, release-operation, and internal
+- Organization, project, DSN-key, operation, artifact, release-operation, and internal
   resource identities are canonical lowercase UUID v7 values at Watchtower
   boundaries and PostgreSQL `uuid` when persisted by their owner.
-- Sentry project IDs, DSN key IDs, release versions, and event IDs are
+- Sentry project IDs, release versions, and event IDs are
   compatibility aliases or scoped external identifiers. Issue IDs and short
   IDs are globally unique compatibility aliases across tenants and are never
   reused across project generations. Organization slugs are globally
@@ -2973,6 +3002,8 @@ exercise:
   required Sentry metadata and external event ID, each optional release/dist/
   platform omission combination, explicit-null rejection, and rejection of eventless
   minidumps, duplicate `upload_file_minidump`, `sentry`, and annotation parts,
+  exact annotation part media types and dispositions, empty and invalid UTF-8
+  values, NFC normalization, and the post-normalization byte bound,
   body-only `application/octet-stream` requests, and unlisted file parts,
   bounded fields, deterministic `400 invalid_request` no-side-effect failures,
   and the successful `200` zero-length acknowledgement;
@@ -3093,8 +3124,10 @@ exercise:
   deterministic
   `artifact-bundle-<checksum>` name, reuse of identical bundle bytes across
   release, distribution, and project-list identities, release-artifact
-  identity across release-or-null, distribution, artifact type, and logical
-  filename, direct release-file upload/list/item scope populated from the
+  identity across canonical project identity, project generation, release-or-null,
+  distribution, artifact type, and logical filename, project-slug deletion and
+  reuse producing a fresh assembly instead of replaying the old result, direct
+  release-file upload/list/item scope populated from the
   addressed project and decoded release path, repeat-POST polling without an
   operation ID or status URL, plus
   release-independent DIF duplicates and checksum/debug identity conflicts;
@@ -3217,6 +3250,8 @@ exercise:
 - DSN issuance with required name and nullable platform, issuance retry-record
   retention and fresh post-expiry issuance, empty-object rotation,
   bodyless revocation, exact `201`/`200`/`204` responses, same-tuple conflicts,
+  canonical UUID v7 IDs returned by listing and issuance and accepted by
+  rotation/revocation,
   independent cross-project/operation keys, exact 24-hour retry retention and
   post-expiry current-state behavior, and rejection of unknown members or
   bodies;
