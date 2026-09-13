@@ -229,9 +229,9 @@ its route-specific `Allow`, and unknown paths emit no `Allow` header.
 | `unsupported_media_type` | 415 | Unsupported content type or encoding. |
 | `invalid_compression` | 400 | Malformed or undecodable gzip. |
 | `invalid_multipart` | 400 | Malformed multipart framing or boundary. |
-| `invalid_envelope` | 400 | Invalid Envelope framing, length, header, legacy event, or supported item after transport decoding. |
+| `invalid_envelope` | 400 | Invalid Envelope framing, length, header, legacy event, client report, or supported item after transport decoding. |
 | `conflict` | 409 | Conflicting event content, conflicting attachment/upload binding, retired environment, deleting project, or other lifecycle conflict. |
-| `payload_too_large` | 413 | Byte, decoded-payload, item, part-count, or cardinality limit exceeded. |
+| `payload_too_large` | 413 | A byte, decoded-payload, item, part-count, or other cardinality limit that #16 maps to `413` is exceeded. Client-report record cardinality is excluded from this mapping. |
 | `rate_limited` | 429 | Project/organization collection quota or environment-registration capacity exhausted. |
 | `unavailable` | 503 | Stale/unavailable authorization or quota projection, storage dependency, unsafe enforcement evaluation, or exhausted service capacity. |
 | `deadline_exceeded` | 504 | A bounded synchronous admission operation exceeded its deadline without a committed outcome. |
@@ -248,9 +248,17 @@ is too large.`, `Rate limit exceeded.`, `The service is temporarily
 unavailable.`, `The request deadline was exceeded.`, `Internal server error.`,
 and `The requested capability is not supported.`
 
-Durable acceptance, a matching duplicate, a mixed request with at least one
-accepted unit, and a valid no-op all return the #16 success response: HTTP
-`200`, zero-length body, `X-Request-ID`, and `X-Watchtower-Request-ID`.
+Client-report `discarded_events` cardinality is an explicit exception to the
+general payload-cardinality mapping: more than 1,024 records in one item or
+more than 1,024 records across an Envelope returns `400 invalid_envelope`
+before acceptance, as required by #16. It never returns
+`413 payload_too_large`.
+
+Durable acceptance and a matching duplicate return the #16 success response:
+HTTP `200`, zero-length body, `X-Request-ID`, and `X-Watchtower-Request-ID`.
+A mixed request returns the same `200` response only when no event-bearing unit
+is rejected and at least one unit is accepted. A valid standalone no-op also
+returns `200` with the same headers.
 Envelope `OPTIONS` returns `204`. TUS creation returns `201`; successful TUS
 `HEAD` returns `200`; successful TUS `PATCH` returns `204`; each retains the
 exact #16 TUS headers. A failed TUS `HEAD` is bodyless, and a failed TUS
@@ -352,6 +360,15 @@ before any unit is selected. There is no server-side sampling. Valid traffic
 within the stated limits is admitted; excess or unsupported traffic is
 explicitly rejected or excluded.
 
+When an Envelope contains an event-bearing unit, that unit and any accompanying
+client-report or no-op units form one request-atomic admission group after
+structural validation. A conflict, quota failure, temporary admission failure,
+or other rejection of the event-bearing unit rolls back every auxiliary unit's
+acceptance, reservation, and handoff, and the event result determines the
+response. Auxiliary acceptance can never turn a rejected event into `200`.
+When the event-bearing unit is accepted or is a matching duplicate, auxiliary
+units may commit according to their normal rules.
+
 Repository-owned identities are canonical lowercase UUID v7 strings and
 PostgreSQL `uuid` values. Ingest generates non-reused IDs for the accepted raw
 unit, parent event, attachment, upload, and internal operation as applicable.
@@ -373,7 +390,9 @@ accepted event ID installs a minimal raw deduplication record through the
 earlier of the seven-day default cutoff and the active project's raw-retention
 cutoff, measured from its first `accepted_at`. Retries do not extend that
 period. A matching event ID and matching content digest reuses the original
-acceptance; a different content digest is `409 conflict`.
+acceptance only when an initial error unit also has the same initial attachment
+identity set; a different content digest or attachment identity set is `409
+conflict`.
 The public external event ID is also an alias fence: the compatibility record
 continues to own that alias while its canonical event remains queryable, for
 90 days by default or the shorter effective query-retention cutoff. A matching
@@ -431,6 +450,15 @@ identity. The #16 `payload_digest` remains the semantic RFC 8785 digest for
 compatibility and downstream canonical processing; it does not widen the
 effective raw-admission fence or turn byte-different event retries into
 duplicates.
+
+For an initial error unit, the event ID and event-byte
+`admission_content_digest` are compared together with the canonical sorted set
+of initial attachment identities. Each set member uses the attachment identity
+fields `(filename/name, content_type, attachment_type, sha256(content_bytes))`
+defined below, with the candidate event as the parent; an empty set is also
+part of the comparison. The attachment set is not folded into the ordinary
+event-byte digest, but a set mismatch is still a conflicting initial unit and
+cannot be silently dropped or charged as a separate unseen attachment.
 
 An attachment identity is `(parent_acceptance_id, filename/name,
 content_type, attachment_type, sha256(content_bytes))`, using the decoded
@@ -518,6 +546,25 @@ by exactly that many payload bytes. The manifest has schema
       "attachment_type": "optional-type",
       "length": 456,
       "sha256": "lowercase-hex-sha256-of-this-payload"
+    },
+    {
+      "kind": "minidump",
+      "content_type": "application/octet-stream",
+      "length": 789,
+      "sha256": "lowercase-hex-sha256-of-this-payload",
+      "metadata": {
+        "schema": "watchtower.sentry.minidump.v1",
+        "minidump_sha256": "lowercase-hex-sha256-of-this-payload",
+        "annotations": {
+          "prod": "optional-normalized-value"
+        },
+        "sentry": {
+          "event_id": "normalized-lowercase-event-id",
+          "release": "optional-bounded-string-if-present",
+          "dist": "optional-bounded-string-if-present",
+          "platform": "optional-bounded-string-if-present"
+        }
+      }
     }
   ]
 }
@@ -525,11 +572,18 @@ by exactly that many payload bytes. The manifest has schema
 
 The event section contains the validated decompressed event bytes and each
 attachment section contains the validated decoded or dereferenced attachment
-bytes. The event descriptor precedes attachment descriptors, which are sorted
-by the canonical descriptor bytes; exact duplicate attachment identities are
-coalesced before serialization. Excluded item payloads and client-report-only
-metadata are never placed in the container. The object digest is the lowercase
-SHA-256 of the complete container bytes, including framing, manifest, and all
+bytes, and a minidump section contains the validated decompressed
+`upload_file_minidump` bytes. A minidump descriptor's `metadata` is the exact
+normalized `watchtower.sentry.minidump.v1` digest object, including the Sentry
+event context and Crashpad annotation map, so all validated multipart inputs
+needed by Processor are retained in the raw object rather than only in
+acceptance metadata. Multipart boundaries, part ordering, transport
+compression, DSNs, and request IDs are not retained. The event descriptor
+precedes attachment and minidump descriptors, which are sorted by canonical
+descriptor bytes; exact duplicate attachment identities are coalesced before
+serialization. Excluded item payloads and client-report-only metadata are never
+placed in the container. The object digest is the lowercase SHA-256 of the
+complete container bytes, including framing, manifest, metadata, and all
 sections, and its size is the complete byte length. Per-item digests cover only
 their respective payload sections. `admission_content_digest` and the #16
 semantic `payload_digest` remain separate identities. `RawPayloadReferenceV1`
@@ -704,8 +758,8 @@ The verification specification must use synthetic fixtures and prove:
 - every #16 route, content type, encoding, limit, framing error, unsupported
   item, response, retry header, and no-payload guarantee;
 - valid errors, native crashes, initial attachments, later attachments,
-  client reports, no-ops, atomic invalid units, and independent valid-unit
-  behavior;
+  client reports, no-ops, event-bearing mixed-request rejection rollback,
+  atomic invalid units, and independent valid-unit behavior;
 - missing, malformed, rotated, revoked, cross-project, suspended, deleted,
   stale, and concurrently revoked DSNs, including 60-second projection and
   immediate-fence boundaries;
@@ -713,9 +767,9 @@ The verification specification must use synthetic fixtures and prove:
   retries, whitespace changes, protocol scope, effective raw-cutoff expiry
   without retry extension, query-retention alias fencing while canonical events remain
   queryable, missing IDs, and deletion/restore fencing;
-- equal and different attachment identities, attachment-before-parent,
-  pre-processing attachment delivery, expired/deleted parents, TUS binding,
-  and parent retention cutoffs;
+- equal and different attachment identities, initial-attachment-set duplicate
+  and conflict behavior, attachment-before-parent, pre-processing attachment
+  delivery, expired/deleted parents, TUS binding, and parent retention cutoffs;
 - reservation races, one-charge duplicate handling, TUS staging byte/count
   exhaustion, delayed-cleanup reservation retention, deletion-confirmed
   release/conversion, quota exhaustion, environment
@@ -726,9 +780,10 @@ The verification specification must use synthetic fixtures and prove:
   shutdown, restore, orphan cleanup, quarantine, duplicate delivery, and
   conflicting dispositions;
 - bounded decoding, decompression, duration, concurrency, memory, no-op and
-  client-report acceptance without a raw object, deterministic multipart
-  minidump digests, deterministic `RawUnitContainerV1` framing/digests,
-  completed-disposition tombstones, backlog, quarantine, mandatory
+  client-report acceptance without a raw object, client-report cardinality
+  mapping, deterministic multipart minidump digests with retained metadata,
+  deterministic `RawUnitContainerV1` framing/digests, completed-disposition
+  tombstones, backlog, quarantine, mandatory
   Processor-outage expiry sweeps, retention expiry, and deletion behavior; and
 - safe logs/traces/metrics, immediate risk paging, mTLS/ACL isolation,
   tenant-scoped references, N/N-1 message compatibility, and absence of raw
