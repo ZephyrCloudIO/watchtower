@@ -838,11 +838,15 @@ canonical lowercase UUID v7. The exact mutation precondition wire fields are:
   operation, or body returns `409 conflict`.
 - A versioned resource response includes a strong `ETag` header in the exact
   form `"v<decimal-version>"`, where `<decimal-version>` is a positive base-10
-  API resource version with no leading zeroes. `ETag` is never weak and is not
-  returned as a JSON field. A mutation supplies the observed version only in a
-  single `If-Match` header containing that exact quoted ETag; `If-Match: *`, an
-  unquoted value, a weak tag, a list, or a JSON/query-string version is invalid
-  and returns `400 invalid_request`. A mismatched tag returns `409 conflict`.
+  API resource version with no leading zeroes, unless the route explicitly
+  returns an authorization-filtered representation and omits the validator.
+  `ETag` is never weak and is not returned as a JSON field. A mutation supplies
+  the observed version only in a single `If-Match` header containing that exact
+  quoted ETag; `If-Match: *`, an unquoted value, a weak tag, a list, or a
+  JSON/query-string version is invalid and returns `400 invalid_request`. A
+  mismatched tag returns `409 conflict`. An authorization-filtered response
+  that omits `ETag` may expose a route-defined mutation-version header, but that
+  header is not a representation validator.
 - A project detail response includes one `X-Watchtower-Project-Generation`
   header containing the project's non-reusable canonical lowercase UUID v7
   generation. Project settings `PUT` and `DELETE` requests require that exact
@@ -1058,10 +1062,16 @@ an explicit `null` is retained and means clear the corresponding nullable
 metadata. The `Idempotency-Key`, when supplied, binds to this digest but is not
 included in it. The single-release detail response (`GET
 /api/0/organizations/<organization>/releases/<version>/`) and every successful
-release creation, duplicate, metadata update, and finalization response
-include the strong resource `ETag`. Organization- and project-scoped release
-list responses omit `ETag`, and a collection response ETag is never accepted
-as the observed version for `If-Match`.
+release creation, duplicate, metadata update, and finalization response include
+the strong resource `ETag` when the detail representation contains the complete
+release project association. If current authorization filters one or more
+associated projects from the detail representation, the response omits `ETag`
+and instead includes `X-Watchtower-Resource-Version` with the current exact
+quoted resource-version value (`"v<decimal-version>"`). This header is not a
+representation validator, but its value may be copied verbatim into
+`If-Match`. Organization- and project-scoped release list responses omit
+`ETag`, and a collection response ETag is never accepted as the observed
+version for `If-Match`.
 Release metadata and finalization `PUT` requests require that exact observed
 ETag in `If-Match`; creation has no prior version and does not require it.
 Release creation additionally requires `Idempotency-Key`; a missing or
@@ -1733,7 +1743,11 @@ must be at level 16 or below. Recursive event objects additionally have at most
 are message, exception-value, or stacktrace text. These structural limits are
 checked before unknown-value handling, canonicalization, or digest calculation;
 a value at level 17 returns `400 invalid_envelope` with no acceptance side
-effect.
+effect for an Envelope or legacy `store` ingestion request, and `400
+invalid_request` with no mutation or acceptance side effect for a management
+JSON request. The adapter determines the request family from the route before
+decoding, so deeply nested management values such as deployment `metadata`
+never use the ingestion `invalid_envelope` code.
 
 The smaller applicable limit wins. A request that exceeds a byte, decoded-
 payload, multipart-count, or explicit assembly-cardinality limit returns `413`
@@ -2209,6 +2223,17 @@ ordering is fixed per route:
 | `GET /api/0/projects/<organization>/<project>/releases/<version>/files/` | `dateCreated ASC`, then artifact `id ASC` |
 | `GET /api/0/organizations/<organization>/releases/<version>/deploys/` | `dateFinished DESC`, then deployment `id ASC` |
 
+Every non-numeric string tie-breaker in the table above uses ascending
+lexicographic Unicode-scalar ordinal comparison after NFC normalization,
+independent of locale or database collation. This includes organization,
+project, DSN, issue, release, and deployment compatibility aliases, plus
+external event and commit IDs. Canonical lowercase UUID and checksum values use
+the same comparator after their required lowercase normalization. Normalization
+affects ordering only; the original compatibility alias or version remains the
+DTO value. Thus aliases such as `"10"` and `"2"` order as `"10"`, then `"2"`,
+and the same comparator is used for the corresponding opaque cursor boundary
+and `previous-with-commits` selection.
+
 For both release-list routes, `NFC(version) ASC` means ascending lexicographic
 Unicode-scalar ordinal order after NFC normalization, independent of locale or
 database collation. The original release version remains the DTO value;
@@ -2355,9 +2380,20 @@ Watchtower management credential. SDK DSNs are not used for artifact writes.
 The contract supports JavaScript source maps, native dSYMs and Breakpad/Crashpad
 debug files, Android ProGuard/R8 mappings, and the artifact metadata required by
 the pinned clients. Artifact-bundle assembly accepts an optional release
-`version`; when absent, the artifact has `release: null` and uses the explicit
-versionless identity `(project, null release, dist, artifact type, logical
-filename)`. Because the pinned artifact-bundle request has no filename field,
+`version`. After request-shape and project-list validation, a supplied version
+must resolve to an existing release with that exact tenant-scoped version, and
+every requested project must already be associated with that release. An
+unknown, cross-organization, or inaccessible release, or a requested project
+that is not associated with it, returns indistinguishable `404 not_found` with
+no chunk, assembly operation, artifact, release, or association side effect.
+Versioned artifact-bundle assembly never creates or associates a release; the
+release and its project associations must be created through the release
+management route first. Existing project authorization and lifecycle rules
+still apply after this release check, including `403` for a disabled target.
+When `version` is absent, the artifact has `release: null` and uses the
+explicit versionless identity `(project, null release, dist, artifact type,
+logical filename)`. Because the pinned artifact-bundle request has no filename
+field,
 the adapter uses the deterministic synthetic name
 `artifact-bundle-<checksum>` (the lowercase 40-character bundle SHA-1) for the
 Artifact DTO and this identity. Release-associated artifacts are content-addressed and idempotent
@@ -2700,7 +2736,9 @@ and an eligible release with no remaining readable project is omitted or
 returned as indistinguishable `404 not_found` for detail. An unassociated
 release is visible only to a principal with organization-level `Owner` or
 `Admin` authority. No organization-scoped Release DTO exposes an unreadable
-project's ID, slug, or name.
+project's ID, slug, or name. A filtered organization-scoped detail omits the
+strong `ETag` and uses `X-Watchtower-Resource-Version` as the separate mutation
+version described above.
 The same eligibility predicate applies before every organization-scoped
 release subresource read, including `/commits/` and `/deploys/`: an associated
 release requires at least one currently readable associated project, while an
@@ -2987,9 +3025,11 @@ exercise:
   item and 50,000,000-byte aggregate limits, with no partial persistence, plus
   unknown Envelope-header values at and over the global 16-level JSON nesting
   bound, including ignored over-depth values returning `400 invalid_envelope`
-  without acceptance, and unsupported `content_encoding` values on unknown or
-  individually excluded items being ignored while recognized item types return
-  `415 unsupported_media_type`;
+  without acceptance, management JSON and deeply nested deployment metadata at
+  the same boundary returning `400 invalid_request` without mutation, and
+  unsupported `content_encoding` values on unknown or individually excluded
+  items being ignored while recognized item types return `415
+  unsupported_media_type`;
 - duplicate, case-variant, malformed, and conflicting event IDs, including
   acceptance-record retirement while the canonical event remains queryable,
   identical retries after environment retirement, and uniqueness-tombstone
@@ -3047,7 +3087,10 @@ exercise:
   `X-Sentry-Token`, including agreeing sources, conflicting principals or
   effective scopes, malformed secondary sources, and rejection before tenant
   lookup or mutation;
-- versioned and versionless artifact-bundle assembly, the deterministic
+- versioned and versionless artifact-bundle assembly, including unknown or
+  inaccessible release versions, missing project associations, and the
+  no-side-effect rejection before chunk or operation acceptance, the
+  deterministic
   `artifact-bundle-<checksum>` name, reuse of identical bundle bytes across
   release, distribution, and project-list identities, release-artifact
   identity across release-or-null, distribution, artifact type, and logical
@@ -3075,6 +3118,8 @@ exercise:
   plus same-key fresh-authentication reconfirmation after Support release
   without creating a second operation;
 - pagination using the documented per-route order and tie-breaker, including
+  numeric-looking aliases such as `"10"` and `"2"`, NFC-equivalent aliases,
+  matching opaque cursor boundaries, and `previous-with-commits` selection,
   deterministic rate-limit ordering for equal scope/category/duration entries
   with different reasons or namespaces, rejection of namespace-bearing entries
   without a reason, total singleton-bucket selection for
@@ -3139,7 +3184,8 @@ exercise:
   lost-response retries, exact 24-hour retention and post-expiry behavior for
   release creation and completed keyless retry records, stale-generation
   conflicts, exact `201`/`200`
-  DTO responses and headers including strong mutation ETags and list-response
+  DTO responses and headers including strong mutation ETags, filtered release
+  detail omission of `ETag` with `X-Watchtower-Resource-Version`, list-response
   ETag omission, no `202` operation responses, and rejection of
   unknown or misplaced fields, mixed-authority project lists, all-or-nothing
   project authorization, the Owner/Admin requirement when `projects` is
