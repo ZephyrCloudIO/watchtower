@@ -604,8 +604,8 @@ the v1 browser-origin setting:
 ```
 
 The array is unique and uses the origin validation rules below. No other
-project setting is exposed by this compatibility route. The project-creation
-canonical request identity is the lowercase SHA-256 of the RFC 8785
+project setting is exposed by this compatibility route. The project-settings
+update canonical request identity is the lowercase SHA-256 of the RFC 8785
 canonical-JSON encoding of the normalized body; the required
 `Idempotency-Key` binds to that digest and is excluded from it. Project updates
 use the observed strong `If-Match` ETag and existing mutation idempotency rules.
@@ -659,9 +659,9 @@ reports the mutation as a successful Project DTO result.
 
 | Mutation | Initial request | Pending poll or duplicate | Terminal or completed duplicate |
 | --- | --- | --- | --- |
-| Project creation | `POST` returns `202` pending Operation DTO and requires `Idempotency-Key`. | The same key and canonical body return the same pending operation with `202`; changed body within the same principal/organization/operation tuple returns `409 conflict`, while another scope is independent. | While `now < completed_at + 24h`, the operation URL and a repeat of the same key return `200` with `status: "succeeded"` and the same Project DTO in `result`. At `now >= completed_at + 24h`, the operation URL and completed duplicate return the top-level `410 operation_expired` error; they do not create another project or operation. |
-| Browser-origin update | When the generation-matched Ingest acknowledgement is already available, `PUT` returns `200` with the Project DTO, the new strong `ETag`, and no `Location` or `Retry-After`; otherwise it returns `202` with a pending Operation DTO. | A retry with the same project, observed `If-Match`, normalized body, and supplied key, if any, returns the same current `200` or `202` result before the current-version check; otherwise a stale `If-Match` returns `409 conflict`. | A pending update polls to `200` with a succeeded Operation DTO whose `result` is the updated Project DTO. While `now < completed_at + 24h`, a matching completed duplicate returns the same terminal result; at `now >= completed_at + 24h`, both the operation URL and matching completed duplicate return the top-level `410 operation_expired` error before current-version or lifecycle evaluation, without creating another operation or setting mutation. |
-| Project deletion | A bodyless authorized request with the required confirmation, observed `If-Match`, and `Idempotency-Key` returns `202` pending Operation DTO; it never returns a Project DTO. | The same target and key return the same pending operation with `202` while `completed_at` is `null`; changed content within the same principal/project/operation tuple returns `409 conflict`, while another scope is independent. | Once terminal, the operation URL and a matching retry return `200` with a succeeded Operation DTO and `result: null` while `now < completed_at + 24h`; at `now >= completed_at + 24h`, both return the top-level `410 operation_expired` error before deleted-project lifecycle lookup, without exposing a deleted Project DTO or creating another operation. |
+| Project creation | `POST` returns `202` pending Operation DTO and requires `Idempotency-Key`. | The same key and canonical body return the same pending operation with `202`; changed body within the same principal/organization/operation tuple returns `409 conflict`, while another scope is independent. | While `now < completed_at + 24h`, the operation URL and a repeat of the same key return `200` with either `status: "succeeded"` and the same Project DTO in `result`, or `status: "failed"` with `result: null` and the standard non-null Operation `error` when the pending mutation fails because of an owner, lifecycle, or artifact dependency. At `now >= completed_at + 24h`, the operation URL and completed duplicate return the top-level `410 operation_expired` error; they do not create another project or operation. |
+| Browser-origin update | When the generation-matched Ingest acknowledgement is already available, `PUT` returns `200` with the Project DTO, the new strong `ETag`, and no `Location` or `Retry-After`; otherwise it returns `202` with a pending Operation DTO. | A retry with the same project, observed `If-Match`, normalized body, and supplied key, if any, returns the same current `200` or `202` result before the current-version check; otherwise a stale `If-Match` returns `409 conflict`. | A pending update polls to `200` with either a `status: "succeeded"` Operation DTO whose `result` is the updated Project DTO, or a `status: "failed"` Operation DTO with `result: null` and the standard non-null `error` when the pending mutation fails because of an owner, lifecycle, or artifact dependency. While `now < completed_at + 24h`, a matching completed duplicate returns the same terminal result; at `now >= completed_at + 24h`, both the operation URL and matching completed duplicate return the top-level `410 operation_expired` error before current-version or lifecycle evaluation, without creating another operation or setting mutation. |
+| Project deletion | A bodyless authorized request with the required confirmation, observed `If-Match`, and `Idempotency-Key` returns `202` pending Operation DTO; it never returns a Project DTO. | The same target and key return the same pending operation with `202` while `completed_at` is `null`; changed content within the same principal/project/operation tuple returns `409 conflict`, while another scope is independent. | Once terminal, the operation URL and a matching retry return `200` with either a `status: "succeeded"` Operation DTO and `result: null`, or a `status: "failed"` Operation DTO with `result: null` and the standard non-null `error` when the pending deletion fails because of an owner, lifecycle, or artifact dependency, while `now < completed_at + 24h`; at `now >= completed_at + 24h`, both return the top-level `410 operation_expired` error before deleted-project lifecycle lookup, without exposing a deleted Project DTO or creating another operation. |
 
 Direct Project DTO responses include the resource `ETag` and the
 `X-Watchtower-Project-Generation` response header. Operation DTO responses do
@@ -911,7 +911,7 @@ are omitted, never emitted as `null`, and never become an extension surface.
 
 | DTO | Field | Type and rule |
 | --- | --- | --- |
-| Organization | `id` | Required non-empty string compatibility alias; never a Watchtower canonical ID |
+| Organization | `id` | Required canonical lowercase UUID v7 repository-owned organization/tenant identifier; never a compatibility alias |
 | Organization | `slug` | Required string compatibility alias |
 | Organization | `name` | Required string |
 | Organization | `status` | Required enum: `active`, `suspended`, or `deleting` |
@@ -2618,6 +2618,25 @@ all match, where each target is the same
 identity is `(tenant_id, checksum, ordered_chunks, version_or_null,
 dist_or_null, ordered_resolved_targets)`, where the resolved targets are part
 of the identity rather than only the submitted aliases.
+
+For both DIF and artifact-bundle assemblies, `maxFileSize: 50000000` is
+measured against the complete decompressed assembled bytes. If all referenced
+chunks are available at initial submission and the assembled bytes exceed that
+limit, the request returns `413 payload_too_large` before that assembly identity
+is accepted. If a missing-chunk assembly was accepted as pending and later
+completion reveals that it exceeds the limit, it terminalizes as an oversize
+failure rather than returning an undefined result or reopening the assembly.
+The exact bounded detail is `The assembled file exceeds the 50 MB limit.`
+
+For a deferred oversized DIF entry, the terminal result is `state: "error"`
+with that detail, an empty `missingChunks` array, and no `dif` member. The DIF
+POST returns `200` once every entry is terminal, and this result is stable for
+later identical polls. For a deferred oversized artifact bundle, the terminal
+response is `200` with `state: "failed"`, an empty `missingChunks` array, that
+top-level detail, and one failed/null project result per input project. No
+artifact or project registration is exposed as a partial success, and later
+chunk uploads do not reopen the terminal failure.
+
 If a project slug was deleted and reused, a request that resolves to a new
 canonical UUID or generation does not match the old pending or terminal
 assembly: it is evaluated as a fresh assembly against the current chunks and
