@@ -237,7 +237,7 @@ to a native route.
 | `/api/<project_id>/store/` | `POST` | Collection-only DSN | Supported legacy JSON error path required by a pinned client. The body is converted to one error event and follows Envelope admission semantics. Malformed JSON, an invalid body shape, or invalid required event fields return `400 invalid_envelope` with no acceptance side effect. Successful admission returns `200` with a zero-length body and request-ID headers. |
 | `/api/<project_id>/minidump/` | `POST` | Collection-only DSN | Supported for pinned crash workflows whose fixture specifies the non-Envelope minidump path. `multipart/form-data` and the pinned client field names are accepted. Successful admission returns `200` with a zero-length body and request-ID headers. |
 | `/api/<project_id>/upload/` | `POST` | Collection-only DSN | Supported pinned Native large-attachment TUS creation route. A valid integer `Upload-Length` from `0` through `20,000,000`, `Tus-Resumable: 1.0.0`, and `Upload-Metadata: sentry <base64({"attachment_type":"event.minidump"})>` request returns `201` with an absolute HTTP(S), project-bound `Location` containing a canonical lowercase UUID v7 `upload_id`, `Tus-Resumable: 1.0.0`, and `Upload-Offset: 0`; a zero-length upload is created directly as `complete-unbound`, while a positive-length upload is pending. Neither creation path accepts attachment bytes. A pending upload has a fixed 24-hour lifetime beginning at creation. |
-| `/api/<project_id>/upload/<upload_id>` | `HEAD`, `PATCH` | Collection-only DSN bound to the upload | Supported pinned Native TUS offset and append workflow. `HEAD` requires request `Tus-Resumable: 1.0.0` and, on success, returns `200` with an empty body and `Tus-Resumable: 1.0.0`, `Upload-Offset`, and `Upload-Length` response headers. Missing or unsupported `Tus-Resumable` returns `412 precondition_failed`; a missing, expired, already-bound, or inaccessible upload returns `404 not_found`, and invalid authentication returns `401 invalid_authentication`. A failed `HEAD` has no response body or `Content-Type`; it returns only its status, `Tus-Resumable: 1.0.0`, request-ID headers, and `Content-Length: 0`, with no `Upload-Offset` or `Upload-Length`. `PATCH` requires `Tus-Resumable: 1.0.0`, `Upload-Offset`, and `application/offset+octet-stream`, appends only at the expected offset, and returns `204` with an empty body, `Tus-Resumable: 1.0.0`, and the new `Upload-Offset`. A stale or mismatched offset returns `409 conflict` with the current `Upload-Offset`; bytes that would exceed `Upload-Length` return `413 payload_too_large` with the current `Upload-Offset`. `PATCH` failures use the standard JSON error body and atomically append no bytes. Reaching the declared length transitions the upload to `complete-unbound`; it remains subject to attachment and project limits and is not accepted until the subsequent Envelope binds it to an event. |
+| `/api/<project_id>/upload/<upload_id>` | `HEAD`, `PATCH` | Collection-only DSN bound to the upload | Supported pinned Native TUS offset and append workflow. `HEAD` requires request `Tus-Resumable: 1.0.0` and, on success, returns `200` with an empty body and `Tus-Resumable: 1.0.0`, `Upload-Offset`, and `Upload-Length` response headers. Missing or unsupported `Tus-Resumable` returns `412 precondition_failed`; a missing, expired, already-bound, or inaccessible upload returns `404 not_found`, and invalid authentication returns `401 invalid_authentication`. A failed `HEAD` has no response body or `Content-Type`; it returns only its status, `Tus-Resumable: 1.0.0`, request-ID headers, and `Content-Length: 0`, with no `Upload-Offset` or `Upload-Length`. `PATCH` requires `Tus-Resumable: 1.0.0`, `Upload-Offset`, and `application/offset+octet-stream`, appends only at the expected offset, and returns `204` with an empty body, `Tus-Resumable: 1.0.0`, and the new `Upload-Offset`. A stale or mismatched offset returns `409 conflict` with the current `Upload-Offset`; bytes that would exceed `Upload-Length` return `413 payload_too_large` with the current `Upload-Offset`. Every `PATCH` response, including precondition, authentication, not-found, stale-offset, and overflow failures, includes `Tus-Resumable: 1.0.0`; failed `PATCH` requests retain the standard JSON error body and atomically append no bytes. Reaching the declared length transitions the upload to `complete-unbound`; it remains subject to attachment and project limits and is not accepted until the subsequent Envelope binds it to an event. |
 | `/api/<project_id>/security-report/` | `POST` | Collection-only DSN | Explicitly unsupported in v1; returns `501 unsupported_capability` with no persistence side effect because security reports are not error telemetry. |
 | Any other `/api/<project_id>/...` ingestion route | Any | Any | `404` or `405` according to whether the path or method is unknown; no side effect. An unknown-path `HEAD` is status/header-only as defined below. |
 
@@ -471,8 +471,8 @@ the allowlist, or a project with no configured allowlist, receives
 | `/api/0/projects/<organization>/<project>/keys/` | `GET` DSN metadata/public DSNs and `POST` issuance using the exact closed body and `201` response below. Plaintext management tokens are never returned. |
 | `/api/0/projects/<organization>/<project>/keys/<key_id>/` | `PUT` rotation with the empty JSON object `{}` and `200` DSN response, and bodyless `DELETE` revocation with `204`; both use the exact idempotency rules below and never return a secret. |
 | `/api/0/projects/<organization>/<project>/issues/` | `GET` issue list with the exact bounded filters and cursor pagination defined below, and `PUT` only for the pinned bulk status operation with repeated bounded `id` query parameters and a `resolved`, `unresolved`, `ignored`, `muted`, or `resolvedInNextRelease` status body. The latter two map as defined for the unqualified issue route. `POST`, `DELETE`, and unbounded bulk operations are unsupported. |
-| `/api/0/issues/<issue>/` | `GET` issue read and `PUT` status transitions with the exact request body defined below for `resolved`, `unresolved`, `ignored`, `muted`, and `resolvedInNextRelease`. `muted` maps to `ignored`; `resolvedInNextRelease` maps to `resolved` with `statusDetails.inNextRelease: true`. The issue alias is globally unique across tenants; the adapter resolves it before checking authorization for its owning tenant, and an inaccessible issue is indistinguishable from an unknown issue. Issue assignment, merge, split, delete, bookmark, alert, and comment operations are unsupported. |
-| `/api/0/issues/<issue>/events/` | `GET` issue event list with bounded cursor pagination. The `<issue>` alias uses the same global resolution and owning-tenant authorization rule as the single-issue route. |
+| `/api/0/issues/<issue>/` | `GET` issue read and `PUT` status transitions with the exact request body defined below for `resolved`, `unresolved`, `ignored`, `muted`, and `resolvedInNextRelease`. `<issue>` accepts the canonical lowercase UUID v7 `Issue.id` or the globally unique `shortId` compatibility alias; `Issue.id` is the persistent identity returned in the DTO. `muted` maps to `ignored`; `resolvedInNextRelease` maps to `resolved` with `statusDetails.inNextRelease: true`. The resolver checks the owning tenant before authorization, and an inaccessible issue is indistinguishable from an unknown issue. Issue assignment, merge, split, delete, bookmark, alert, and comment operations are unsupported. |
+| `/api/0/issues/<issue>/events/` | `GET` issue event list with bounded cursor pagination. `<issue>` accepts the canonical lowercase UUID v7 `Issue.id` or the same globally unique `shortId` compatibility alias, using the single-issue route's resolution and owning-tenant authorization rule. |
 | `/api/0/projects/<organization>/<project>/events/` | `GET` project event list with bounded cursor pagination for the pinned CLI/query workflow. |
 | `/api/0/projects/<organization>/<project>/events/<event>/` | `GET` event read subject to tenant, project, retention, and query authorization. The external event identifier is never a Watchtower primary key. |
 | `/api/0/organizations/<organization>/releases/` | `GET` release list and `POST` release creation. Release reads/updates/finalization use the exact sentry-cli request fields and idempotency rules. |
@@ -887,7 +887,7 @@ payloads into internal messages.
 | Organization/project read | Organization/project compatibility alias and current management credential | Upstream-compatible resource DTO containing only currently readable fields, canonical-safe pagination link, and request ID |
 | Project create/update/delete | Organization scope, the exact project mutation body defined below, current authorization, observed version and `X-Watchtower-Project-Generation` for settings update and delete, a bodyless delete, `X-Confirm-Project-Name` for delete, and idempotency key for create/delete | Exact `200` Project DTO or `202`/`200` Operation DTO responses defined in Project mutation responses; direct Project DTOs include the strong `ETag` and project-generation header |
 | DSN issue/rotate/revoke | Project scope, the exact closed issuance body, `{}` rotation body, or bodyless revocation shape below, current Manage authority, and a required idempotency key | `201` issuance or `200` rotation returns the fixed DSN DTO; `204` revocation has an empty body; management-token plaintext is never returned |
-| Issue/event read or status transition | Globally unique issue alias resolved before owning-tenant authorization, or tenant/project-scoped event alias, bounded filters or status, and current credential | The fixed Issue or Event DTO below, request ID, and cursor link when paginated |
+| Issue/event read or status transition | Canonical lowercase UUID v7 Issue ID or globally unique `shortId` compatibility alias resolved before owning-tenant authorization, or tenant/project-scoped event alias, bounded filters or status, and current credential | The fixed Issue or Event DTO below, request ID, and cursor link when paginated |
 | Release mutation | Organization/project scope, release version, bounded metadata, and canonical request identity; release creation requires an `Idempotency-Key` | `201` for a new release or `200` for duplicate/update/finalization, with the direct Release DTO and request-ID headers; no operation state |
 | Direct release-file upload | Project/release version scope, logical filename, optional distribution, bounded bytes, artifact type, and management credential | An upload operation ID and `202` pending state when asynchronous; artifact/file/checksum identity is returned by the successful terminal poll; artifact-bundle assembly uses the native response below and returns no assembly operation ID or status URL |
 | DIF chunk/assembly upload | Organization or project capability scope for chunks, project scope for assembly, a checksum-keyed request map of one to 256 entries whose lowercase full-file SHA-1 keys each map to `name`, optional `debug_id`, and ordered chunks, bounded bytes, and management credential | DIF checksum/debug identities and native repeat-POST `202` pending state when asynchronous; no assembly operation ID or status URL is returned |
@@ -1106,8 +1106,9 @@ malformed key returns `400 invalid_request` before mutation.
 ```
 
 `version` is required and is a non-empty bounded string containing no control
-characters. This is the same control-character restriction applied to decoded
-`<version>` path segments below. `projects` is
+characters and is not exactly `.` or `..`. This is the same control-character
+and dot-segment restriction applied to decoded `<version>` path segments below.
+`projects` is
 optional, but when present is a non-null array of at most 100 unique project
 aliases from the organization. `ref`, `url`, and `dateStarted` are optional nullable
 strings; a non-null `url` is an HTTP(S) URL and a non-null `dateStarted` is an
@@ -1115,7 +1116,7 @@ RFC 3339 UTC timestamp with zero through nine fractional decimal digits. The
 accepted timestamp is normalized to `YYYY-MM-DDTHH:mm:ss.sssssssssZ`.
 `dateReleased` is not accepted during creation;
 finalization uses the separate body below. An empty object, a missing or empty
-`version`, a control character in `version`, an invalid nullable value, a
+`version`, a control character or exact dot segment in `version`, an invalid nullable value, a
 duplicate project, or any other member returns `400 invalid_request` before
 mutation.
 
@@ -1231,8 +1232,8 @@ surface.
 
 | DTO | Field | Type and rule |
 | --- | --- | --- |
-| Issue | `id` | Required non-empty string compatibility alias; never a Watchtower canonical ID |
-| Issue | `shortId` | Required string compatibility alias |
+| Issue | `id` | Required canonical lowercase UUID v7 repository-owned persistent issue identifier; this is the canonical `<issue>` route identity |
+| Issue | `shortId` | Required non-empty globally unique compatibility/display alias; it is accepted as an alternate `<issue>` lookup value but is never the persistent Issue identity |
 | Issue | `title` | Required string |
 | Issue | `culprit` | Nullable string |
 | Issue | `level` | Required enum: `sample`, `debug`, `info`, `warning`, `error`, `fatal`, or `unknown` |
@@ -1511,6 +1512,10 @@ ingestion or `/api/0/...` management route, whose `404` status and request-ID
 headers remain authoritative. All four have `Content-Length: 0`, neither
 `Content-Type` nor a JSON error body, and no response body.
 
+Failed TUS `PATCH` responses use the standard JSON error object and always
+include `Tus-Resumable: 1.0.0`; the header does not imply that any bytes were
+appended.
+
 ```json
 {
   "code": "invalid_request",
@@ -1700,12 +1705,18 @@ or transport metadata. The annotation values are the decoded NFC-normalized
 strings defined above. Annotation keys and object keys use RFC 8785 ordering, and
 the minidump hash is over decompressed bytes rather than multipart framing or
 compressed bytes. A missing `sentry` part or missing/malformed `event_id`
-returns `400 invalid_request` before acceptance. The retry identity is
-`(tenant_id, project_id, external_event_id, minidump_digest)`. A matching
-identity returns the original `200` empty-body acceptance, while a matching
-external event ID or digest with different bytes, annotations, or metadata
-returns `409 conflict`. The Ingest acceptance record retains the digest and
-identity for the same acceptance-retention horizon as the raw handoff.
+returns `400 invalid_request` before acceptance. Minidump submissions use the
+same cross-transport event-ID uniqueness record as Envelope and legacy `store`
+ingestion. That record is keyed by
+`(tenant_id, project_id, external_event_id)`, stores the accepted transport
+payload digest and canonical event reference, and remains authoritative through
+the full query-retention horizon even after the raw minidump acceptance record
+expires. For minidumps, `minidump_digest` is the transport payload digest: a
+matching event ID and digest returns the original `200` empty-body acceptance,
+while an existing event ID with a different digest, bytes, annotations, or
+metadata—including one accepted through another event-bearing transport—returns
+`409 conflict` without creating a second canonical event. The Ingest acceptance
+record retains the digest and identity for the raw-handoff acceptance horizon.
 
 ### Explicit limits
 
@@ -2013,9 +2024,13 @@ correlation ID.
 
 Unknown top-level members in Envelope headers, members in item headers, event
 payloads, client reports, minidump metadata, and extensible bounded DTO data
-are ignored at the adapter boundary and are never persisted, returned, or used
-for authorization; the nested Envelope-header `sdk` and `trace` objects remain
-closed schemas. Exact management request bodies defined by this contract,
+are removed at the adapter boundary before NFC normalization or key-collision
+validation; they are never persisted, returned, or used for authorization. An
+unknown member therefore cannot create an NFC collision or turn an otherwise
+valid extensible payload into `400`; collisions among retained fields and
+recursive objects whose keys are accepted data remain invalid. The nested
+Envelope-header `sdk` and `trace` objects remain closed schemas. Exact
+management request bodies defined by this contract,
 including project mutations, release mutations, issue status transitions, and
 artifact or deployment assembly bodies, are closed schemas: an unknown member
 returns `400 invalid_request` before mutation. Unknown fields never authorize a
@@ -2124,10 +2139,11 @@ tie-breaker.
   lexeme as an exact decimal and is accepted only when conversion to the RFC
   8785 IEEE-754 binary64 number model and canonical reserialization preserve
   the same numeric value; values such as `9007199254740993` are rejected
-  rather than rounded to `9007199254740992`. Before sorting or emitting any
-  object, the adapter NFC-normalizes every key and rejects the object with
-  `400 invalid_envelope` if two distinct input keys produce the same normalized
-  key; it never overwrites or resolves the collision. Object keys are then
+  rather than rounded to `9007199254740992`. After extensible unknown-member
+  removal, before sorting or emitting any retained object, the adapter
+  NFC-normalizes every key and rejects the object with `400 invalid_envelope`
+  if two distinct input keys produce the same normalized key; it never
+  overwrites or resolves the collision. Object keys are then
   sorted, array order is preserved, and explicit `null` members are retained
   inside a present nested object. The normalized top-level object contains only
   the listed accepted fields, uses the normalized values above, and is
@@ -2170,23 +2186,26 @@ tie-breaker.
   unsupported-only, and attachment-only Envelopes use `event: null`, an empty
   attachment array, and an empty client-report array.
 - A retained supported event submission is idempotent by the tuple
-  `(tenant_id, project_id, external_event_id, payload_digest)` while the
-  Ingest-owned acceptance record containing the payload digest and original
-  acceptance remains retained. The same tuple returns the original
-  acceptance; the same event ID with a different digest returns `409` and is
-  not merged or durably accepted. These idempotency checks apply only when the
+  `(tenant_id, project_id, external_event_id, payload_digest)`, recorded in the
+  one cross-transport event-ID uniqueness record shared by Envelope, legacy
+  `store`, and minidump ingestion. The record is keyed by
+  `(tenant_id, project_id, external_event_id)` and stores the accepted transport
+  payload digest and canonical event reference. A matching tuple returns the
+  original acceptance; the same event ID with a different digest returns `409`
+  and is not merged or durably accepted. These idempotency checks apply only when the
   Envelope retains a supported event item, occur after complete structural
   validation and before the environment retirement fence or any new acceptance
   side effect, so this
   `409 conflict` is the explicit exception to the otherwise universal `200`
-  Envelope acknowledgement. If the acceptance record retires while the canonical event
-  remains queryable, a payload-free uniqueness tombstone retains the scoped
-  event ID, digest, and canonical event reference for at least the full query-
-  retention horizon. During that horizon, a matching retry returns the original
+  Envelope acknowledgement. If the raw acceptance record retires while the
+  canonical event remains queryable, the shared uniqueness record remains
+  authoritative through the full query-retention horizon. During that horizon,
+  a matching retry returns the original
   acceptance without creating another event, while a different digest returns
   `409 conflict`; the event-detail route resolves the one retained canonical
-  event. Only after the tombstone and query-retention horizon expire does this
-  contract make no historical deduplication or conflicting-digest guarantee.
+  event. Only after the shared record and query-retention horizon expire does
+  this contract make no historical deduplication or conflicting-digest
+  guarantee.
 - An accepted Envelope with no retained supported event item uses a separate
   no-op/client-report retry identity when the caller supplied a valid canonical
   `X-Request-ID`: `(tenant_id, project_id, client_request_id, payload_digest)`.
@@ -2281,7 +2300,12 @@ the original route scope and filters. Every later page uses the same snapshot,
 so records inserted or reordered after the first page are deferred to a new
 traversal rather than skipped or duplicated. Each page rechecks current
 authorization, revocation, lifecycle, retention, and security-projection
-freshness; a record that is no longer authorized is omitted without disclosure.
+freshness. If the authorization or security revision bound into the cursor has
+changed, the entire traversal is stale and the request returns `403
+permission_denied`; it never continues with a silently filtered page. When
+those bound revisions remain valid, a record that is no longer readable because
+of a current lifecycle, retention, or security-projection check is omitted
+without disclosure.
 A snapshot and every cursor created for it have a fixed 15-minute lifetime
 starting at the instant the first page establishes the snapshot. The cursor
 carries that immutable expiration, and page reads, retries, and generated next
@@ -2830,10 +2854,10 @@ Every `<version>` in a release path is one RFC 3986 URI path segment. Clients
 percent-encode the UTF-8 bytes of the version, including reserved bytes such as
 `/`, `?`, `#`, and `%`; `+` is a literal plus in a path and is not decoded as a
 space. The adapter segments the raw path before decoding exactly once, rejects
-malformed escapes, invalid UTF-8, controls, and an empty decoded version with
-`400 invalid_request`, and then uses the decoded string for the scoped release
-lookup. Query-string bytes and a second decode can never alter the release
-alias.
+malformed escapes, invalid UTF-8, controls, an empty decoded version, and an
+exact decoded `.` or `..` dot segment with `400 invalid_request`, and then uses
+the decoded string for the scoped release lookup. Query-string bytes and a
+second decode can never alter the release alias.
 
 Release-file cleanup uses
 `GET` and `DELETE /api/0/projects/<organization>/<project>/releases/<version>/files/<file_id>/`.
@@ -2936,23 +2960,25 @@ unsupported release-health behavior.
   resource identities are canonical lowercase UUID v7 values at Watchtower
   boundaries and PostgreSQL `uuid` when persisted by their owner.
 - Sentry project IDs supplied in compatibility routes, release versions, and event IDs are
-  compatibility aliases or scoped external identifiers. Issue IDs and short
-  IDs are globally unique compatibility aliases across tenants and are never
-  reused across project generations. Organization slugs are globally
+  compatibility aliases or scoped external identifiers. Issue IDs are canonical
+  lowercase UUID v7 persistent identities; issue `shortId` values are globally
+  unique compatibility aliases across tenants and are never reused across
+  project generations. Organization slugs are globally
   unique compatibility aliases; project slugs are unique within their
   organization and tenant-scoped. Organization slugs are resolved before tenant
   selection, while project slugs are resolved only after the canonical tenant
   is selected. Slugs may be reused only after deletion completes for a new
   resource generation, while canonical IDs and other scoped external
   identifiers are never reused across generations.
-- SDK event IDs for retained supported events are retained as
-  `(tenant_id, project_id, external_event_id)` identifiers. Two projects may
-  use the same event ID without collision or disclosure. A payload-free
-  uniqueness tombstone prevents reuse while the canonical event remains
-  queryable, and the scoped event alias resolves to at most that one canonical
-  event. An SDK event ID is never a canonical Watchtower primary key. An event
-  ID carried only by an empty or excluded-only Envelope is not registered and
-  may be reused by a later supported event.
+- Supported event IDs from Envelope, legacy `store`, and minidump ingestion use
+  one cross-transport uniqueness record keyed by
+  `(tenant_id, project_id, external_event_id)`. Two projects may use the same
+  event ID without collision or disclosure. The record stores the accepted
+  transport payload digest and canonical event reference, remains authoritative
+  while the canonical event is queryable, and prevents a second canonical event
+  or incompatible retry across transports. An event ID is never a canonical
+  Watchtower primary key. An event ID carried only by an empty or excluded-only
+  Envelope is not registered and may be reused by a later supported event.
 - API owns control-plane, project, DSN, release, artifact, operation, and audit
   authority. Ingest owns raw accepted records and recoverable handoff. Processor
   owns processing, canonical telemetry, symbolication, and derived issue data.
@@ -3057,7 +3083,10 @@ exercise:
   values, NFC normalization, and the post-normalization byte bound,
   body-only `application/octet-stream` requests, and unlisted file parts,
   bounded fields, deterministic `400 invalid_request` no-side-effect failures,
-  and the successful `200` zero-length acknowledgement;
+  the successful `200` zero-length acknowledgement, and shared
+  cross-transport event-ID uniqueness with Envelope/store ingestion, including
+  retries after raw acceptance expiry while the canonical event remains
+  queryable and conflicting payload digests returning `409`;
 - `sdk.native.crash` using the exact multipart minidump request and
   `sdk.native.tus-minidump` using the separate TUS creation/append and Envelope
   `attachment-ref` binding workflow;
@@ -3077,8 +3106,9 @@ exercise:
   failures, and `404` missing/expired/bound/inaccessible uploads, followed by
   expected-offset identity-only `PATCH` appends, gzip `415` responses with no
   append, stale-offset `409` responses and current
-  offsets, overflow `413` responses, atomic no-append behavior for both
-  failures, incomplete-upload retention, finalization at the declared length,
+  offsets, overflow `413` responses, `Tus-Resumable: 1.0.0` on every successful
+  and failed `PATCH`, atomic no-append behavior for both failures,
+  incomplete-upload retention, finalization at the declared length,
   the 24-hour pending and complete-unbound lifetimes, no extension by append,
   and exact `now >= expires_at` behavior,
   failed-`HEAD` status/header-only responses with `Content-Length: 0`, the
@@ -3129,7 +3159,8 @@ exercise:
   `accepted_at` to `dateReceived` mapping, missing-timestamp fallback,
   nanosecond precision/range rejection including leap-second rejection, strict
   lowercase level validation with explicit-null and case-variant rejection,
-  deterministic tag-array serialization, duplicate-event rejection, event items with no
+  deterministic tag-array serialization, duplicate-event rejection across
+  Envelope, legacy `store`, and minidump transports, event items with no
   error signal, strict `user`/`sdk` type validation and null/missing/unknown
   member mapping, recognized Envelope `event_id`/`dsn`/`sent_at`/`sdk`/`trace`
   header shapes, `sent_at` precision/range/leap-second/sub-nanosecond rejection
@@ -3139,7 +3170,8 @@ exercise:
   decomposed event release preservation and release/artifact association,
   unknown top-level members, rejected unknown nested
   `sdk`/`trace` members, invalid-shape rejection, and NFC-normalized key
-  collisions before hashing, including rejection of scalar and `null`
+  collisions after extensible unknown-member removal before hashing, including
+  ignored composed/decomposed unknown-key pairs and rejection of scalar and `null`
   `exception.values` and `stacktrace.frames` elements, standard
   `breadcrumbs.values` wrapper normalization and Event entry projection, empty arrays, recursive bounds,
   binary64 round-trip rejection for non-canonical recursive numbers, and
@@ -3183,8 +3215,8 @@ exercise:
   operation ID or status URL, plus
   release-independent DIF duplicates and checksum/debug identity conflicts;
 - release versions containing percent-encoded reserved path bytes, literal
-  plus signs, malformed escapes, invalid UTF-8, query delimiters, and
-  double-decoding attempts;
+  plus signs, exact `.` and `..` dot segments, malformed escapes, invalid
+  UTF-8, query delimiters, and double-decoding attempts;
 - allowlisted and disallowed browser origins, Envelope CORS preflight and
   actual responses, DSN tenant binding, exact origin reflection, exposed
   request and rate-limit headers including `Content-Encoding`, and no
@@ -3210,8 +3242,10 @@ exercise:
   without a reason, total singleton-bucket selection for
   equal capacities with different remaining counts or reset times, snapshot
   consistency under concurrent inserts/updates, the fixed 15-minute cursor
-  lifetime and exact `now >= expires_at` cutoff, cursor binding, malformed and
-  expired cursor `400` results, stale cursor `403` results, cross-tenant cursor
+  lifetime and exact `now >= expires_at` cutoff, cursor binding,
+  authorization/security revision changes invalidating the entire traversal
+  with `403` rather than filtered continuation, malformed and expired cursor
+  `400` results, stale cursor `403` results, cross-tenant cursor
   `404` results, rate-limit headers including fractional, zero, and capped
   canonical seconds plus reason values at the one- and 64-character bounds and
   outside-grammar cases, exact
@@ -3235,8 +3269,9 @@ exercise:
   every `statusDetails` member's exact type, nullability, and status-dependent
   presence condition, including canonical `ignoreUntil` and reprocessing-info
   timestamps, Actor and reprocessing-info shapes,
-  list/detail/status-transition consistency, globally unique issue aliases with
-  owning-tenant authorization, CLI
+  list/detail/status-transition consistency, canonical lowercase UUID v7 Issue
+  IDs with globally unique `shortId` compatibility aliases and owning-tenant
+  authorization, CLI
   `muted`/`resolvedInNextRelease` mappings, exact single-issue and bulk PUT
   bodies, exact issue-list `query`/`status`/repeated `environment`/`cursor`/
   `limit` filters, duplicate and unknown-filter rejection, repeated unique
