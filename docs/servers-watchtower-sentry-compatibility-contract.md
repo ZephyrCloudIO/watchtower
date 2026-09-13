@@ -239,7 +239,7 @@ to a native route.
 | `/api/<project_id>/upload/` | `POST` | Collection-only DSN | Supported pinned Native large-attachment TUS creation route. A valid integer `Upload-Length` from `0` through `20,000,000`, `Tus-Resumable: 1.0.0`, and `Upload-Metadata: sentry <base64({"attachment_type":"event.minidump"})>` request returns `201` with an absolute HTTP(S), project-bound `Location` containing a canonical lowercase UUID v7 `upload_id`, `Tus-Resumable: 1.0.0`, and `Upload-Offset: 0`; a zero-length upload is created directly as `complete-unbound`, while a positive-length upload is pending. Neither creation path accepts attachment bytes. A pending upload has a fixed 24-hour lifetime beginning at creation. |
 | `/api/<project_id>/upload/<upload_id>` | `HEAD`, `PATCH` | Collection-only DSN bound to the upload | Supported pinned Native TUS offset and append workflow. `HEAD` requires request `Tus-Resumable: 1.0.0` and, on success, returns `200` with an empty body and `Tus-Resumable: 1.0.0`, `Upload-Offset`, and `Upload-Length` response headers. Missing or unsupported `Tus-Resumable` returns `412 precondition_failed`; a missing, expired, already-bound, or inaccessible upload returns `404 not_found`, and invalid authentication returns `401 invalid_authentication`. A failed `HEAD` has no response body or `Content-Type`; it returns only its status, `Tus-Resumable: 1.0.0`, request-ID headers, and `Content-Length: 0`, with no `Upload-Offset` or `Upload-Length`. `PATCH` requires `Tus-Resumable: 1.0.0`, `Upload-Offset`, and `application/offset+octet-stream`, appends only at the expected offset, and returns `204` with an empty body, `Tus-Resumable: 1.0.0`, and the new `Upload-Offset`. A stale or mismatched offset returns `409 conflict` with the current `Upload-Offset`; bytes that would exceed `Upload-Length` return `413 payload_too_large` with the current `Upload-Offset`. `PATCH` failures use the standard JSON error body and atomically append no bytes. Reaching the declared length transitions the upload to `complete-unbound`; it remains subject to attachment and project limits and is not accepted until the subsequent Envelope binds it to an event. |
 | `/api/<project_id>/security-report/` | `POST` | Collection-only DSN | Explicitly unsupported in v1; returns `501 unsupported_capability` with no persistence side effect because security reports are not error telemetry. |
-| Any other `/api/<project_id>/...` ingestion route | Any | Any | `404` or `405` according to whether the path or method is unknown; no side effect. |
+| Any other `/api/<project_id>/...` ingestion route | Any | Any | `404` or `405` according to whether the path or method is unknown; no side effect. An unknown-path `HEAD` is status/header-only as defined below. |
 
 An unsupported method other than `HEAD` on a known supported ingestion route
 returns the standard `405 method_not_allowed` object and an `Allow` header
@@ -477,7 +477,7 @@ the allowlist, or a project with no configured allowlist, receives
 | `/api/0/organizations/<organization>/releases/<version>/commits/` | `GET` a direct array of commit objects, each containing exactly `{ "id": string }`, required by `sentry-cli info`; the organization-scoped release visibility predicate applies before any commit ID is returned, and commit association writes are unsupported. |
 | `/api/0/organizations/<organization>/releases/<version>/previous-with-commits/` | `GET` the fixed Release DTO below for the deterministic previous release selected by the project-filter rules below, or `404 not_found` when no previous release is available, subject to project and tenant scope. |
 | `/api/0/projects/<organization>/<project>/releases/<version>/files/` | `GET` file listing and `POST` upload using the exact multipart protocol below. Source maps and debug files are handled by the artifact authority. |
-| `/api/0/projects/<organization>/<project>/releases/<version>/files/<file_id>/` | `GET` the one release file identified by `file_id`, returning its Artifact DTO and current strong `ETag`; `DELETE` performs idempotent failed-upload cleanup using that exact observed ETag. Deletion never bypasses lifecycle rules. |
+| `/api/0/projects/<organization>/<project>/releases/<version>/files/<file_id>/` | `GET` the one release file identified by `file_id`, returning its Artifact DTO and current strong `ETag`; `DELETE` performs idempotent cleanup only for an Artifact in `failed` state, using that exact observed ETag. A delete of an `accepted`, `processing`, or `processed` Artifact returns `409 conflict` with no side effect. Deletion never bypasses lifecycle rules. |
 | `/api/0/organizations/<organization>/chunk-upload/` | `GET` organization-scoped artifact-bundle and DIF chunk capability for the pinned sentry-cli, available only with effective `Write` or `Manage` authority on at least one project in the organization. The response supplies the upload URL, chunk size, request limits, concurrency, hash algorithm, and accepted compression. The returned `url` is itself an admitted organization-scoped multipart `POST` route valid for both workflows; its request carries no project field and uses the same authority rule. |
 | `/api/0/projects/<organization>/<project>/chunk-upload/` | `GET` project-scoped DIF chunk capability for the pinned sentry-cli. The response supplies a project-bound upload URL, chunk size, request limits, concurrency, hash algorithm, and accepted compression. |
 | `/api/0/projects/<organization>/<project>/files/difs/chunks/` (or the exact project-bound upload URL returned by the DIF capability response) | `POST` multipart chunk upload using `file` or `file_gzip` parts keyed by SHA-1 checksum. A valid new or matching checksum returns `200` with an empty body and the standard request-ID headers; a matching checksum is idempotent, while conflicting bytes are `409`. |
@@ -485,7 +485,7 @@ the allowlist, or a project with no configured allowlist, receives
 | `/api/0/organizations/<organization>/artifactbundle/assemble/` | `POST` source-map/artifact-bundle assembly with `checksum`, ordered `chunks`, `projects`, optional `version`, and optional `dist`; repeated identical POSTs poll the same assembly and return the exact per-project artifact-bundle response defined below. `202` remains pending until artifact processing completes. `checksum` is the lowercase SHA-1 of the ordered decompressed chunk bytes defined below. |
 | `/api/0/operations/<operation_id>/` | `GET` Watchtower compatibility polling extension for project/lifecycle/artifact operations that return an operation ID and do not have an upstream polling request. The operation ID is canonical UUID v7, tenant-scoped, non-reusable, and returns the defined operation status DTO and state machine below. |
 | `/api/0/organizations/<organization>/releases/<version>/deploys/` | `GET` and `POST` deployment records. The organization-scoped release visibility predicate applies before any Deployment DTO is returned; deployment records are release metadata and do not schedule deployment work. |
-| Any other `/api/0/...` route | Any | An unknown path returns safe `404` with no persistence side effect; an unsupported method on a known supported path returns `405`; explicitly unsupported capabilities are listed below and return `501`. |
+| Any other `/api/0/...` route | Any | An unknown path returns safe `404` with no persistence side effect; an unknown-path `HEAD` is status/header-only as defined below; an unsupported method on a known supported path returns `405`; explicitly unsupported capabilities are listed below and return `501`. |
 
 An unsupported method other than `HEAD` on a known supported management route
 returns the standard `405 method_not_allowed` object, includes an `Allow`
@@ -984,7 +984,7 @@ only representation of an absent nullable Release timestamp.
 | DSN | `dateCreated` | Required UTC timestamp serialized exactly as `YYYY-MM-DDTHH:mm:ss.sssssssssZ` |
 | DSN | `dsn` | Required public DSN URL; it contains no management credential |
 | DSN | `browserOrigins` | Required array of canonical serialized origin strings |
-| Deployment | `id` | Required non-empty string compatibility alias; never a Watchtower canonical ID |
+| Deployment | `id` | Required canonical lowercase UUID v7 repository-owned persistent deployment identity |
 | Deployment | `environment` | Required string |
 | Deployment | `name` | Nullable string |
 | Deployment | `url` | Nullable HTTP(S) URL |
@@ -1488,11 +1488,12 @@ response uses this exact JSON object. The bodyless error exceptions are a
 failed TUS `HEAD`, whose HTTP status and headers are authoritative, with
 `Content-Length: 0`, `Tus-Resumable: 1.0.0`, and request-ID headers; an
 unsupported `HEAD` on a known management or ingestion route, whose `405`
-status, route-specific `Allow`, and request-ID headers remain authoritative; and
-a `HEAD` addressed to an explicitly unsupported capability, whose `501` status
-and request-ID headers remain authoritative. All three have
-`Content-Length: 0`, neither `Content-Type` nor a JSON error body, and no
-response body.
+status, route-specific `Allow`, and request-ID headers remain authoritative; a
+`HEAD` addressed to an explicitly unsupported capability, whose `501` status
+and request-ID headers remain authoritative; and an unknown-path `HEAD` on an
+ingestion or `/api/0/...` management route, whose `404` status and request-ID
+headers remain authoritative. All four have `Content-Length: 0`, neither
+`Content-Type` nor a JSON error body, and no response body.
 
 ```json
 {
@@ -2241,17 +2242,22 @@ Every non-numeric string tie-breaker in the table above uses ascending
 lexicographic Unicode-scalar ordinal comparison after NFC normalization,
 independent of locale or database collation. This includes organization,
 project, DSN, issue, release, and deployment compatibility aliases, plus
-external event and commit IDs. Canonical lowercase UUID and checksum values use
-the same comparator after their required lowercase normalization. Normalization
-affects ordering only; the original compatibility alias or version remains the
-DTO value. Thus aliases such as `"10"` and `"2"` order as `"10"`, then `"2"`,
-and the same comparator is used for the corresponding opaque cursor boundary
-and `previous-with-commits` selection.
+external event and commit IDs. When two original strings are NFC-equivalent,
+their original UTF-8 byte sequences are compared lexicographically as the next
+tie-breaker. If all route-defined normalized and original string values remain
+equal, the owning resource's canonical lowercase UUID v7 is the final unique
+tie-breaker. Canonical lowercase UUID and checksum values use the same
+comparator after their required lowercase normalization. Normalization affects
+ordering only; the original compatibility alias or version remains the DTO
+value. Thus aliases such as `"10"` and `"2"` order as `"10"`, then `"2"`, and
+the complete tuple, including these tie-breakers, is used for the corresponding
+opaque cursor boundary and `previous-with-commits` selection.
 
 For both release-list routes, `NFC(version) ASC` means ascending lexicographic
 Unicode-scalar ordinal order after NFC normalization, independent of locale or
 database collation. The original release version remains the DTO value;
-NFC-equivalent versions therefore reach the `id` tie-breaker.
+NFC-equivalent versions compare their original UTF-8 bytes before the release
+`id` tie-breaker.
 
 The first page establishes a read snapshot and its immutable high-water mark;
 the opaque cursor carries that snapshot, the last complete ordering tuple, and
@@ -2297,7 +2303,10 @@ header-name casing is insignificant):
   comma-separated list with no whitespace. Each entry has the grammar
   `<seconds>:<category;category>:<scope>` optionally followed by
   `:<reason>` and, only when `reason` is present, `:<namespace;namespace>`.
-  `seconds` is a non-negative decimal duration, categories are lowercase
+  `seconds` is the canonical decimal serialization of
+  `min(ceil(max(reset_at - now, 0)), 2,147,483,647)` whole seconds. It is an
+  unsigned base-10 integer with no leading zeroes, signs, fractional digits, or
+  exponent notation; zero is serialized as `0`. Categories are lowercase
   `error`, `attachment`, `default`, `artifact`, or `all`, scope is lowercase
   `principal`, `organization`, `project`, or `key`, reason is a lowercase ASCII
   token matching `[a-z0-9][a-z0-9_-]{0,63}`, and each namespace is a lowercase token matching
@@ -2802,7 +2811,11 @@ resources. The caller copies that exact observed ETag into `If-Match` for
 deletion, needs current `Manage` authority, and must supply
 the exact observed `If-Match` ETag and an idempotency key bound to the exact
 file target and observed version. A missing `If-Match` or key returns `400
-invalid_request` before artifact authority is called.
+invalid_request` before artifact authority is called. After the target is
+resolved and the observed version and authorization are validated, deletion is
+allowed only when the current Artifact `state` is `failed`. An `accepted`,
+`processing`, or `processed` Artifact returns `409 conflict` with the standard
+error body and creates no deletion side effect or deletion idempotency record.
 Successful delete returns `204` with an empty body only after durable artifact
 authority deletion. The completed deletion idempotency record or tombstone is
 retained for exactly 24 hours after the successful commit. Define `expires_at`
@@ -2862,13 +2875,15 @@ tombstone is retained for exactly 24 hours after the successful commit. Define
 `expires_at` as commit time plus 24 hours: while `now < expires_at`, repeating
 the same body returns the original successful result, while reusing the key
 with a different body or scope returns `409 conflict`. The first successful
-`POST` for a new identity returns `201` with the fixed Deployment DTO. An
-identical retry that finds the retained idempotency result returns `200` with
-the same Deployment DTO; it does not replay the original `201` status or create
-a second record. At `now >= expires_at`, the record no longer matches and the
-request is evaluated as a new write against current authentication,
-authorization, and lifecycle state; the key is reusable, and an accepted retry
-creates a new deployment-history record with a new identity and returns `201`.
+`POST` for a new identity returns `201` with the fixed Deployment DTO, whose
+`id` is the new canonical lowercase UUID v7 deployment identity. An identical
+retry that finds the retained idempotency result returns `200` with the same
+Deployment DTO; it does not replay the original `201` status or create a second
+record. At `now >= expires_at`, the record no longer matches and the request is
+evaluated as a new write against current authentication, authorization, and
+lifecycle state; the key is reusable, and an accepted retry creates a new
+deployment-history record with a new canonical lowercase UUID v7 identity and
+returns `201`.
 Both `dateCreated` and
 `dateFinished` equal the normalized
 request `timestamp`, serialized as the canonical UTC form
@@ -2881,7 +2896,8 @@ unsupported release-health behavior.
 
 ## Identity, aliases, and storage ownership
 
-- Organization, project, DSN-key, operation, artifact, release-operation, and internal
+- Organization, project, DSN-key, operation, artifact, release-operation, deployment,
+  and internal
   resource identities are canonical lowercase UUID v7 values at Watchtower
   boundaries and PostgreSQL `uuid` when persisted by their owner.
 - Sentry project IDs, release versions, and event IDs are
@@ -3152,7 +3168,8 @@ exercise:
   without creating a second operation;
 - pagination using the documented per-route order and tie-breaker, including
   numeric-looking aliases such as `"10"` and `"2"`, NFC-equivalent aliases,
-  matching opaque cursor boundaries, and `previous-with-commits` selection,
+  original UTF-8 tie-breaking and canonical UUID final tie-breaking across
+  matching opaque cursor boundaries and `previous-with-commits` selection,
   deterministic rate-limit ordering for equal scope/category/duration entries
   with different reasons or namespaces, rejection of namespace-bearing entries
   without a reason, total singleton-bucket selection for
@@ -3160,8 +3177,9 @@ exercise:
   consistency under concurrent inserts/updates, the fixed 15-minute cursor
   lifetime and exact `now >= expires_at` cutoff, cursor binding, malformed and
   expired cursor `400` results, stale cursor `403` results, cross-tenant cursor
-  `404` results, rate-limit headers including reason values at the one- and
-  64-character bounds and outside-grammar cases, exact
+  `404` results, rate-limit headers including fractional, zero, and capped
+  canonical seconds plus reason values at the one- and 64-character bounds and
+  outside-grammar cases, exact
   `rel="next"`/`results="true"`/`cursor` Link parameters, `limit` bounds,
   DSN-key, release-file, release-commit, and deployment lists, unknown fields,
   organization lists scoped to one credential owner including active and
@@ -3264,6 +3282,8 @@ exercise:
 - project deletion with missing/mismatched confirmation, release-file deletion
   item reads exposing the current strong `ETag`, deletion without `If-Match` or
   idempotency key, a non-empty entity body, by exact `file_id`, repeated deletion, wrong-scope `404`,
+  deletion allowed only for `failed` artifacts and `409 conflict` for
+  `accepted`, `processing`, and `processed` artifacts,
   stale-version and idempotency-key conflicts, pending retries with
   `completed_at: null`, exact 24-hour terminal deletion retry retention, the
   `now >= expires_at` boundary, post-expiry `404` for the deleted target, and
@@ -3297,8 +3317,8 @@ exercise:
   body and no `field_errors`, platform-token grammar,
   recognized Envelope scalars over 4,096 bytes returning `400 invalid_envelope`,
   and unsupported methods returning the route-specific `Allow` header, including
-  bodyless `HEAD` errors on known management and ingestion routes and bodyless
-  `501` responses on explicitly unsupported capabilities, exact scalar byte
+  bodyless `HEAD` errors on known and unknown management and ingestion routes
+  and bodyless `501` responses on explicitly unsupported capabilities, exact scalar byte
   boundaries, the root/container/scalar recursive event depth algorithm and
   level-16/17 boundaries,
   and URL/text limits, plus
@@ -3350,7 +3370,7 @@ exercise:
   metadata bounds, NFC key-collision rejection, bounded timestamp precision,
   canonical digest, required client idempotency, exact 24-hour retry retention,
   `now >= expires_at` key reuse as a new deployment, exact `201` initial and
-  `200` duplicate responses, missing-key rejection, and conflicting supplied-key
+  `200` duplicate responses with canonical UUID v7 deployment IDs, missing-key rejection, and conflicting supplied-key
   retry rejection during retention, plus
   Write/Manage authorization over every associated
   release project and Owner/Admin authorization for unassociated releases;
@@ -3382,7 +3402,7 @@ matrix result. A client regression cannot be hidden by changing the fixture.
 - Every supported and unsupported route, method, format, Envelope item, and
   relevant non-Envelope path has explicit behavior, including exact `Allow`
   headers for known-route `405` responses, bodyless unsupported `HEAD`
-  responses on known management and ingestion routes, and bodyless `501`
+  responses on known and unknown management and ingestion routes, and bodyless `501`
   responses on explicitly unsupported capabilities.
 - Authentication, content type, compression, limits, fields, errors,
   pagination, rate headers, unknown fields, retries, idempotency, capability
