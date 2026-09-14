@@ -24,6 +24,9 @@ commands to `watchtower-api`, and native or compatible queries to
 Sentry-compatible event ingestion and management APIs preserve the upstream
 routes and request semantics required by the
 [`Sentry compatibility contract`](servers-watchtower-sentry-compatibility-contract.md).
+The [`ingestion admission and durable handoff contract`](servers-watchtower-ingestion-contract.md)
+defines the admission outcomes and raw-handoff state behind compatible
+event-ingestion routes.
 Native Watchtower business APIs use `/api/v1`.
 
 Initial synchronous component calls use unary Protobuf-over-HTTP under
@@ -67,6 +70,9 @@ payload reference. Credentials and unrestricted customer payloads are
 prohibited. Delivery is at least once, consumers are idempotent, and no global
 ordering is guaranteed unless a downstream domain contract declares ordering
 for an aggregate partition.
+Ingest raw-unit and later-attachment handoffs remain project-scoped,
+protocol-neutral, and compatible with the existing authenticated fetch,
+disposition, retention-expiry, and expiry-fence interfaces.
 
 The envelope scope is one of `project`, `organization`, `account`, `staff`, or
 `operational`.
@@ -119,6 +125,9 @@ credential and recovery lifecycle, control-plane privacy, abuse controls, and
 security gates. Processing-payload privacy remains owned by #18. Canonical
 storage lifecycle, retention, deletion, restoration, and replay mechanics
 remain owned by the canonical telemetry and storage contract.
+The ingestion contract owns the required admission operating values and
+verification scenarios; this runtime contract supplies the common transport,
+workload-authentication, error, readiness, shutdown, and release rules.
 
 API owns control-plane recovery state and external identity synchronization.
 Its consumers enforce security projections with a maximum freshness of 60

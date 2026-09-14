@@ -20,7 +20,10 @@ deployment units:
 The six units use one coordinated release train. They receive and roll back
 the same release, but retain independent scaling, readiness, and failure
 domains. Detailed product decisions are owned by the downstream contracts
-listed in `docs/project-watchtower.md`.
+listed in `docs/project-watchtower.md`, including the
+[`ingestion admission and durable handoff contract`](servers-watchtower-ingestion-contract.md)
+for Ingest's admission units, quota reservations, raw acceptance, and
+recoverable handoff behavior.
 
 ## Boundary Invariants
 
@@ -41,7 +44,7 @@ listed in `docs/project-watchtower.md`.
 
 | Component | Public surface and responsibilities | Must not own |
 | --- | --- | --- |
-| `watchtower-ingest` | Public write-only telemetry routes, protocol admission, raw accepted records, and the recoverable handoff/outbox to processing. | Normalization, enrichment, grouping, control-plane state, analytical queries, or another component's storage. |
+| `watchtower-ingest` | Public telemetry routes and protocol-support methods, including bounded TUS status, protocol admission, pre-acceptance TUS staging records and appendable bytes, raw accepted records, and the recoverable handoff/outbox to processing. | Normalization, enrichment, grouping, control-plane state, analytical queries, or another component's storage. |
 | `watchtower-api` | Native `/api/v1` control-plane and release/artifact commands, every Sentry-compatible management REST route, control-plane and artifact authority, versioned change events, and contract-level audit authority. | Telemetry admission, canonical telemetry processing, analytical storage, or direct query-store access. |
 | `watchtower-processor` | Asynchronous normalization, privacy processing, enrichment, symbolication execution, canonical telemetry, processing state, and derived domain aggregates. | Public business routes, control-plane authority, query serving, job scheduling, or another owner's store. |
 | `watchtower-query` | Native `/api/v1` read/query routes, Prometheus-, Loki-, and Tempo-compatible query routes, read projections, search and analytical indexes, caches, and provider query orchestration. | Canonical, control-plane, or raw writes, and fallback persistence access. |
@@ -61,7 +64,7 @@ They have no public business routes.
 
 | Component | Authoritative state, owned projection, or cache |
 | --- | --- |
-| Ingest | Raw accepted records, recoverable processing handoff/outbox, and local projections of API-published security or control changes. |
+| Ingest | TUS staging records, appendable staging bytes, staging reservations and lifecycle fences, raw accepted records, recoverable processing handoff/outbox, and local projections of API-published security or control changes. |
 | API | Control-plane state, artifact authority, versioned change events describing those authoritative changes, the append-only contract-level audit event boundary, and restore-independent audit, export-hold/expiry, completed-export source-eligibility, authorization-revocation, and active-project lifecycle registry state. |
 | Processor | Canonical telemetry, processing state, and derived domain aggregates. |
 | Query | Query-owned read projections, search and analytical indexes, PostgreSQL export metadata including `snapshot_generation`, caches, and provider query orchestration state. |
@@ -78,7 +81,7 @@ unavailable or older than the 60-second maximum freshness established by
 
 | Component | Independent scaling boundary | Failure behavior and customer-visible owner |
 | --- | --- | --- |
-| Ingest | Protocol admission, raw-record writes, and recoverable handoff capacity. | Ingest owns admission outcomes and stops successful admission when safe capacity is exhausted; accepted raw records and handoffs remain recoverable. |
+| Ingest | Protocol admission, TUS staging and cleanup capacity, raw-record writes, and recoverable handoff capacity. | Ingest owns admission outcomes and stops successful admission when safe capacity is exhausted; staging state, accepted raw records, and handoffs remain recoverable. |
 | API | Control-plane, artifact, release, and Sentry management request load. | API owns control mutations and management compatibility responses; API failure does not stop valid Ingest admission or Query reads while their security projections remain fresh. |
 | Processor | Asynchronous normalization, privacy, enrichment, symbolication, and aggregate processing backlog. | Processor owns processing lag and recovery; failure preserves durable handoff work and does not create public business routes or direct storage fallbacks. |
 | Query | Native and compatible read load, projection consumption, indexes, and caches. | Query owns query results and projection freshness; Query failure stops query routes and Sentry management reads. Ordinary API-owned mutations continue, but mutations that require a synchronous durable fence or acknowledgement from an affected public owner fail closed while that owner is unavailable. |
@@ -91,21 +94,33 @@ The allowed protocol and data-flow direction is:
 
 1. Browsers and external clients reach public routes through the shared L7
    routing layer. They cannot reach internal messages or RPCs.
-2. Ingest accepts telemetry and consumes API-published changes for local
+2. Ingest accepts telemetry according to the
+   [`ingestion admission and durable handoff contract`](servers-watchtower-ingestion-contract.md)
+   and consumes API-published changes for local
    authorization-related projections. For a revocation that affects
    telemetry-write permission, Ingest also durably installs the matching
    `AuthorizationRevocationFenceV1` revision and rejects affected public
    admission before acknowledging the fence. It publishes recoverable processing
-   handoff work and consumes Processor's terminal `RawHandoffDispositionV1`
-   messages or Jobs' `RawRetentionExpiryV1` commands before retiring the
-   corresponding raw state. A `RawRetentionExpiryV1` command may carry either
-   the class-default or an active shortened-policy basis; Ingest's matching
-   durable fence is terminal for that handoff. Processor retrieves referenced
+   handoff work and consumes the owner-mediated
+   `RawHandoffCompletionArbitrationV1` outcome, the terminal
+   `RawHandoffDispositionV1` message, or Jobs' `RawRetentionExpiryV1` command
+   before retiring the corresponding raw state. A `RawRetentionExpiryV1`
+   command may carry either the class-default or an active shortened-policy
+   basis; the effective raw-retention cutoff is the hard completion-lease
+   deadline, so a provisional or finalized claim without a terminal disposition
+   receives the owner-recorded expiry fence. A pending or active lifecycle
+   fence is resolved by the claim finalization phase, while the raw-retention
+   cutoff is resolved by a terminal disposition or expiry fence. A
+   provisional or finalized claim is not sufficient for raw retirement; only a
+   matching terminal disposition or lifecycle/expiry fence may close the
+   handoff. Processor
+   retrieves referenced
    raw bytes only through Ingest's authenticated `RawPayloadFetchV1` interface,
-   and Ingest's
-   durable expiry fence rejects late fetches or dispositions. Ingest also
-   publishes the durable `RawHandoffExpiryFenceV1` to Processor when it
-   records an expiry fence.
+   and Ingest's durable expiry or lifecycle fence rejects late fetches,
+   arbitration requests, and claims; only a matching expiry or lifecycle
+   disposition may close that fence idempotently. Ingest also publishes the
+   durable `RawHandoffExpiryFenceV1` or `RawHandoffLifecycleFenceV1` to
+   Processor when it records the corresponding fence.
 3. API accepts control-plane, release, artifact, and Sentry management
    commands. It publishes versioned change events. API may call affected public
    owners' authenticated internal interfaces, including Ingest and Query for
@@ -191,11 +206,12 @@ retrieves bounded authenticated selection pages, derived
    staged live write uses an idempotent no-row `CanonicalChangeSkipV1` marker
    for its reserved sequence only when no authoritative ClickHouse row exists;
    if the row was committed while still within its cutoff and publication then
-   failed, Processor reconciles and publishes the row; if the cutoff arrives
-   after commit but before publication, recovery first reconciles Query's
-   applied row/skip outcome and only when it is explicitly absent removes the
-   row, verifies its absence, and publishes the skip. Live consumers therefore receive
-   contiguous coverage, and Processor persists each live skip marker in the
+   failed, Processor requires the matching Ingest-recorded disposition
+   acknowledgement and publishes the row; if the cutoff arrives after commit
+   but before that acknowledgement, recovery removes the row, verifies its
+   absence, and publishes the skip. Canonical publication cannot precede the
+   acknowledgement, so live consumers receive contiguous coverage, and
+   Processor persists each live skip marker in the
    retained canonical replay class so it remains available through the replay
    horizon.
    Before Processor becomes ready after restoring its processing store, it
@@ -213,14 +229,39 @@ retrieves bounded authenticated selection pages, derived
    Processor unready; it accepts no new canonical sequence reservation or
    derived aggregate work and allocates no revision until reconciliation is
    committed.
-   It publishes a
-   terminal
-   `RawHandoffDispositionV1` to Ingest for every completed,
-   shortened-policy-rejected, or default-expired raw handoff when it remains
-   authoritative. It suppresses late processing for an Ingest expiry fence,
-   persists the highest `RawHandoffExpiryFenceV1` for each handoff, and performs
-   the authoritative cutoff and local-fence check immediately before canonical
-   commit and publication. Canonical changes use the Processor-owned
+   It durably stages a verified canonical candidate or payload-free no-op, then
+   invokes the authenticated owner-mediated unary
+   `RawHandoffCompletionArbitrationV1` handshake with Ingest. The claim phase
+   serializes with expiry state and returns an idempotent provisional claim or
+   expiry outcome; the finalization phase immediately before canonical commit
+   or no-op completion serializes with pending and active retention/deletion
+   fences. It returns either `claim_finalized` or a matching
+   `RawHandoffLifecycleFenceV1` `lifecycle_fenced` outcome. Processor may
+   commit the canonical candidate or finalize a no-op only after
+   `claim_finalized` and before a raw-expiry fence. It publishes the canonical
+   change only after Ingest durably records and acknowledges the matching
+   terminal disposition; a pending arbitration, disposition recording, or
+   finalization record is retained and reconciled after a crash rather than
+   being converted by message-arrival order. A project-deletion fence does not
+   cancel a previously finalized claim; Jobs retains it as a deletion
+   dependency until its terminal disposition and purge cleanup complete. The
+   resulting `RawHandoffCompletionClaimV1` carries the scoped
+   `watchtower_id`, completion kind, applicable digest or no-op identity,
+   `accepted_at`, cutoff, correlation identifier, and idempotency key. It
+   publishes a terminal `RawHandoffDispositionV1` to Ingest for every
+   `completed`, `completed_no_op`, `policy_rejected`, `default_expired`, or
+   `lifecycle_rejected` raw handoff when it remains authoritative. It suppresses
+   late processing for an Ingest expiry or lifecycle fence, persists the highest
+   fence for each handoff, and performs the authoritative finalization outcome
+   check immediately before canonical commit. It requires the Ingest
+   disposition acknowledgement immediately before canonical publication. A
+   claim finalized before a later retention/deletion lifecycle fence remains
+   eligible for commit and publication after that acknowledgement; the
+   resulting canonical state remains a lifecycle cleanup or purge dependency.
+   An unfinalized claim that receives `lifecycle_fenced` is never promoted and
+   its candidate is discarded.
+   A candidate canonical row without the matching finalized claim is not
+   authoritative. Canonical changes use the Processor-owned
    `(tenant_id, project_id, signal_family)` partition and monotonic sequence
    defined by the canonical storage contract.
 5. Query consumes API changes and Processor changes into its own projections,
@@ -365,11 +406,28 @@ Processor or Jobs outages preserve durable work for later processing.
 Ingest may acknowledge a successful telemetry write only after both the raw
 accepted record and a recoverable processing handoff/outbox are durably
 established. Processor or broker outages may accumulate bounded backlog. When
-safe capacity is exhausted, Ingest must stop returning successful admissions
-until capacity is recovered. Ingest does not retire the raw object, acceptance
-metadata, or handoff outbox until it durably records the matching terminal
-Processor disposition or its own expiry fence from `RawRetentionExpiryV1`,
-whether the fence basis is class-default or an active shortened policy.
+   safe capacity is exhausted, Ingest must stop returning successful admissions
+   until capacity is recovered. Ingest does not retire the raw object, acceptance
+   metadata, or handoff outbox until it durably records the matching terminal
+   disposition or its own expiry/lifecycle fence from `RawRetentionExpiryV1`
+   or `RawHandoffLifecycleFenceV1`, whether the fence basis is class-default,
+   an active shortened policy, or project deletion. A provisional or finalized
+   completion claim alone keeps the handoff recoverable until its terminal
+   outcome is recorded.
+The exact acceptance-unit, quota-reservation, duplicate, exclusion, and public
+response rules are owned by the ingestion contract; this boundary continues to
+own component ownership and failure isolation.
+
+TUS creation, append, binding, expiry, and cleanup remain Ingest-owned
+pre-acceptance state. Ingest stores the appendable bytes and staging record in
+its assigned storage boundary, reserves project staging capacity before a
+staging write, and retains that reservation through binding or logical expiry
+until physical deletion is confirmed. Ingest recovery reconciles the staging
+record, staged bytes, reservation, and lifecycle fence conservatively; an
+uncertain or unavailable side remains reserved and inaccessible. Binding may
+create the final attachment charge, but it never transfers or releases staging
+capacity while staging state remains. No other component reads pre-binding
+staging storage directly.
 
 Processor owns asynchronous normalization, privacy processing, enrichment,
 symbolication execution, canonical telemetry, processing state, derived
@@ -390,7 +448,8 @@ idempotently and publishes the outcome; Jobs never writes domain-owned storage.
 Diagnostic and recovery ownership follows data ownership:
 
 - The L7 layer owns route selection and edge diagnostics.
-- Ingest owns admission, raw records, handoffs, outboxes, and their recovery.
+- Ingest owns admission, TUS staging records and bytes, staging reservations and
+  lifecycle fences, raw records, handoffs, outboxes, and their recovery.
 - API owns control-plane and artifact authority and its change publication.
 - Processor owns canonical processing and derived aggregate recovery.
 - Query owns projection, index, cache, and provider-query recovery from
@@ -409,7 +468,9 @@ Native public business routes use `/api/v1`. Sentry-compatible routes retain
 the upstream route and request behavior required by the
 [`Sentry compatibility contract`](servers-watchtower-sentry-compatibility-contract.md).
 That contract owns the exact endpoint, wire, and client compatibility matrices;
-this contract continues to own component routing and data boundaries.
+the [`ingestion contract`](servers-watchtower-ingestion-contract.md) owns the
+admission and raw-handoff behavior behind those routes, and this contract
+continues to own component routing and data boundaries.
 
 Initial synchronous component calls use unary Protobuf-over-HTTP under
 `/internal/v1`. Internal streaming, gRPC, and Connect RPC are not part of
@@ -836,38 +897,69 @@ effective cutoff, `expiry_basis=class_default` or
 `expiry_basis=retention_policy`, the matching policy generation when
 applicable, correlation identifier, and idempotency key; it is a project-scoped
 sweep and does not require Jobs to know individual `watchtower_id` values.
-Ingest enumerates its own acceptance state, durably records a terminal
-`default_expired` or `policy_rejected` fence for each eligible handoff, and
-retires each matching raw object, acceptance metadata, and outbox entry without
-waiting for Processor. A later `RawPayloadFetchV1` request or
-`RawHandoffDispositionV1` delivery for a fenced handoff is rejected as stale
-and cannot publish or revive canonical work.
+Ingest enumerates its own acceptance state and reconciles any matching
+owner-recorded arbitration state before installing a terminal
+`default_expired` or `policy_rejected` fence for an eligible handoff. Only a
+matching terminal disposition recorded before the effective raw-retention
+cutoff keeps completion authoritative; a provisional or finalized claim
+without that disposition receives the expiry fence. A pending or active
+retention/deletion fence may cancel an unfinalized claim through the
+owner-mediated lifecycle outcome. Without a terminal disposition, Ingest
+durably records the expiry or lifecycle
+fence and, for raw-retention expiry, retires each matching raw object,
+acceptance metadata, and outbox entry without waiting for Processor. For a
+project-deletion fence, a previously finalized claim remains an outstanding
+dependency and raw state is retained until its matching terminal disposition
+and purge cleanup complete. A later `RawPayloadFetchV1`, arbitration request,
+or completion claim for a fenced handoff is rejected as stale and cannot
+publish or revive canonical work; only a matching expiry, lifecycle, or
+terminal disposition may close the recorded outcome, idempotently.
 
 When Ingest records a class-default or shortened-policy expiry fence, it also
 publishes a versioned durable `RawHandoffExpiryFenceV1` message to Processor.
 The message carries the scoped `watchtower_id`, accepted-at cutoff, retention
 policy or class-default basis, fence generation, correlation identifier, and
-idempotency key. Processor persists the highest fence and must perform a
-final authoritative cutoff and local-fence check immediately before canonical
-or derived commit and
-publication; a denied check records the matching terminal disposition without
-publishing canonical changes.
+idempotency key. Processor persists the highest fence and must validate the
+owner-recorded finalization or expiry/lifecycle outcome immediately before
+canonical or derived commit and publication; a claim finalized before the
+effective raw-retention cutoff cannot publish after the matching expiry fence
+wins. A lifecycle fence that wins before finalization returns
+`lifecycle_fenced`, and Processor records the matching `lifecycle_rejected`
+disposition without publishing canonical changes.
 
-The raw-handoff completion path is a versioned durable `RawHandoffDispositionV1`
-message from Processor to Ingest using the common asynchronous envelope. Its
-bounded payload contains the canonical lowercase UUID v7 `watchtower_id`, a
-terminal `disposition` of `completed`, `policy_rejected`, or `default_expired`,
-and the generation context for the result: canonical lowercase UUID v7
-`processing_generation` is required for `completed`, `policy_rejected` includes
-the `retention_policy_generation`, and `default_expired` includes a bounded
-rejection reason with `expiry_basis=class_default` and no policy generation.
-The Processor publishes the message through its durable outbox after recording
-the terminal result; transient processing failures publish no terminal
-disposition. Ingest
-transactionally persists the disposition and idempotency state before retiring
-the matching outbox entry and raw acceptance data. Redelivery of the same
-message is idempotent, and a conflicting disposition or generation is an
-integrity failure that cannot retire raw state.
+The raw-handoff completion path uses the authenticated owner-mediated unary
+`RawHandoffCompletionArbitrationV1` handshake from Processor to Ingest,
+followed by the terminal `RawHandoffDispositionV1` on the common asynchronous
+envelope. The handshake's durable Ingest-side arbitration and finalization
+state is the cutoff- and lifecycle-arbitration proof; asynchronous delivery
+cannot race the expiry or lifecycle sweep. Its successful claim has either a
+`payload` variant with canonical lowercase UUID v7 `processing_generation` and
+canonical content digest, or a `no_op` variant with the bounded no-op retry
+identity and semantic `payload_digest` but no processing generation, canonical
+result, or payload reference. Both variants also carry the scoped lowercase
+UUID v7 `watchtower_id`, `accepted_at`, effective cutoff, correlation identifier,
+and idempotency key. The disposition's bounded payload contains a terminal
+`disposition` of `completed`, `completed_no_op`, `policy_rejected`,
+`default_expired`, or `lifecycle_rejected`. `completed` and `completed_no_op`
+match the successful `claim_finalized` outcome; `policy_rejected` and
+`default_expired` carry the matching `RawHandoffExpiryFenceV1` identity,
+outcome, basis, and applicable policy generation; `lifecycle_rejected` carries
+the matching `RawHandoffLifecycleFenceV1` identity and lifecycle generation.
+Fence dispositions carry no completion-claim fields. Processor publishes a
+completion disposition through its durable outbox after the canonical result
+or payload-free no-op completion is covered by `claim_finalized` and before
+canonical change publication. It waits for Ingest to transactionally persist
+the disposition and idempotency state and return a durable acknowledgement;
+only then may it publish the canonical change. It publishes an expiry or
+lifecycle disposition only after the owner-recorded fence outcome is covered
+by the matching fence. Transient failures publish no terminal disposition.
+Ingest retires the matching outbox entry and eligible raw acceptance data only
+after its disposition transaction succeeds. For
+`completed_no_op`, the bounded acceptance/retry tombstone remains live and the
+no-op admission reservation stays held until tombstone expiry and confirmed
+physical cleanup release it exactly once.
+Redelivery of the same message is idempotent, and a conflicting disposition or
+generation is an integrity failure that cannot retire raw state.
 
 The registry-snapshot handoff is a versioned unary Protobuf-over-HTTP call under
 `/internal/v1` from each of Ingest, Processor, Query, and Jobs to API. Each owner
@@ -1300,13 +1392,19 @@ become runtime acceptance criteria for the owning implementation issues:
    handoff records, the authenticated `RawPayloadFetchV1` path when a bounded
    payload is insufficient, Processor, its `RawHandoffDispositionV1` completion
    path back to Ingest, Query projection, and visible query results.
+   For a TUS-backed attachment, create and append staging bytes across a
+   request boundary, bind them, restore Ingest before cleanup, and verify that
+   the staging record and bytes remain Ingest-owned and capacity is released
+   only after confirmed deletion.
 2. Stop Processor delivery before and after Ingest acknowledgement; accepted
-   data remains recoverable until a matching terminal disposition or the
+   data remains recoverable through a provisional or finalized claim until a
+   matching terminal disposition, or the
    Ingest-authoritative project-scoped `RawRetentionExpiryV1` sweep durably
    records `default_expired` fences for Ingest-enumerated state, including
-   `policy_rejected` and `default_expired`, and late Processor fetches or
-   dispositions are rejected; admission stops at the documented capacity
-   boundary.
+   `policy_rejected`, `default_expired`, and `lifecycle_rejected`, and late
+   Processor fetches, claims, or finalization requests are rejected while a
+   matching expiry/lifecycle disposition is accepted idempotently; admission
+   stops at the documented capacity boundary.
 3. Follow a native control command from Web to API through defense-in-depth
    authorization, authoritative persistence, and change publication.
 4. Follow a Sentry management read through API compatibility translation and

@@ -232,11 +232,11 @@ to a native route.
 
 | Route | Methods | Authentication | v1 behavior |
 | --- | --- | --- | --- |
-| `/api/<project_id>/envelope/` | `POST` | Collection-only DSN in `X-Sentry-Auth`, DSN query parameters, or the DSN URL used by the pinned SDK | Supported for an active project for error events, attachments, client reports, and native crash items. Every structurally valid, non-conflicting Envelope returns `200` with an empty response body, including accepted, mixed, empty, and unsupported-only Envelopes; durable acceptance is returned before asynchronous processing/query visibility. An idempotency or digest conflict returns the `409 conflict` response defined below instead of the blanket `200`. Disabled and deleting projects use the lifecycle admission responses below before payload acceptance. A deleted project's pre-deletion DSN is no longer current and returns `401 invalid_authentication` before project lookup. |
+| `/api/<project_id>/envelope/` | `POST` | Collection-only DSN in `X-Sentry-Auth`, DSN query parameters, or the DSN URL used by the pinned SDK | Supported for an active project for error events, attachments, client reports, and native crash items. Every structurally valid, non-conflicting Envelope that passes authorization, lifecycle, quota, capacity, and dependency admission returns `200` with an empty response body, including accepted, mixed, empty, unsupported-only, and client-report-only Envelopes; durable acceptance is returned before asynchronous processing/query visibility. An idempotency or digest conflict returns the `409 conflict` response defined below instead of the blanket `200`; an admission failure returns its applicable quota, capacity, or dependency response. Disabled and deleting projects use the lifecycle admission responses below before payload acceptance. A deleted project's pre-deletion DSN is no longer current and returns `401 invalid_authentication` before project lookup. |
 | `/api/<project_id>/envelope/` | `OPTIONS` | Collection-only DSN in the DSN query parameters or DSN URL, project alias, and request `Origin` | Supported only for a configured project-origin CORS preflight. The DSN authenticates and tenant-binds the project alias before the allowlist is read. Returns `204` with no persistence side effect; missing or invalid DSN authentication receives `401 invalid_authentication`, while a missing, malformed, or disallowed origin, including a project with no configured allowlist, receives `403 permission_denied` with no CORS allow headers. |
 | `/api/<project_id>/store/` | `POST` | Collection-only DSN | Supported legacy JSON error path required by a pinned client. The body is converted to one error event and follows Envelope admission semantics. Malformed JSON, an invalid body shape, or invalid required event fields return `400 invalid_envelope` with no acceptance side effect. Successful admission returns `200` with a zero-length body and request-ID headers. |
 | `/api/<project_id>/minidump/` | `POST` | Collection-only DSN | Supported for pinned crash workflows whose fixture specifies the non-Envelope minidump path. `multipart/form-data` and the pinned client field names are accepted. Successful admission returns `200` with a zero-length body and request-ID headers. |
-| `/api/<project_id>/upload/` | `POST` | Collection-only DSN | Supported pinned Native large-attachment TUS creation route. A valid integer `Upload-Length` from `0` through `20,000,000`, `Tus-Resumable: 1.0.0`, and `Upload-Metadata: sentry <base64({"attachment_type":"event.minidump"})>` request returns `201` with an absolute HTTP(S), project-bound `Location` containing a canonical lowercase UUID v7 `upload_id`, `Tus-Resumable: 1.0.0`, and `Upload-Offset: 0`; a zero-length upload is created directly as `complete-unbound`, while a positive-length upload is pending. Neither creation path accepts attachment bytes. A pending upload has a fixed 24-hour lifetime beginning at creation. |
+| `/api/<project_id>/upload/` | `POST` | Collection-only DSN | Supported pinned Native large-attachment TUS creation route. A valid integer `Upload-Length` from `0` through `20,000,000`, `Tus-Resumable: 1.0.0`, and `Upload-Metadata: sentry <base64({"attachment_type":"event.minidump"})>` request returns `201` with an absolute HTTP(S), project-bound `Location` containing a canonical lowercase UUID v7 `upload_id`, `Tus-Resumable: 1.0.0`, and `Upload-Offset: 0`; a zero-length upload is created directly as `complete-unbound`, while a positive-length upload is pending. Neither creation path accepts attachment bytes. A pending upload has a fixed 24-hour lifetime beginning at creation and consumes the project-scoped TUS staging slot/byte reservation defined by #17. |
 | `/api/<project_id>/upload/<upload_id>` | `HEAD`, `PATCH` | Collection-only DSN bound to the upload | Supported pinned Native TUS offset and append workflow. `HEAD` requires request `Tus-Resumable: 1.0.0` and, on success, returns `200` with an empty body and `Tus-Resumable: 1.0.0`, `Upload-Offset`, and `Upload-Length` response headers. Missing or unsupported `Tus-Resumable` returns `412 precondition_failed`; a missing, expired, already-bound, or inaccessible upload returns `404 not_found`, and invalid authentication returns `401 invalid_authentication`. A failed `HEAD` has no response body or `Content-Type`; it returns only its status, `Tus-Resumable: 1.0.0`, request-ID headers, and `Content-Length: 0`, with no `Upload-Offset` or `Upload-Length`. `PATCH` requires `Tus-Resumable: 1.0.0`, `Upload-Offset`, and `application/offset+octet-stream`, appends only at the expected offset, and returns `204` with an empty body, `Tus-Resumable: 1.0.0`, and the new `Upload-Offset`. A stale or mismatched offset returns `409 conflict` with the current `Upload-Offset`; bytes that would exceed `Upload-Length` return `413 payload_too_large` with the current `Upload-Offset`. Every `PATCH` response, including precondition, authentication, not-found, stale-offset, and overflow failures, includes `Tus-Resumable: 1.0.0`; failed `PATCH` requests retain the standard JSON error body and atomically append no bytes. Reaching the declared length transitions the upload to `complete-unbound`; it remains subject to attachment and project limits and is not accepted until the subsequent Envelope binds it to an event. |
 | `/api/<project_id>/security-report/` | `POST` | Collection-only DSN | Explicitly unsupported in v1; returns `501 unsupported_capability` with no persistence side effect because security reports are not error telemetry. |
 | Any other `/api/<project_id>/...` ingestion route | Any | Any | `404` or `405` according to whether the path or method is unknown; no side effect. An unknown-path `HEAD` is status/header-only as defined below. |
@@ -258,8 +258,12 @@ error remains `method_not_allowed`. The route-specific values are:
 | `/api/<project_id>/upload/<upload_id>` | `HEAD, PATCH` |
 
 The explicitly unsupported `/api/<project_id>/security-report/` route retains
-its `501 unsupported_capability` result for every method and does not use this
-`405` rule. Unknown paths remain `404` and do not emit `Allow`.
+its `501 unsupported_capability` result for `POST`. Other non-`HEAD` methods
+on that known path return `405 method_not_allowed` with `Allow: POST`; `HEAD`
+returns the bodyless `501` status/header-only response with
+`Content-Length: 0`, no `Content-Type`, and no JSON body. Unknown paths remain
+`404` and do not emit `Allow`; an unknown-path `HEAD` uses the same bodyless
+status/header-only rule.
 
 `project_id` is a compatibility alias accepted only at the adapter boundary.
 It resolves to one canonical lowercase UUID v7 project identity within the
@@ -357,17 +361,21 @@ Other operation IDs remain subject to ordinary authorization and lifecycle
 rules.
 
 After bounded transport decoding, event parsing, and complete structural
-validation, Ingest normalizes the identity of a retained supported event item
-and performs the event idempotency lookup before applying the API-owned
-environment retirement tombstone and generation fence. A matching acceptance
-record or payload-free uniqueness tombstone returns the original acceptance,
-and the same event ID with a different digest returns `409 conflict`, even
-when the environment has since been retired. If no prior identity exists, the
-retirement fence is then applied before persistence or durable acceptance. An
-empty, unsupported-only, or attachment-only Envelope retains no supported
-event identity and follows the separate no-op/client-report retry rules below;
-its validated envelope-level event ID remains bounded request metadata and is
-not reserved by this lookup. A new event whose
+validation, Ingest applies the raw admission identity and effective-cutoff content
+comparison owned by the
+[`ingestion admission and durable handoff contract`](servers-watchtower-ingestion-contract.md).
+The raw comparison uses decompressed original bytes; #16's semantic
+`payload_digest` remains the compatibility and downstream canonical digest.
+A matching admission record returns the original acceptance, while different
+raw content under the active scoped event-ID fence returns `409 conflict`,
+even when the environment has since been retired. If no prior identity exists,
+the retirement fence is then applied before persistence or durable acceptance.
+An empty, unsupported-only, or uncorrelated attachment-only Envelope retains
+no supported event identity and follows the separate no-op/client-report retry
+rules below; its validated envelope-level event ID remains bounded request
+metadata and is not reserved by this lookup. A correlated later-attachment
+Envelope instead uses its envelope-level event ID to resolve the existing
+parent under the rules below. A new event whose
 `environment` names an environment that is retired for the project returns
 `409 conflict` with detail `The request conflicts with the current resource
 state.` and persists no payload, acceptance record, attachment bytes, or
@@ -392,23 +400,33 @@ equal the completed TUS upload's actual byte count and the declared
 `Upload-Length`; the small JSON reference payload itself is not measured
 against that value. The upload is deliberately event-unbound: TUS creation
 stores no event ID and the pinned creation metadata remains only
-`attachment_type`. At binding, the adapter authorizes the collection DSN for
+`attachment_type`. At binding, the raw minidump descriptor uses the exact
+TUS-specific `watchtower.sentry.minidump.v1` metadata preimage: the SHA-256 of
+the completed identity-encoded upload bytes, an empty `annotations` object,
+and a `sentry` object containing only the normalized binding `event_id`.
+`release`, `dist`, and `platform` are omitted because this workflow supplies
+none, and multipart or Crashpad fields are never invented. The adapter then
+authorizes the collection DSN for
 the same tenant and project, requires the `Location` to resolve to that
 project-bound upload, and requires the Envelope/event ID to identify the
-accepted event in that same tenant and project. It evaluates the existing
-Envelope idempotency identity
-`(tenant_id, project_id, external_event_id, payload_digest)` before rejecting
-the upload state. An exact retry whose retained acceptance record already
-bound the same upload ID and attachment digest to the same event returns the
-original acceptance, even when the upload is now `bound`; it does not create a
-second attachment or transition. The retained binding record includes the
-upload ID, event ID, payload digest, attachment digest and length, and original
-acceptance. If the same Envelope identity matches a retained acceptance but
-references a different upload ID, the adapter returns `409 conflict` without
-creating a second binding or attachment transition; the original binding
-remains authoritative and the other upload remains `complete-unbound` subject
-to expiry. A retry with the same event ID and a different digest remains the
-documented `409 conflict`; an otherwise unmatched `bound` upload remains
+accepted event in that same tenant and project. It evaluates the #17 raw
+admission identity and attachment identity before transitioning the upload;
+the #16 Envelope identity
+`(tenant_id, project_id, external_event_id, payload_digest)` remains bounded
+compatibility metadata. An exact retry whose retained acceptance record already
+bound the same upload ID and complete attachment identity to the same event
+returns the original acceptance, even when the upload is now `bound`; it does
+not create a second attachment or transition. The retained binding record
+includes the upload ID, event ID, `attachment_identity_digest`, attachment
+digest and length, semantic `payload_digest`, and original acceptance. The
+attachment identity is compared independently of aggregate payload changes
+from auxiliary client reports. If the same raw admission identity matches a
+retained acceptance but references a different upload ID, or if the attachment
+identity differs, the adapter returns `409 conflict` without creating a second
+binding or attachment transition; the original binding remains authoritative
+and the other upload remains `complete-unbound` subject to expiry. A retry with the
+same event ID and different raw content remains the documented `409 conflict`
+under the #17 comparison; an otherwise unmatched `bound` upload remains
 inaccessible. Only a first acceptance requires `complete-unbound` with the
 declared length, and it atomically transitions that state to `bound` while
 retaining the uploaded bytes only as an attachment of that event. A completed
@@ -421,8 +439,10 @@ at creation. Expiration is the exclusive boundary `now >= expires_at`:
 at or after the boundary, even if physical garbage collection has not yet
 run. This is the logical deletion fence for the unaccepted staging record;
 physical garbage collection may complete later, but the expired bytes cannot be
-read, appended, or bound. An unreferenced completed upload therefore expires
-without durable customer-payload acceptance.
+read, appended, or bound. The staging slot and byte reservation remain charged
+until deletion is confirmed, so delayed cleanup cannot be replaced by new
+staging usage. An unreferenced completed upload therefore expires without
+durable customer-payload acceptance.
 
 The reference attachment payload is a closed JSON object with exactly these
 two members:
@@ -1706,17 +1726,32 @@ strings defined above. Annotation keys and object keys use RFC 8785 ordering, an
 the minidump hash is over decompressed bytes rather than multipart framing or
 compressed bytes. A missing `sentry` part or missing/malformed `event_id`
 returns `400 invalid_request` before acceptance. Minidump submissions use the
-same cross-transport event-ID uniqueness record as Envelope and legacy `store`
-ingestion. That record is keyed by
-`(tenant_id, project_id, external_event_id)`, stores the accepted transport
-payload digest and canonical event reference, and remains authoritative through
-the full query-retention horizon even after the raw minidump acceptance record
-expires. For minidumps, `minidump_digest` is the transport payload digest: a
-matching event ID and digest returns the original `200` empty-body acceptance,
-while an existing event ID with a different digest, bytes, annotations, or
-metadata—including one accepted through another event-bearing transport—returns
-`409 conflict` without creating a second canonical event. The Ingest acceptance
-record retains the digest and identity for the raw-handoff acceptance horizon.
+same cross-transport event-ID compatibility record as Envelope and legacy
+`store` ingestion. That record is keyed by
+`(tenant_id, project_id, source_protocol, external_event_id)`, stores the accepted transport
+digest and canonical event reference, and keeps protocol namespaces isolated.
+The #17 raw
+admission fence governs whether it is still an admission duplicate or conflict:
+it lasts through the earlier of the seven-day default cutoff and the active
+project raw-retention cutoff from first acceptance, and is not extended by a
+retry. For minidumps, `minidump_digest` is also #17's
+`admission_content_digest`: it
+includes the decompressed dump bytes, normalized Crashpad annotations, and
+normalized Sentry metadata while excluding multipart boundaries, part ordering,
+and transport compression. A matching scoped event ID and digest within the
+active raw fence returns the original `200` empty-body acceptance; different
+dump bytes or metadata return `409 conflict` without a second acceptance.
+After the effective raw fence expires, the same event ID still cannot create a
+new public generation while the older canonical event's alias remains
+queryable; the compatibility record remains authoritative until the
+query-retention alias fence expires. The Ingest admission tombstone retains the
+non-payload digest and identity through the raw fence even if raw state has
+already retired. For a multipart minidump, the compatibility record retains
+the same `minidump_digest` as its `alias_horizon_digest` through that alias
+fence. A matching retry compares that retained digest and returns the original
+acceptance; a changed dump, normalized annotation, or normalized Sentry
+metadata returns `409 conflict`. Multipart framing, part ordering, and
+transport compression remain excluded by the `minidump_digest` preimage.
 
 ### Explicit limits
 
@@ -1848,15 +1883,19 @@ same result applies when either repeated filter exceeds its limit.
 
 An Envelope is newline-delimited JSON headers followed by items. The envelope
 header is required, and each item uses either length-delimited or
-newline-delimited framing. When `length` is present it is authoritative,
-payload bytes must match the declared length, and trailing bytes other than the
-permitted final newline are invalid. When `length` is omitted, the item payload
-uses the permitted newline-delimited framing. When a supported error event item
+newline-delimited framing. When `length` is present it is authoritative: the
+framed payload bytes as received, before any item `content_encoding` decoding,
+must match the declared length. The adapter consumes that exact encoded section
+before decoding it, and trailing bytes other than the permitted final newline
+are invalid. Decoded bytes are checked separately against the decoded item and
+aggregate limits. When `length` is omitted, the item payload uses the permitted
+newline-delimited framing. When a supported error event item
 is present, the envelope's `event_id`, when present, must match that item. If no
 supported error event item is present, a present envelope `event_id` is still
 syntax- and DSN-validated but is not required to match an excluded item and is
-retained only as bounded request/no-op metadata. Empty Envelopes are
-structurally valid but have no accepted item.
+retained only as bounded request/no-op metadata, except for the exact
+later-attachment shape defined below. Empty Envelopes are structurally valid
+but have no accepted item.
 
 Every external SDK event ID uses the grammar `[0-9a-fA-F]{32}`: exactly 32
 ASCII hexadecimal characters, with no hyphens, braces, `0x` prefix, whitespace,
@@ -1939,7 +1978,31 @@ must equal both the dereferenced completed upload byte count and its declared
 TUS `Upload-Length`; the reference JSON payload length is not used for this
 comparison. A missing, malformed, or mismatched value is rejected with
 `400 invalid_envelope` before binding. The attachment is retained only with
-its accepted event.
+its accepted event or its resolved existing parent.
+
+A later-attachment Envelope has a valid normalized envelope-level `event_id`,
+exactly one `attachment` item, zero or more `client_report` items, no `event`
+item, and no other supported item. The `client_report` items are auxiliary
+bounded units, with one bounded client-report admission unit per item; they do
+not change the attachment's correlated parent or its request-atomic admission
+outcome.
+The envelope-level ID is the scoped external ID of an already accepted parent;
+the attachment item carries no parent or event-ID field. This shape is a
+payload-bearing later-attachment unit, not an attachment-only no-op. For a new
+attachment binding, the parent must be in the same tenant and
+project, remain authorized and within its effective raw-retention cutoff, and
+be resolved before attachment identity,
+quota, and acceptance are committed. An exact retry of a previously bound TUS
+reference is checked against retained binding evidence first; while the
+query-retention alias remains live, a matching scoped parent/event identity,
+upload ID, attachment identity digest, attachment digest, length, and original
+acceptance returns the original result even after the parent raw cutoff. It
+does not create a new binding or require live raw parent state, but lifecycle,
+deletion, tenant, and project fences still apply. A TUS reference uses the same
+shape and binds the completed project-bound upload to that parent. An attachment-only
+Envelope that lacks this exact correlation shape remains the documented
+bounded no-op.
+
 `client_report` has this JSON payload shape:
 
 ```json
@@ -1964,8 +2027,8 @@ below and are not included in the digest. Missing required members, wrong
 types, empty arrays or tokens, invalid token grammar, quantities outside the
 range, an item record count over 1,024, or an Envelope aggregate over 1,024
 rejects the entire Envelope with `400 invalid_envelope` before acceptance.
-Duplicate records are retained and sorted by canonical JSON for digest
-construction; they are not merged.
+Duplicate records are retained and sorted by canonical JSON for both envelope
+and per-item digest construction; they are not merged.
 
 The adapter counts `event` item headers before accepting or normalizing any item
 payload. An Envelope containing a second `event` item is rejected in its
@@ -1998,8 +2061,8 @@ acceptance.
 | Item type | v1 behavior |
 | --- | --- |
 | `event` | Supported when it meets the error-event predicate above. Exactly one event item is allowed; a second event item rejects the entire Envelope as described above. |
-| `attachment` | Supported when associated with a supported error or native crash. A structurally valid unassociated attachment is individually excluded with reason `unassociated_attachment`; its bytes are not retained. |
-| `client_report` | Structurally accepted and recorded as bounded client diagnostic metadata; it is not an error event. |
+| `attachment` | Supported when associated with a supported error or native crash, or when it uses the exact later-attachment correlation shape above. A structurally valid unassociated attachment is individually excluded with reason `unassociated_attachment`; its bytes are not retained. |
+| `client_report` | Structurally accepted and recorded as bounded client diagnostic metadata; it is not an error event. A client-report-only Envelope is a payload-free accepted no-op. |
 | `profile`, `profile_chunk` | Individually excluded. |
 | `transaction`, `span` | Individually excluded; tracing semantics belong to #25. |
 | `session` | Individually excluded; sessions and release health are out of scope. |
@@ -2015,12 +2078,13 @@ Malformed framing, invalid JSON headers, invalid lengths, invalid compression,
 or an invalid supported item rejects the entire request. A structurally valid
 Envelope retains supported error/attachment items and individually excludes
 unsupported non-error items, including an unassociated attachment. An
-unsupported-only or attachment-only Envelope is durably accepted only as a
-bounded no-op when its framing is valid; it records bounded acceptance and
-handoff metadata, persists no payload bytes, and returns `200` with an empty
-response body. An empty Envelope follows the same no-op behavior. Exclusion
-diagnostics contain only item type, reason, count, project, request ID, and
-correlation ID.
+unsupported-only, client-report-only, or uncorrelated attachment-only Envelope
+is durably accepted only as a bounded no-op when its framing is valid; it
+records bounded acceptance and handoff metadata, persists no payload bytes, and
+returns `200` with an empty response body. A correlated later-attachment
+Envelope is payload-bearing and follows the parent-resolution rules above. An
+empty Envelope follows the same no-op behavior. Exclusion diagnostics contain
+only item type, reason, count, project, request ID, and correlation ID.
 
 Unknown top-level members in Envelope headers, members in item headers, event
 payloads, client reports, minidump metadata, and extensible bounded DTO data
@@ -2044,20 +2108,23 @@ management schemas remain the explicit exception.
 
 ### Acknowledgement, errors, retries, and idempotency
 
-- Every structurally valid, non-conflicting Envelope `POST`, whether it retains
-  supported items or is an empty/unsupported-only no-op, returns HTTP `200`
-  with a zero-length response body. Request IDs remain response headers, and
-  no `202` or `204` success is used for Envelope admission. A validated
-  idempotency or digest conflict instead returns the standard `409 conflict`
-  body and no new acceptance side effect.
+- After authorization, lifecycle, quota, capacity, and dependency admission
+  succeeds, every structurally valid, non-conflicting Envelope `POST`, whether
+  it retains supported items or is an empty/unsupported-only/client-report-only
+  no-op, returns HTTP `200` with a zero-length response body. Request IDs remain
+  response headers, and no `202` or `204` success is used for Envelope
+  admission. A validated idempotency or digest conflict instead returns the
+  standard `409 conflict` body and no new acceptance side effect; an admission
+  failure returns its applicable quota, capacity, or dependency response.
 - Successful legacy `store` and `minidump` `POST`s use the same `200`-
   empty-body acknowledgement and request-ID headers, including an idempotent
   retry of an already accepted submission.
-- A successful ingestion response for one or more accepted items means raw
+- A successful ingestion response for one or more accepted payload-bearing items means raw
   bytes, acceptance metadata, and a recoverable processing handoff/outbox are
   durable. It does not mean canonical storage, issue grouping, symbolication,
   or Query visibility.
-- A successful no-op acknowledgement for an empty or unsupported-only Envelope
+- A successful no-op acknowledgement for an empty, unsupported-only,
+  client-report-only, or uncorrelated attachment-only Envelope
   means only that bounded acceptance metadata and the no-op handoff are durable;
   it does not imply that raw payload bytes were retained or accepted.
 - Management `202` means an operation is durably accepted and pending. A
@@ -2183,30 +2250,92 @@ tie-breaker.
   preimage excludes transport compression, Envelope framing and lengths,
   request IDs, DSN, `sent_at`, `sdk`, `trace`, and individually excluded items;
   attachment bytes contribute through their SHA-256 and size. Empty,
-  unsupported-only, and attachment-only Envelopes use `event: null`, an empty
-  attachment array, and an empty client-report array.
-- A retained supported event submission is idempotent by the tuple
-  `(tenant_id, project_id, external_event_id, payload_digest)`, recorded in the
-  one cross-transport event-ID uniqueness record shared by Envelope, legacy
-  `store`, and minidump ingestion. The record is keyed by
-  `(tenant_id, project_id, external_event_id)` and stores the accepted transport
-  payload digest and canonical event reference. A matching tuple returns the
-  original acceptance; the same event ID with a different digest returns `409`
-  and is not merged or durably accepted. These idempotency checks apply only when the
-  Envelope retains a supported event item, occur after complete structural
-  validation and before the environment retirement fence or any new acceptance
-  side effect, so this
-  `409 conflict` is the explicit exception to the otherwise universal `200`
-  Envelope acknowledgement. If the raw acceptance record retires while the
-  canonical event remains queryable, the shared uniqueness record remains
-  authoritative through the full query-retention horizon. During that horizon,
-  a matching retry returns the original
-  acceptance without creating another event, while a different digest returns
-  `409 conflict`; the event-detail route resolves the one retained canonical
-  event. Only after the shared record and query-retention horizon expire does
-  this contract make no historical deduplication or conflicting-digest
-  guarantee.
-- An accepted Envelope with no retained supported event item uses a separate
+  unsupported-only, and uncorrelated attachment-only Envelopes use
+  `event: null`, an empty attachment array, and an empty client-report array.
+  A client-report-only Envelope uses `event: null`, an empty attachment array,
+  and its canonical client-report records.
+
+  `alias_horizon_digest` is lowercase hexadecimal SHA-256 over the UTF-8 bytes
+  of the RFC 8785 canonical-JSON encoding of the primary event and its initial
+  attachment multiset only:
+
+  ```text
+  {
+    "schema": "watchtower.sentry.alias-horizon.v1",
+    "event": normalized_event_object,
+    "attachments": sort_by_canonical_json([
+      {
+        "content_type": string_or_null,
+        "filename": string_or_null,
+        "attachment_type": string_or_null,
+        "sha256": lowercase_hex_sha256(dereferenced_or_decoded_attachment_bytes),
+        "size": dereferenced_or_decoded_attachment_byte_count
+      }
+    ])
+  }
+  ```
+
+  It excludes auxiliary `client_report` units and is retained with the
+  compatibility alias for comparison after the raw-admission fence expires.
+  Therefore a matching primary event and initial attachment multiset remains
+  a matching alias retry when auxiliary reports are added, removed, or
+  changed; a primary or attachment change remains `409 conflict`.
+
+  For a multipart minidump, `alias_horizon_digest` is the retained
+  `minidump_digest` defined in the minidump admission section above. Its exact
+  multipart preimage is authoritative for the alias comparison; no
+  `normalized_event_object` or initial-attachment mapping is inferred for that
+  transport.
+
+  For admission accounting, each normalized `client_report` item also retains
+  its item boundary. Its `client_report_item_digest` is the lowercase
+  hexadecimal SHA-256 of the RFC 8785 canonical JSON bytes for that item's
+  normalized `{ "discarded_events": [...] }` object after its records are
+  sorted by canonical JSON, with duplicate records retained. Its zero-based
+  `client_report_occurrence` is assigned among equal item digests after the
+  item digests are sorted, so reordered records, reordered items, and duplicate
+  items have stable, distinct unit keys.
+- A retained supported event submission uses the #17 raw admission identity:
+  `(tenant_id, project_id, source_protocol, external_event_id,
+  admission_generation, admission_content_digest)`. For an initial error unit,
+  the identity additionally includes the
+  `initial_attachment_identity_multiset`, which is the canonical sorted multiset
+  of the initial error unit's attachment identities, including an empty
+  multiset and repeated equal members. Each member uses the accepted
+  `(filename, content_type, attachment_type, sha256(content_bytes))` fields;
+  an absent filename remains absent rather than becoming a null or default.
+  Its multiplicity is part of the comparison, so adding, removing, changing,
+  or duplicating an initial attachment is a conflict even when the event bytes
+  are unchanged. This identity's minimal duplicate and
+  conflict fence lasts through the earlier of the seven-day default cutoff and
+  the active project raw-retention cutoff from first acceptance, and is not
+  extended by retries. For Envelope and legacy `store`,
+  `admission_content_digest` compares
+  decompressed original supported event bytes, so JSON whitespace and
+  member-order changes are different raw content; multipart minidumps use the
+  deterministic `minidump_digest` preimage defined above and do not infer an
+  initial-event attachment multiset. Transport
+  authentication, compression, and framing are excluded. For an initial error
+  unit, the event content digest and attachment multiset are compared together;
+  the attachment identity is not folded into the event-byte digest.
+  A matching identity returns the original acceptance, while different raw
+  content or an initial attachment identity multiset mismatch under the active
+  event-ID fence returns `409 conflict` with no new acceptance or charge. The
+  #16 semantic `payload_digest` remains recorded for
+  compatibility and downstream canonical processing, but it does not extend
+  or replace the raw admission fence. These checks occur after complete
+  structural validation and before the environment retirement fence or any
+  new acceptance side effect. After the effective raw cutoff, raw
+  duplicate/conflict state may expire, but the same external event ID cannot create a new public
+  generation while the older canonical event remains queryable. The
+  compatibility record continues to own the alias through the effective query
+  retention cutoff; matching retries compare `alias_horizon_digest`, resolve to
+  that record, and allow auxiliary reports to vary independently. Conflicting
+  primary content or attachment identity returns `409 conflict`. After the
+  alias fence expires, the canonical reference may retire, but a permanent
+  payload-free event-ID fence still rejects reuse with `409 conflict`.
+- An accepted Envelope with no retained supported event item, excluding a
+  correlated later-attachment unit, uses a separate
   no-op/client-report retry identity when the caller supplied a valid canonical
   `X-Request-ID`: `(tenant_id, project_id, client_request_id, payload_digest)`.
   This identity is used even when a syntax-validated envelope-level event ID is
@@ -2222,6 +2351,12 @@ tie-breaker.
   new no-op/client-report submission. If no client `X-Request-ID` was supplied,
   the generated response request ID is diagnostic only and each retry is a new
   accepted submission; identical payloads are never collapsed by content alone.
+  Each `client_report` item extends this identity for its own reservation and
+  handoff with `unit_kind=client_report`, its `client_report_item_digest`, and
+  its `client_report_occurrence`. A retry must reproduce the complete set of
+  item unit keys; a missing, extra, or changed key under the same request
+  identity is `409 conflict` rather than a partial duplicate. An empty or
+  unsupported-only no-op uses `unit_kind=no_op` instead.
 - Creation, deletion, rotation, release finalization, chunk assembly, and
   deployment writes use the control-plane idempotency tuple. Project creation,
   project deletion, DSN mutation, and release-file deletion reject a missing
@@ -2971,14 +3106,28 @@ unsupported release-health behavior.
   resource generation, while canonical IDs and other scoped external
   identifiers are never reused across generations.
 - Supported event IDs from Envelope, legacy `store`, and minidump ingestion use
-  one cross-transport uniqueness record keyed by
-  `(tenant_id, project_id, external_event_id)`. Two projects may use the same
-  event ID without collision or disclosure. The record stores the accepted
-  transport payload digest and canonical event reference, remains authoritative
-  while the canonical event is queryable, and prevents a second canonical event
-  or incompatible retry across transports. An event ID is never a canonical
-  Watchtower primary key. An event ID carried only by an empty or excluded-only
-  Envelope is not registered and may be reused by a later supported event.
+  one cross-transport compatibility record keyed by
+  `(tenant_id, project_id, source_protocol, external_event_id)`. Two projects
+  and two source protocols may use the same event ID without collision or
+  disclosure. The record stores the `alias_horizon_digest` and canonical event
+  reference for the current admission generation. It is a
+  compatibility projection, not the raw-admission deduplication fence, but it
+  and its permanent non-reuse fence both use the full tuple. It also owns the
+  public alias while the referenced canonical event remains
+  queryable, for 90 days by default or the shorter effective query-retention
+  cutoff. The separate #17 raw-admission duplicate and conflict fence lasts
+  through the earlier of the seven-day default cutoff and the active project
+  raw-retention cutoff from first acceptance and is not extended by retries.
+  A matching retry resolves to the retained compatibility record by comparing
+  `alias_horizon_digest`; conflicting primary content or attachment identity
+  returns `409 conflict`. The projection cannot point to a later generation.
+  After the alias expires, the canonical reference may be retired, but the
+  Ingest-owned permanent payload-free per-protocol event-ID non-reuse fence
+  remains and rejects any later public generation in that protocol with `409
+  conflict`. An event ID is
+  never a canonical Watchtower primary key. An event ID carried only by an
+  empty or excluded-only Envelope is not registered and may be reused by a
+  later supported event.
 - API owns control-plane, project, DSN, release, artifact, operation, and audit
   authority. Ingest owns raw accepted records and recoverable handoff. Processor
   owns processing, canonical telemetry, symbolication, and derived issue data.
@@ -3084,9 +3233,12 @@ exercise:
   body-only `application/octet-stream` requests, and unlisted file parts,
   bounded fields, deterministic `400 invalid_request` no-side-effect failures,
   the successful `200` zero-length acknowledgement, and shared
-  cross-transport event-ID uniqueness with Envelope/store ingestion, including
-  retries after raw acceptance expiry while the canonical event remains
-  queryable and conflicting payload digests returning `409`;
+  cross-transport event-ID compatibility with Envelope/store ingestion,
+  deterministic `minidump_digest` equality across multipart boundary and part
+  ordering changes, metadata/dump changes returning `409`, effective-cutoff
+  raw-admission duplicate/conflict behavior, post-raw-fence alias retries using
+  the retained `minidump_digest`, and alias retention preventing a new public
+  generation while the canonical event remains queryable;
 - `sdk.native.crash` using the exact multipart minidump request and
   `sdk.native.tus-minidump` using the separate TUS creation/append and Envelope
   `attachment-ref` binding workflow;
@@ -3110,6 +3262,10 @@ exercise:
   and failed `PATCH`, atomic no-append behavior for both failures,
   incomplete-upload retention, finalization at the declared length,
   the 24-hour pending and complete-unbound lifetimes, no extension by append,
+  project-scoped staging byte/count exhaustion, reservation retention through
+  delayed physical cleanup, deletion-confirmed idempotent release, and
+  final attachment charging on binding while retaining the separate
+  `tus_staging` reservation until confirmed physical deletion,
   and exact `now >= expires_at` behavior,
   failed-`HEAD` status/header-only responses with `Content-Length: 0`, the
   exact closed `{url,path}` reference object and relative-path validation,
@@ -3121,20 +3277,26 @@ exercise:
   `200` binding response when the upload is already `bound`, rejection of
   cross-project binding, bounded Ingest-owned unaccepted staging before
   binding, and the logical deletion fence at the exact expiry boundary;
-- empty, unsupported-only, attachment-only, supported-only, and mixed Envelopes,
-  including unassociated-attachment exclusion, and an
-  envelope-level event ID on an excluded-only Envelope, all expecting `200`
-  with a zero-length response body, plus malformed, non-canonical, and duplicate
+- empty, unsupported-only, client-report-only, uncorrelated attachment-only,
+  supported-only, mixed, and correlated later-attachment Envelopes, including
+  correlated later attachments with auxiliary client reports,
+  unassociated-attachment exclusion, and an envelope-level event ID on an
+  excluded-only Envelope, all expecting the applicable `200` after successful
+  admission with a zero-length response body, while exhausted or unavailable
+  no-op capacity expects `429` or `503`; plus malformed, non-canonical, and duplicate
   `X-Request-ID` headers returning `400 invalid_request` before lookup or
   mutation, plus eventless empty/client-report retries with the same client
   `X-Request-ID`, different client IDs, and no client ID;
   client reports also cover the exact `discarded_events` shape, token and
-  quantity boundaries, duplicate-record digest handling, unknown members,
-  multiple `client_report` items, and the aggregate 1,024-record limit;
+  quantity boundaries, canonical record ordering within each item, duplicate
+  record retention, unknown members, multiple `client_report` items, distinct
+  per-item reservation keys, reordered and duplicate-item retry stability,
+  changed unit-key conflict handling, and the aggregate 1,024-record limit;
   conflicting event/request digests expect the standard `409 conflict` body
   and no new acceptance side effect;
-- nested identity/gzip item payloads at and over the decoded 20,000,000-byte
-  item and 50,000,000-byte aggregate limits, with no partial persistence, plus
+- nested identity/gzip item payloads whose encoded framed lengths differ from
+  decoded sizes, at and over the decoded 20,000,000-byte item and 50,000,000-byte
+  aggregate limits, with no partial persistence, plus
   unknown Envelope-header values at and over the global 16-level JSON nesting
   bound, including ignored over-depth values returning `400 invalid_envelope`
   without acceptance, management JSON and deeply nested deployment metadata at
@@ -3143,10 +3305,14 @@ exercise:
   items being ignored while recognized item types return `415
   unsupported_media_type`;
 - duplicate, case-variant, malformed, and conflicting event IDs, including
-  acceptance-record retirement while the canonical event remains queryable,
-  identical retries after environment retirement, and uniqueness-tombstone
-  enforcement; equivalent payloads with different
-  compression, JSON ordering, or excluded metadata; message-only and
+  effective raw-admission-fence expiry while the canonical event remains
+  queryable, auxiliary client-report changes that preserve the
+  `alias_horizon_digest`, primary-content conflicts after the raw fence,
+  permanent event-ID non-reuse after alias expiry, identical retries after
+  environment retirement, and deletion fencing; raw-byte differences such as
+  compression-independent whitespace
+  or JSON ordering conflicts at admission while equivalent semantic
+  `payload_digest` values remain deterministic downstream; message-only and
   stacktrace-only error events, exception events, deterministic multi-entry
   Event DTO serialization and ordering, deterministic Event `title` candidate
   precedence and empty fallback, deterministic Event `culprit` precedence and

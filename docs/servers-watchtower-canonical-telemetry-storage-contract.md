@@ -16,6 +16,10 @@ authoritative in
 This contract selects the canonical data and storage decisions those contracts
 leave to downstream ownership. A downstream contract may refine behavior in
 its assigned domain but must not move ownership across the component boundary.
+The [`ingestion admission and durable handoff contract`](servers-watchtower-ingestion-contract.md)
+refines raw acceptance units, admission identity, quota reservation, and
+Ingest recovery without changing this contract's storage ownership or
+retention fences.
 
 ## Canonical Model
 
@@ -96,7 +100,8 @@ canonical telemetry.
 
 | Data class | Writer and authority | Storage boundary | Lifecycle |
 | --- | --- | --- | --- |
-| Raw accepted records and attachments | Ingest; authoritative for raw acceptance | Encrypted immutable S3 objects plus Ingest PostgreSQL acceptance metadata and outbox state | Seven days from `accepted_at` by default; a project policy may shorten this cutoff but never extend it, and raw state may remain only until Processor durably confirms handoff completion or Ingest durably records class-default or shortened-policy expiry within that cutoff; never customer-downloadable |
+| Raw accepted records and attachments | Ingest; authoritative for raw acceptance units under the [ingestion contract](servers-watchtower-ingestion-contract.md) | Encrypted immutable S3 objects plus Ingest PostgreSQL acceptance metadata and outbox state | Seven days from `accepted_at` by default; a project policy may shorten this cutoff but never extend it, and raw state may remain only until Processor durably confirms handoff completion or Ingest durably records class-default or shortened-policy expiry within that cutoff; never customer-downloadable |
+| TUS staging records and appendable bytes | Ingest; authoritative for pre-acceptance upload lifecycle, append state, binding, staging reservations, and deletion fences | Ingest-owned encrypted mutable S3 staging objects or multipart uploads plus Ingest PostgreSQL staging metadata, reservation state, and lifecycle-fence evidence | Pending and `complete-unbound` uploads retain their declared slot and bytes through the fixed 24-hour lifetime; binding transitions the record to `bound`, creates the final attachment charge, retains staging capacity, and records the attachment's effective raw-retention cutoff for cleanup no later than that cutoff; logical expiry blocks access, and confirmed physical deletion releases the staging reservation exactly once; never customer-, Processor-, or Query-readable |
 | Normalized records | Processor; authoritative only as processing input | Processor-owned encrypted S3 replay-batch prefix, with separate class metadata | Retained as needed for replay; when raw may retire after a successful handoff, a verified normalized representation has a retention floor through the applicable raw-retention cutoff even if a class policy is shorter, and is never retained longer than 90 days |
 | Enriched records | Processor; authoritative only as processing input | Processor-owned encrypted S3 replay-batch prefix, with separate class metadata | Retained only as needed for replay, no longer than 90 days |
 | Canonical telemetry | Processor; authoritative for the four signal histories | Four independent ClickHouse canonical table families | Immutable history for 90 days from `accepted_at` |
@@ -152,7 +157,7 @@ access to another component's storage are prohibited.
 
 | Component | Owned storage and writes |
 | --- | --- |
-| Ingest | Encrypted immutable raw S3 objects, PostgreSQL acceptance metadata, and the transactional processing outbox. |
+| Ingest | Encrypted mutable TUS staging objects or multipart uploads, PostgreSQL TUS staging metadata/reservation/fence state, encrypted immutable raw S3 objects, PostgreSQL acceptance metadata, and the transactional processing outbox. |
 | Processor | The four immutable canonical ClickHouse histories, encrypted project-scoped non-authoritative replay batches, PostgreSQL processing state, and mutable derived aggregates. |
 | Query | Independently owned ClickHouse read projections, Query-owned PostgreSQL export metadata, encrypted non-authoritative cache, and encrypted project-scoped S3 export prefix. |
 | API | Authoritative control-plane and audit state in its own PostgreSQL boundary, plus encrypted immutable S3 control-registry prefixes for restore-independent retention policies, deletion tombstones, API restore audit intents, the API audit journal, export holds, and captured export snapshot payloads. |
@@ -172,18 +177,79 @@ immutable object exists,
 its digest and size have been verified, and the acceptance metadata and
 transactional outbox commit. Orphaned or incomplete attempts are reconciled
 without being reported as successful acceptance. The raw object, acceptance
-metadata, and recoverable handoff remain until Processor durably confirms
-completion through the versioned `RawHandoffDispositionV1` message or Ingest
-durably records a class-default or shortened-policy expiry fence through
-`RawRetentionExpiryV1`.
-For a `completed` disposition, Processor commits the verified normalized replay
-representation before sending the disposition, so Ingest may retire raw state
-immediately without losing the reprocessing source. Ingest retries and
-reconciles pending handoffs while their raw acceptance remains eligible. If a
-handoff remains unprocessed at the seven-day class-default cutoff, the
-`RawRetentionExpiryV1` sweep causes Ingest to durably record `default_expired`
-and fence the handoff; it is not redelivered after the raw source or MSK
-handoff record expires, and late fetches or dispositions are rejected.
+metadata, and recoverable handoff remain until Processor completes the
+owner-mediated `RawHandoffCompletionArbitrationV1` finalization and Ingest
+durably records the matching terminal `RawHandoffDispositionV1`, expiry fence,
+or lifecycle fence. The initial `RawHandoffCompletionClaimV1` is provisional;
+even a `claim_finalized` result does not retire raw state before the terminal
+disposition. The effective raw-retention cutoff is the hard completion-lease
+deadline: a provisional or finalized claim without a matching terminal
+disposition receives the owner-recorded expiry fence at that cutoff and cannot
+keep raw state eligible indefinitely. A `claim_finalized` result authorizes
+completion through a later project-deletion fence, but not past a raw-expiry
+fence that wins before its terminal disposition. A pending or active
+shortened-policy or deletion fence can cancel an unfinalized claim through
+`RawHandoffLifecycleFenceV1`. An already finalized claim remains authoritative
+for project deletion, but its terminal disposition and resulting
+canonical cleanup are outstanding deletion dependencies. Asynchronous message
+arrival cannot decide the winner.
+
+TUS staging is a separate Ingest-owned boundary from accepted raw state. The
+staging record is authoritative for the project and upload identity, declared
+length, current offset, lifecycle status, expiry, binding evidence, staging
+reservation, and deletion fence; its appendable bytes remain in the matching
+encrypted S3 staging object or multipart upload. Creation and each append are
+recoverable from these Ingest-owned boundaries without creating an accepted raw
+record or a Processor handoff. After a restore, Ingest reconciles staging
+metadata with the staged object or multipart state, retains the reservation and
+blocks access when either side is uncertain, and releases capacity only after
+confirmed physical deletion. Processor receives bytes only through the normal
+post-acceptance owner-mediated handoff and never reads the staging prefix.
+
+When binding succeeds, the staging record becomes `bound` and records the
+earlier of the attachment's own applicable raw-retention cutoff and the
+parent's remaining raw-retention cutoff. Jobs schedules bound-staging cleanup
+through the project-scoped retention sweep, and Ingest physically deletes the
+staging bytes and records the deletion no later than that cutoff. A failed or
+uncertain cleanup remains fenced and retryable, retaining the staging
+reservation until physical deletion is confirmed; binding never permanently
+consumes capacity merely because the record is terminally bound.
+
+At each 24-hour logical expiry, Jobs also schedules a project-scoped staging
+expiry sweep for `pending` and `complete-unbound` records, including
+zero-length uploads. Ingest idempotently enumerates the expired unbound state,
+fences `HEAD`, `PATCH`, and binding, physically deletes its staging bytes and
+record, and records deletion or a retryable deletion fence. Uncertain or failed
+cleanup retains the reservation until physical deletion is confirmed; the
+staging slot and bytes are released exactly once after confirmation. This sweep
+is mandatory and separate from bound raw-retention cleanup, including while
+Processor is unavailable and during restore reconciliation.
+
+For a `completed` disposition, Processor stages the verified normalized replay
+representation, obtains the claim phase of the owner-mediated arbitration from
+Ingest, and invokes its finalization phase immediately before authoritative
+default-generation promotion. Ingest records the matching provisional
+`RawHandoffCompletionClaimV1` and then serializes finalization with pending and
+active retention/deletion fences. `claim_finalized` permits candidate commit
+before a raw-expiry fence, and a later retention/deletion lifecycle fence does
+not invalidate a claim whose finalization already won; canonical promotion
+remains gated on the matching terminal disposition acknowledgement, and the
+resulting canonical state remains a lifecycle-purge dependency. A
+`lifecycle_fenced` result records `RawHandoffLifecycleFenceV1`, forbids
+promotion, and requires a matching `lifecycle_rejected` disposition. The same
+handshake has a no-op variant for payload-free completion and carries no
+canonical digest or processing generation. A claim granted while the handoff
+is eligible remains eligible until the effective raw-retention cutoff, but a
+later lifecycle fence cancels it if finalization has not won. If a handoff
+remains unresolved at the seven-day class-default cutoff, the
+`RawRetentionExpiryV1` sweep serializes with the owner-mediated arbitration:
+only a matching terminal disposition already recorded before the cutoff keeps
+completion authoritative. A provisional or finalized claim without that
+disposition receives `default_expired` or `policy_rejected`, and Processor
+must discard or remove any unpublished result before acknowledging the matching
+expiry fence. A later claim, fetch, or conflicting disposition cannot revive a
+fenced handoff; a matching expiry or lifecycle disposition may close the
+recorded outcome idempotently.
 
 Canonical ClickHouse tables are partitioned monthly by `accepted_at` and
 ordered by:
@@ -214,19 +280,36 @@ remains eligible, or uses the cutoff/no-row path after expiry. A sequence is
 never reused. The reconciler then idempotently commits the staged row to
 ClickHouse using the partition and sequence identity. After verifying the same
 digest, it marks the staging record `clickhouse_committed`; only that state is
-eligible for durable outbox publication. Processor performs the current-cutoff
-check before committing the row. If that check fails before commit, the
-reconciler marks the staged write retention-expired and, after proving that no
-authoritative row exists, publishes an idempotent no-row
+eligible for durable outbox publication. Processor performs the final
+owner-mediated completion check before committing the row. A matching
+`claim_finalized` result permits commit while no raw-expiry fence has won; it
+remains eligible across a later retention/deletion lifecycle fence when
+finalization won first. A provisional claim without finalization, or a
+`lifecycle_fenced` result, cannot commit or publish. If that check fails before
+commit without a terminally eligible claim, the
+reconciler marks the staged write retention/lifecycle-fenced and, after proving
+that no authoritative row exists, publishes an idempotent no-row
 `CanonicalChangeSkipV1` marker for the reserved sequence through the same
 canonical-change path. If ClickHouse committed the row while it was still
-within its cutoff and publication then failed, recovery verifies its digest,
-retains the row, marks the staging record `clickhouse_committed`, and publishes
-the actual canonical change. If the current cutoff arrives after ClickHouse
-commits the row but before publication, recovery marks the staging record
-retention-expired, removes the authoritative row, verifies its absence, and
-publishes the idempotent no-row `CanonicalChangeSkipV1` marker. It never
-publishes a skip while the row exists or publishes an expired row. A skip after
+within its cutoff and canonical publication then failed, recovery verifies its
+digest and marks the staging record `clickhouse_committed`. Processor delivers
+the matching terminal `completed` `RawHandoffDispositionV1` to Ingest for an
+initial handoff and waits for Ingest's idempotent durable-recording
+acknowledgement before publishing the actual canonical change. A reprocessing
+candidate does not issue a second disposition; its original terminal
+disposition and reprocessing lifecycle/publication checks remain the evidence.
+If the raw-retention cutoff arrives
+after ClickHouse commits the row but before that acknowledgement, recovery marks
+the staging record retention/lifecycle-expired, removes the authoritative row,
+verifies its absence, and publishes the idempotent no-row
+`CanonicalChangeSkipV1` marker. If the disposition was durably acknowledged
+before the raw-retention cutoff and canonical publication then failed, recovery
+retains the row and publishes the actual canonical change. A later
+retention/deletion lifecycle fence does not remove a row whose claim finalized
+first; its canonical state remains subject to the owning purge or
+anonymization dependency. Canonical publication cannot precede the required
+initial-handoff acknowledgement, so it never publishes a skip while the row
+exists or publishes an expired row. A skip after
 a reconciliation attempt is valid only after the row is durably removed and
 its absence is verified. The marker carries the partition, sequence, retention
 cutoff, expiry basis, marker integrity digest, and idempotency context; Query
@@ -434,10 +517,10 @@ Storage changes use local storage transactions, transactional outboxes,
 versioned messages, idempotent retry, and reconciliation. There are no
 distributed transactions and no best-effort cross-store writes.
 
-Ingest acknowledgement means only that durable raw acceptance and durable
-handoff have succeeded. It does not mean that canonical telemetry or a Query
-projection is visible. Canonical and Query visibility are asynchronous and
-eventually consistent.
+Ingest acknowledgement means only that the ingestion contract's durable raw
+acceptance unit and recoverable handoff have succeeded. It does not mean that
+canonical telemetry or a Query projection is visible. Canonical and Query
+visibility are asynchronous and eventually consistent.
 
 The existing versioned message envelope remains authoritative for message
 identity, producer, tenant/project context, event time, causation,
@@ -644,23 +727,36 @@ execution fence or artifact invalidation, and API does not complete the
 post-commit phase or release any held revision until the required
 acknowledgements and normal hold-release command are durably accepted. Processor returns a durable
 `RawHandoffDispositionV1`
-message with a terminal
-`policy_rejected` disposition for each handoff rejected by the shortened policy;
-for an unprocessed handoff that crosses the seven-day class default without a
-shortened policy, it returns `default_expired` with
-`expiry_basis=class_default` and no retention-policy generation. If that cutoff
-arrives while Processor is unavailable, Jobs sends the versioned
-`RawRetentionExpiryV1` project-scoped sweep to Ingest. Ingest verifies the
-current cutoff, enumerates its own eligible acceptance state, durably records a
-`default_expired` fence for each handoff, retires each matching outbox entry,
-and purges the raw object and acceptance metadata without waiting for
-Processor. `RawPayloadFetchV1` and late Processor dispositions reject a handoff
-already fenced by Ingest expiry. When Ingest records that fence, it also emits
-the durable project-scoped `RawHandoffExpiryFenceV1` to Processor. Processor
-persists the highest fence for the handoff and performs an authoritative
-current-cutoff and local-fence check immediately before committing or
-publishing any canonical or derived result. A denied final check records the
-appropriate terminal disposition and cannot publish canonical changes. Jobs
+message with a terminal `policy_rejected` disposition for each unclaimed
+handoff rejected by the shortened policy, together with the owner-recorded
+expiry outcome. A lifecycle fence that cancels an unfinalized claim produces
+`lifecycle_rejected` with the matching
+`RawHandoffLifecycleFenceV1`. For an unprocessed handoff that crosses the
+seven-day class default without a shortened policy, the owner-recorded
+disposition is `default_expired` with `expiry_basis=class_default` and no
+retention-policy generation. The retention variants carry the matching
+`RawHandoffExpiryFenceV1` identity, outcome, basis, and applicable policy
+generation rather than completion-claim fields; lifecycle rejection carries
+the matching lifecycle fence and generation. If that cutoff arrives while
+Processor is unavailable, Jobs sends the versioned `RawRetentionExpiryV1`
+project-scoped sweep to Ingest. Ingest verifies the current cutoff, enumerates
+its own eligible acceptance state, and reconciles each matching owner-mediated
+completion arbitration before recording a `default_expired` fence for an
+unclaimed handoff. It retires each matching outbox entry and purges the raw
+object and acceptance metadata without waiting for Processor.
+`RawPayloadFetchV1` and late Processor arbitration requests, claims, or
+finalization requests reject a handoff already fenced by Ingest expiry or
+lifecycle state; only a matching expiry, lifecycle, or terminal disposition
+may close that fence, idempotently. When Ingest records that fence, it also
+emits the durable project-scoped `RawHandoffExpiryFenceV1` or
+`RawHandoffLifecycleFenceV1` message to Processor. Processor persists
+the highest fence for the handoff and validates the owner-recorded finalization
+or expiry/lifecycle outcome immediately before committing or publishing any
+canonical or derived result. A successful canonical result additionally
+requires Ingest's durable acknowledgement that the matching terminal
+`completed` disposition was recorded before its canonical change may publish.
+A denied final check records the appropriate terminal disposition and cannot
+publish canonical changes. Jobs
 owns a durable recurring
 baseline lifecycle-purge registration for every applicable project and data
 class, even when the project keeps the default policy. Project creation causes
@@ -769,8 +865,15 @@ schedule and dispatch it to every owner, including API. API fails closed
 until the complete active barrier exists. Jobs cancels and fences queued, retry,
 dead-letter, dispatchable, leased, and in-flight non-purge project work,
 dispatches idempotent owner-specific purge or anonymization commands, retries
-them until completion, and rejects late non-purge execution outcomes so they
-cannot recreate project-scoped execution state. Query invalidates cache entries
+them until completion, and rejects late non-purge execution outcomes that lack
+a previously finalized owner claim. A claim finalized before the active
+deletion fence remains authoritative for that already-authorized in-flight
+completion, so Jobs records it as an outstanding Processor deletion dependency
+and keeps the project purge open until the matching terminal disposition and
+resulting canonical cleanup are complete. Processor's owner-specific purge
+must be rerun after that completion if an earlier purge attempt preceded it;
+the owner cannot acknowledge deletion completion while such a dependency is
+open. Query invalidates cache entries
 immediately. Active stores, including API's project-scoped control-plane rows,
 export-hold registry entries, and raw, canonical, derived, projections,
 replay batches, export objects, and Jobs project-scoped operational state, are
@@ -820,21 +923,34 @@ an eligible raw source or a verified normalized replay representation is
 rejected rather than reprocessed from an unverified or unavailable source.
 
 A new result uses a new UUID v7 `processing_generation` and is a candidate until
-the complete requested range passes integrity validation. Processor commits each
-candidate row to canonical ClickHouse and durably publishes its canonical change
-before it can promote that row's authoritative default-generation mapping.
+the complete requested range passes integrity validation. For initial handoff
+processing, Processor commits each candidate row to canonical ClickHouse,
+obtains Ingest's durable acknowledgement for the matching terminal `completed`
+disposition, and then durably publishes its canonical change. Reprocessing a
+previously completed record from a verified normalized replay representation
+does not issue a second raw-handoff disposition: its original terminal
+disposition and verified replay source are the handoff evidence, while the
+reprocessing attempt uses its own final lifecycle-eligibility and publication
+confirmation checks. Both paths promote the authoritative default-generation
+mapping only after the complete requested range succeeds.
 Publication confirmation is the existing Processor durable canonical publication
 state and published-contiguous watermark. It does not require a successful
 Query projection acknowledgement before initial publication, but a missing
 local confirmation is reconciled through `CanonicalPublicationReconcileV1`
-before an expired intent can become a skip. Promotion also performs the
-current-cutoff and row-existence check and updates the mapping only after every
-candidate row has publication confirmation and the full range succeeds. A
-partial or failed range, an unconfirmed publication, or a failed final
-eligibility check never becomes the default and the prior default result remains
-active; recovery either completes publication and promotion or removes the
-candidate and emits the appropriate skip without leaving a mapping to an
-unavailable generation.
+before an expired intent can become a skip. Promotion performs the
+owner-mediated finalization and row-existence check, treating a matching
+`claim_finalized` result as eligible while no raw-expiry fence has won. For an
+initial handoff candidate, the matching Ingest disposition acknowledgement is
+required before canonical publication; a reprocessing candidate uses its
+original terminal handoff evidence and reprocessing lifecycle/publication
+checks instead. A provisional claim or `lifecycle_fenced` result cannot become
+authoritative. It updates the mapping only
+after every candidate row has publication confirmation and the full range
+succeeds. A partial or failed range, an unconfirmed publication, or a failed
+final eligibility or row-existence check never becomes the default and the
+prior default result remains active; recovery either completes publication and
+promotion or removes the candidate and emits the appropriate skip without
+leaving a mapping to an unavailable generation.
 Derived aggregate computation and publication use only rows selected by the
 authoritative default-generation mapping; candidate generations are excluded
 until promotion.
@@ -1288,9 +1404,14 @@ operational boundary.
 Raw and export objects are checksum-validated. Reconciliation compares
 like-for-like dimensions: raw acceptance and handoff compare logical
 `watchtower_id` counts and ordered ID digests; before Ingest retires its
-recoverable state, each successfully completed handoff is generation-aware
-reconciled to the authoritative default-generation selection or a durable
-terminal disposition; canonical histories and replay compare physical
+recoverable state, each successfully completed payload-bearing handoff is
+generation-aware reconciled to the authoritative default-generation selection
+and a matching Ingest-recorded terminal disposition with its publication
+acknowledgement; a `completed_no_op` handoff is instead reconciled by its
+matching terminal no-op disposition and no-op tombstone/reservation cleanup
+evidence, with no default-generation selection or canonical publication
+required; canonical
+histories and replay compare physical
 `(watchtower_id, processing_generation, canonical_content_digest)` counts and
 ordered content-aware digests; and Query projections and canonical exports
 compare the authoritative default-generation selection and canonical content
@@ -1398,7 +1519,7 @@ issues:
 | --- | --- |
 | #15 | [Control-plane resources, WorkOS authentication, authorization, roles, project lifecycle, credentials, non-export quotas, and detailed audit access](servers-watchtower-control-plane-contract.md) |
 | #16 | [Sentry-compatible routes, DTOs, request semantics, and protocol compatibility mappings](servers-watchtower-sentry-compatibility-contract.md) |
-| #17 | Ingestion admission, capacity behavior, and detailed durable raw-to-processing handoff |
+| #17 | [Ingestion admission, capacity behavior, and detailed durable raw-to-processing handoff](servers-watchtower-ingestion-contract.md) |
 | #18 | Normalization, privacy processing, enrichment, and processing policy |
 | #19 | Error grouping, issue aggregates, and issue lifecycle |
 | #21 | Query routes, query language, read semantics, limits, freshness, and error exploration |
@@ -1429,12 +1550,24 @@ The owning implementation contracts must make these scenarios testable:
    spellings to the exact nine-digit UTC `Z` representation before digesting.
 2. Fail S3, PostgreSQL, ClickHouse, and MSK operations before and after local
    commits; verify no false successful acceptance and idempotent recovery,
-   including Processor canonical staging before and after ClickHouse commit and
-   outbox publication, with no duplicate or conflicting sequence; verify a row
-   committed while still within its cutoff but delayed by publication is
-   reconciled and published as a row, while a cutoff reached after ClickHouse
-   commit but before publication removes the row, verifies its absence, and
-   publishes the idempotent `CanonicalChangeSkipV1` marker. An absent row alone
+   including Processor canonical staging before and after ClickHouse commit,
+   disposition recording acknowledgement, and outbox publication, with no
+   duplicate or conflicting sequence. Verify that a row committed while still
+   within its cutoff does not publish a canonical change until Ingest records
+   and acknowledges the matching terminal disposition; if that acknowledgement
+   arrives before the cutoff, delayed publication is reconciled and published
+   as a row, while a cutoff before acknowledgement removes the row, verifies
+   its absence, and publishes the idempotent skip. A winning completion claim
+   finalized while eligible is insufficient by itself; a stalled finalized
+   claim is fenced and its row is removed when the raw-retention cutoff arrives
+   before the disposition acknowledgement, while a finalized claim that
+   survives a later lifecycle fence is published after acknowledgement and
+   remains a purge dependency. Also verify that a
+   provisional claim canceled by a retention/deletion fence produces no
+   canonical row and a matching lifecycle disposition. For a row without an
+   Ingest-recorded terminal completion before the cutoff, a cutoff reached
+   after ClickHouse commit removes the row, verifies its absence, and publishes
+   the idempotent `CanonicalChangeSkipV1` marker. An absent row alone
    may produce that marker through the full canonical replay horizon, so
    a Query outage longer than the seven-day MSK window cannot leave an
    available-watermark gap blocking later changes. Restore Processor from a
@@ -1444,7 +1577,7 @@ The owning implementation contracts must make these scenarios testable:
    readiness or any new reservation, and leave Processor unready for missing,
    truncated, or conflicting baseline or per-reservation intent evidence; for
    each unresolved intent, publish its retained candidate only while it remains
-   before the cutoff, and otherwise reconcile Query's durable
+   before the cutoff and has a matching terminal outcome; otherwise reconcile Query's durable
    `CanonicalPublicationReconcileV1` outcome before readiness: a matching
    applied row or skip must terminalize the intent without a replacement skip,
    while only an explicit absent outcome plus verified row absence may publish
@@ -1467,11 +1600,23 @@ The owning implementation contracts must make these scenarios testable:
    `default_expired` disposition for an unprocessed handoff beyond the class
    default, the project-scoped Jobs-to-Ingest `RawRetentionExpiryV1` sweep
    during Processor outage, Ingest enumeration of expired state, rejection of
-   late fetches or dispositions after the Ingest expiry fence, durable
-   `RawHandoffExpiryFenceV1` delivery, and Processor's final cutoff/fence check
-   before canonical commit and publication, and
-   generation-aware reconciliation of each completed handoff to a promoted
-   canonical default or durable terminal disposition before raw retirement.
+   late fetches, arbitration requests, completion claims, or finalization
+   requests after the Ingest expiry/lifecycle fence, durable
+   `RawHandoffExpiryFenceV1` or `RawHandoffLifecycleFenceV1` delivery, matching
+   expiry/lifecycle dispositions, Processor's owner-mediated claim and
+   finalization check before canonical commit and publication, deterministic
+   claim-versus-expiry/lifecycle arbitration including the no-op variant, and
+   generation-aware reconciliation of each completed payload-bearing handoff to
+   a promoted canonical default or durable terminal disposition before raw
+   retirement; reconcile each `completed_no_op` handoff through its terminal
+   no-op disposition and cleanup evidence without requiring a canonical
+   selection;
+   create, append, bind, logically expire, restore, and clean up zero-length and
+   positive-length TUS staging in `pending`, `complete-unbound`, and `bound`
+   states, including the unbound logical-expiry sweep and bound effective
+   raw-cutoff cleanup deadline, and verify that its Ingest-owned S3/PostgreSQL
+   boundaries retain capacity through uncertainty and release it exactly once
+   after confirmed deletion.
 4. Rebuild eligible canonical and derived Query projections through an
    authorized, durably acknowledged Query-to-Processor `ProjectionRebuildV1`
    request and Processor republishing without direct Processor storage access;
@@ -1572,8 +1717,11 @@ The owning implementation contracts must make these scenarios testable:
    end-of-month clamping; current-time duration enforcement; baseline
    Jobs schedules for default lifecycles even without a shortened policy;
    recurring Jobs-scheduled, owner-run active purges at each effective cutoff
-   without a grace period; retention of minimal tombstone-keyed Jobs deletion
-   orchestration until every owner confirms purge completion;
+   without a grace period; finalized pre-fence claims remain deletion
+   dependencies until their terminal disposition and resulting canonical purge
+   complete, including an idempotent follow-up purge after an earlier attempt;
+   retention of minimal tombstone-keyed Jobs deletion orchestration until every
+   owner confirms purge completion;
    purge or irreversible anonymization of Jobs project-scoped operational state
    after the minimal tombstone-keyed deletion orchestration completes;
    backup purge or irreversible inaccessibility within 90 days of each applicable
@@ -1717,7 +1865,7 @@ The owning implementation contracts must make these scenarios testable:
    normalized or enriched processing-input replay batch before reprocessing or
    canonical publication; and successfully reprocess a record through its
    verified normalized replay representation after raw state was retired before
-   the seven-day cutoff.
+   the seven-day cutoff without requesting a second raw-handoff disposition.
 8. Attempt cross-tenant access through PostgreSQL, ClickHouse, S3, MSK,
    projections, exports, and break-glass workflows; verify denial and required
    audit evidence.

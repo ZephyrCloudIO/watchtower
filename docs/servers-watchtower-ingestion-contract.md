@@ -1,0 +1,1244 @@
+# Watchtower Ingestion Admission and Durable Handoff Contract
+
+## Scope and authority
+
+This contract is the authoritative documentation-only decision for issue #17.
+It defines v1 admission of supported Sentry-compatible error events, native
+crashes, and error attachments from public request through durable raw
+acceptance and recoverable processing handoff. It defines no handlers,
+workers, schemas, migrations, storage adapters, queues, infrastructure,
+runtime rollout, or customer-facing acceptance-status API.
+
+The completed issue #16 Sentry compatibility contract is the prerequisite for
+this admission contract; this document consumes its pinned routes, wire
+formats, limits, and response mappings without selecting a second protocol
+baseline.
+
+The following contracts remain authoritative at their boundaries:
+
+- [`Watchtower Sentry compatibility`](servers-watchtower-sentry-compatibility-contract.md)
+  owns the supported clients, public routes, wire formats, protocol limits,
+  compatibility DTOs, and external response mappings. The exact supported
+  behavior is restated here so admission cannot silently diverge from it.
+- [`Watchtower component and deployment boundary`](servers-watchtower-components-contract.md)
+  owns component ownership, dependency direction, internal boundaries, and
+  failure isolation.
+- [`Watchtower control plane and authorization`](servers-watchtower-control-plane-contract.md)
+  owns tenant/project authority, collection DSNs, authorization, project and
+  organization lifecycle, environment registration, revocation, and quota
+  policy.
+- [`Watchtower canonical telemetry and storage`](servers-watchtower-canonical-telemetry-storage-contract.md)
+  owns raw storage topology, retention and deletion fences, MSK durability,
+  replay, and restore-independent lifecycle evidence.
+- [`Watchtower server runtime`](servers-watchtower-runtime-contract.md) owns
+  the common message envelope, workload authentication, internal transport,
+  safe errors, readiness, shutdown, and coordinated compatibility.
+
+Ingest is the only writer of raw accepted records, acceptance metadata, quota
+charge state associated with an accepted unit, and the recoverable processing
+outbox. API remains authoritative for authorization, lifecycle, environment
+registration, quota policy, and revocation. Processor never reads Ingest S3
+directly and never becomes a synchronous prerequisite for public acceptance.
+
+## Compatibility baseline consumed from #16
+
+### Supported public paths and formats
+
+The following paths and methods are the complete v1 collection surface. A
+request is authenticated by a current project-scoped collection DSN and never
+by a management credential.
+
+| Path | Methods | Accepted format and admission role |
+| --- | --- | --- |
+| `/api/<project_id>/envelope/` | `POST` | `application/x-sentry-envelope`, browser `text/plain;charset=UTF-8`, or the pinned binary transport's `application/octet-stream`/absent content type; identity or gzip encoding. Carries error events, attachments, client reports, and supported native-crash event/attachment combinations. |
+| `/api/<project_id>/envelope/` | `OPTIONS` | DSN-authenticated configured project-origin CORS preflight; `204` with no persistence side effect. |
+| `/api/<project_id>/store/` | `POST` | `application/json`, identity or gzip encoding; one legacy JSON error event only. It cannot carry an arbitrary batch. |
+| `/api/<project_id>/minidump/` | `POST` | `multipart/form-data` with a boundary, identity or gzip encoding; exactly one `upload_file_minidump`, exactly one `sentry` JSON metadata part, and only the pinned Crashpad scalar annotation parts. |
+| `/api/<project_id>/upload/` | `POST` | Native TUS creation with `Tus-Resumable: 1.0.0`, integer `Upload-Length` from `0` through `20,000,000`, and the exact `sentry` attachment metadata form. Creation stores no accepted attachment bytes but reserves project-scoped TUS staging capacity. |
+| `/api/<project_id>/upload/<upload_id>` | `HEAD`, `PATCH` | Native TUS status and append path. `PATCH` uses `application/offset+octet-stream`, the expected decimal `Upload-Offset`, and identity encoding only. A completed upload remains unbound until an Envelope binds it to an accepted event. |
+| `/api/<project_id>/security-report/` | `POST` | Explicitly unsupported; `501 unsupported_capability` with no persistence side effect. Other methods follow the #16 known-route method rules. |
+
+The TUS creation metadata is exactly:
+
+```text
+Upload-Metadata: sentry <base64({"attachment_type":"event.minidump"})>
+```
+
+The TUS `Location` contains a canonical lowercase UUID v7 `upload_id` and is
+project-bound. A positive-length upload has a fixed 24-hour pending lifetime;
+an upload that reaches its declared length has a fixed 24-hour
+`complete-unbound` lifetime. Append does not extend either lifetime. A
+zero-length creation becomes `complete-unbound` immediately. No TUS creation
+or append is an accepted event, attachment, final attachment quota charge, or
+Processor handoff. Each upload nevertheless reserves one project-scoped
+`tus_staging` slot and its declared `Upload-Length` bytes at creation,
+including a slot for a zero-length upload. The reservation is keyed by the
+upload ID and covers both `pending` and `complete-unbound` states; `PATCH`
+cannot exceed it or extend it. When the caller supplies a valid `X-Request-ID`,
+creation also records an idempotency result scoped to the authenticated tenant,
+project, and exact `Upload-Length`/metadata preimage. The upload allocation,
+staging reservation, and that result commit atomically. A retry with the same
+request identity and preimage returns the original `201` and exact `Location`
+and TUS response headers without creating another upload or reservation; reuse
+of the identity with a different length or metadata returns `409 conflict`
+without mutation. The mapping remains live while the upload can be retried and
+is replaced by a non-payload creation tombstone through the retry horizon after
+physical cleanup is confirmed, so response-loss recovery cannot create a second
+staging record. An absent `X-Request-ID` uses the generated request ID for
+diagnostics only and does not provide response-loss idempotency. Binding records
+the final attachment-byte charge but retains the `tus_staging` reservation; it does not release or
+transfer staging capacity while the staging record or its bytes still exist.
+Logical expiry blocks `HEAD`, `PATCH`, and binding. Confirmed physical
+deletion, including lifecycle cleanup, releases the staging slot and bytes
+exactly once; delayed or failed cleanup therefore continues to consume the
+project staging budget. Exhausted staging capacity
+returns `429 rate_limited`; an unavailable staging-capacity projection returns
+`503 unavailable`.
+
+For `/api/<project_id>/security-report/`, `POST` returns `501
+unsupported_capability`; another non-`HEAD` method returns `405
+method_not_allowed` with `Allow: POST`; and `HEAD` returns the bodyless `501`
+status/header-only response defined by #16.
+
+The minidump multipart shape is exact: one binary `upload_file_minidump` part,
+one JSON `sentry` part, and at most one of each optional scalar annotation
+part `prod`, `ver`, `ptype`, `plat`, and `guid`; no other file or annotation
+part is admitted. Annotation parts have a `form-data` disposition with the
+part name and no filename, and exactly `text/plain; charset=utf-8` media type.
+Their bodies are strict, non-empty UTF-8 scalar strings, NFC-normalized, and
+at most 256 UTF-8 bytes. A missing or mismatched annotation media type is
+`415 unsupported_media_type`; duplicate, missing-required, filename-bearing,
+or unlisted parts are `400 invalid_request`. The `sentry` JSON part requires a
+non-null 32-character hexadecimal `event_id` and permits only bounded,
+non-null `release`, `dist`, and `platform` strings when present; explicit
+`null` for those optional members is invalid. A body-only raw minidump is not
+this route and is rejected as `415 unsupported_media_type`.
+
+An Envelope TUS reference attachment has the exact media type
+`application/vnd.sentry.attachment-ref+json`, `attachment_type`
+`event.minidump`, and a required `attachment_length` equal to both the
+completed upload byte count and its declared `Upload-Length`. Its JSON payload
+has exactly `{ "url": <Location>, "path": <safe-relative-path> }`; `url` must
+match the creation `Location` byte-for-byte and `path` is a non-empty safe
+relative path. The reference JSON length is not the attachment byte length.
+
+### Content types, encodings, and transport failures
+
+| Request family | Accepted content type | Accepted encoding |
+| --- | --- | --- |
+| Envelope | `application/x-sentry-envelope`; browser `text/plain;charset=UTF-8`; pinned binary `application/octet-stream` or absent only for the pinned binary transport | identity, gzip |
+| Legacy `store` | `application/json` | identity, gzip |
+| Minidump | `multipart/form-data` with a boundary | identity, gzip |
+| TUS `PATCH` | `application/offset+octet-stream` | identity only |
+
+Before collection authentication, Ingest validates an optional `X-Request-ID`
+header. A supplied value must be a canonical lowercase UUID v7; a malformed,
+non-canonical, or duplicate header returns `400 invalid_request` before
+authentication, lookup, idempotency evaluation, or mutation. When the header
+is absent, Ingest generates a canonical lowercase UUID v7. After this
+header-only validation, collection authentication is the first admission step:
+Ingest authenticates the current project-scoped collection DSN before
+validating the content encoding or type or decoding the body. For an
+authenticated current DSN, Ingest then resolves the tenant, project,
+organization lifecycle, and security authority before validating the
+transport. A disabled project or suspended organization returns
+`403 permission_denied`, and a deleting project returns `409 conflict`; only an
+active project and organization continue to transport validation and body
+decoding. Unsupported `Content-Encoding` is `415 unsupported_media_type`; a
+malformed gzip stream is `400 invalid_compression`; malformed multipart
+boundaries are `400 invalid_multipart`; and a mismatched or unsupported
+content type is `415 unsupported_media_type`. After authentication and
+lifecycle admission, these transport failures occur before payload
+persistence, quota reservation, or environment registration, so an invalid
+DSN retains the #16 `401 invalid_authentication` precedence even when the body
+is malformed; the request-ID validation exception retains its earlier `400`
+precedence.
+
+Envelope framing is newline-delimited JSON headers followed by item payloads.
+The envelope header is required. An item with `length` uses authoritative
+length-delimited framing: `length` is the number of framed payload bytes as
+received, before any item `content_encoding` is decoded. The adapter consumes
+exactly that encoded section before decoding it; only the permitted final
+newline may follow. Decoded bytes are then checked against the decoded item and
+aggregate limits. Without `length`, the permitted newline-delimited framing
+applies. Malformed framing, invalid lengths, trailing bytes, duplicate JSON
+members, and invalid JSON headers reject the entire request.
+
+Recognized item `content_encoding` values are only `identity` and `gzip`.
+Nested decoding is incremental and counted against decoded limits. Unknown or
+individually excluded item types do not acquire special encoding semantics;
+their unknown fields are ignored after global structural limits are checked.
+
+### Exact admission limits
+
+The smaller applicable limit always wins. Limits are checked while streaming,
+before durable acceptance, and overage is never partially accepted.
+
+| Resource | Exact v1 limit |
+| --- | ---: |
+| Decompressed Envelope or legacy event request | 50,000,000 bytes |
+| Envelope item count, including unknown and excluded items | 1,024 items |
+| Decoded JSON nesting | 16 levels |
+| One Envelope item payload | 20,000,000 bytes |
+| One JSON error event | 1,000,000 bytes |
+| One attachment or native crash item | 20,000,000 bytes |
+| Decompressed multipart request, including framing | 100,000,000 bytes |
+| Multipart part count | 1,024 parts |
+| Recursive object keys | 128 UTF-8 bytes per key |
+| `attachment_length` | 0 through 20,000,000 bytes inclusive |
+| TUS `Upload-Length` | 0 through 20,000,000 bytes inclusive |
+| General non-empty scalar after decoding and applicable NFC normalization | 256 UTF-8 bytes |
+| Message, exception values, and stacktrace text | 4,096 UTF-8 bytes |
+| Safe diagnostics, discard reasons, categories, and processing details | 1,024 UTF-8 bytes |
+| Client-report discarded-event records | 1,024 per item and 1,024 aggregate |
+| Client-report quantity | 1 through 2,147,483,647 |
+| Crashpad scalar annotation | 256 UTF-8 bytes after NFC normalization |
+
+Every JSON value, including ignored extensible values, is at nesting level 16
+or below. Recursive event objects and other schemas that explicitly declare
+these recursive cardinality bounds have at most 256 members per object and
+1,024 elements per array. Unknown extensible objects and arrays do not inherit
+those bounds; they remain subject to the global nesting and decoded-byte
+limits. Decoded bytes, decompressed nested item bytes, multipart framing, and
+rejected or duplicate parts count toward their applicable limits.
+
+### Supported and excluded items
+
+| Item | v1 behavior |
+| --- | --- |
+| `event` | Supported only with a valid 32-character hexadecimal external event ID and at least one non-empty message, non-empty exception values, non-empty stacktrace frames, or `level` `error`/`fatal`. Exactly one event item is allowed. A second event item rejects the entire Envelope. |
+| `attachment` | Supported only when associated with a supported error or native crash. An unassociated but structurally valid attachment is excluded as `unassociated_attachment`; its bytes are not retained. |
+| `client_report` | Structurally accepted as bounded client diagnostic metadata, not as an error event. It creates no error quantity charge. |
+| `profile`, `profile_chunk`, `transaction`, `span`, `session`, `replay_event`, `replay_recording`, `feedback`, `log`, `metric_buckets`, `check_in`, `user_report`, `security`, `trace`, `unreal_report`, `form_data`, `nel` | Individually excluded. |
+| Unknown and future item types | Individually excluded with bounded type, reason, and count diagnostics. |
+
+An individually excluded item's decoded payload is never persisted, placed in
+raw storage, or handed to Processor; only the bounded exclusion diagnostic may
+survive as acceptance metadata.
+
+An event item with a valid ID but no error signal is individually excluded as
+`not_error_event`. An invalid recognized field, invalid event shape, invalid
+attachment length, invalid client report, or malformed supported item rejects
+the whole request with the route-appropriate #16 error. Empty,
+unsupported-only, client-report-only, and attachment-only Envelopes that do not
+use the correlated later-attachment shape defined by #16 are valid bounded
+no-ops: they persist no customer payload bytes, but their bounded
+acceptance/no-op metadata and recoverable no-op handoff are recorded.
+
+Exclusion diagnostics contain only bounded item type, exclusion reason, count,
+tenant/project scope, request ID, and correlation ID. They never contain item
+payloads, attachment bytes, DSNs, credentials, or unrestricted user data.
+
+### Exact external response mappings
+
+Every direct compatibility error with an entity body uses exactly:
+
+```json
+{
+  "code": "invalid_request",
+  "detail": "The request is invalid.",
+  "request_id": "canonical-lowercase-uuid-v7"
+}
+```
+
+`code`, `detail`, and `request_id` are the only members. `request_id` equals
+the `X-Watchtower-Request-ID` header. `field_errors` is never emitted.
+
+The documented #16 bodyless `HEAD` cases are excluded from this JSON rule:
+failed TUS `HEAD`, an unsupported `HEAD` on a known ingestion route, `HEAD`
+on an explicitly unsupported capability, and an unknown-path `HEAD` return
+only their status, applicable route/request-ID headers, and
+`Content-Length: 0`; they emit no `Content-Type` or JSON body. A failed TUS
+`HEAD` retains `Tus-Resumable: 1.0.0`, a known-route method failure retains
+its route-specific `Allow`, and unknown paths emit no `Allow` header.
+
+| Code | HTTP | Exact meaning and admission use |
+| --- | ---: | --- |
+| `invalid_authentication` | 401 | Missing, malformed, expired, or revoked collection DSN. |
+| `permission_denied` | 403 | Valid credential but disabled/suspended project or organization, or insufficient scope. |
+| `not_found` | 404 | Unknown or inaccessible resource, upload, or route. |
+| `method_not_allowed` | 405 | Known route with an unsupported method. |
+| `invalid_request` | 400 | Invalid minidump request, field, alias, or TUS input. |
+| `precondition_failed` | 412 | Missing or unsupported `Tus-Resumable`. |
+| `unsupported_media_type` | 415 | Unsupported content type or encoding. |
+| `invalid_compression` | 400 | Malformed or undecodable gzip. |
+| `invalid_multipart` | 400 | Malformed multipart framing or boundary. |
+| `invalid_envelope` | 400 | Invalid Envelope framing, length, header, legacy event, client report, or supported item after transport decoding. |
+| `conflict` | 409 | Conflicting event content, conflicting attachment/upload binding, retired environment, deleting project, or other lifecycle conflict. |
+| `payload_too_large` | 413 | A byte, decoded-payload, item, part-count, or other cardinality limit that #16 maps to `413` is exceeded. Client-report record cardinality is excluded from this mapping. |
+| `rate_limited` | 429 | Project/organization collection quota or environment-registration capacity exhausted. |
+| `unavailable` | 503 | Stale/unavailable authorization or quota projection, storage dependency, unsafe enforcement evaluation, or exhausted service capacity. |
+| `deadline_exceeded` | 504 | A bounded synchronous admission operation exceeded its deadline without a committed outcome. |
+| `internal_error` | 500 | Internal, unknown, or data-loss failure; original cause remains internal. |
+| `unsupported_capability` | 501 | Explicitly unsupported route or capability outside an Envelope. |
+
+The exact `detail` strings are, respectively: `Authentication is required.`,
+`Permission denied.`, `The requested resource was not found.`, `The requested
+method is not allowed.`, `The request is invalid.`, `The request precondition
+failed.`, `The media type is not supported.`, `The request compression is
+invalid.`, `The multipart request is invalid.`, `The Envelope is invalid.`,
+`The request conflicts with the current resource state.`, `The request payload
+is too large.`, `Rate limit exceeded.`, `The service is temporarily
+unavailable.`, `The request deadline was exceeded.`, `Internal server error.`,
+and `The requested capability is not supported.`
+
+Client-report `discarded_events` cardinality is an explicit exception to the
+general payload-cardinality mapping: more than 1,024 records in one item or
+more than 1,024 records across an Envelope returns `400 invalid_envelope`
+before acceptance, as required by #16. It never returns
+`413 payload_too_large`.
+
+Durable acceptance and a matching duplicate return the #16 success response:
+HTTP `200`, zero-length body, `X-Request-ID`, and `X-Watchtower-Request-ID`.
+A mixed request returns the same `200` response only when no payload-bearing
+unit is rejected and at least one unit is accepted. A standalone no-op that
+passes its `no_op_admission` reservation and other dependency checks also
+returns `200` with the same headers.
+Envelope `OPTIONS` returns `204`. TUS creation returns `201`; an exact TUS
+creation retry returns the original `201` and `Location` without a new staging
+reservation; successful TUS
+`HEAD` returns `200`; successful TUS `PATCH` returns `204`; each retains the
+exact #16 TUS headers. A failed TUS `HEAD` is bodyless, and a failed TUS
+`PATCH` uses the standard JSON error and never appends bytes.
+
+`429`, `503`, and `504` are retryable according to `Retry-After` and bounded
+backoff. `429` communicates a quota or registration-window retry; `503`
+communicates temporary service, storage, or safe-enforcement unavailability;
+`504` communicates a deadline with an unknown synchronous outcome. Invalid,
+unsupported, unauthorized, lifecycle-conflicting, and content-conflicting
+requests are not retried with changed content.
+
+If #16's general `408`, `500`, or `502` retryable response is surfaced, its
+retry rules remain in force; Ingest does not automatically retry a
+non-idempotent request after an unknown outcome.
+
+Ingestion also retains the exact #16 rate-limit header rules. When quota is
+safely evaluated, `X-Sentry-Rate-Limit-Limit`,
+`X-Sentry-Rate-Limit-Remaining`, and `X-Sentry-Rate-Limit-Reset` describe the
+one selected bucket even when remaining capacity is nonzero;
+`X-Sentry-Rate-Limits` is omitted when no bucket is active. A `429` includes
+`Retry-After` and the active-limit entry. A `503` caused by unavailable quota
+evaluation includes `Retry-After` but omits quota headers; a `503` caused by
+another unavailable dependency emits no quota headers unless quota evaluation
+actually supplied them. A known reset or dependency deadline is serialized as
+the ceiling of its remaining whole seconds, and the #16 fallback is exactly
+`Retry-After: 5` when no deadline can be evaluated.
+
+When the project-scoped `no_op_admission` count or rate bucket is exhausted,
+the active `X-Sentry-Rate-Limits` entry is exactly
+`<seconds>:default:project:no_op_admission`, with no namespace component. The
+singleton rate-limit headers and `Retry-After` describe that same project
+bucket. This class never uses `all`, `error`, or `attachment`, so exhausting
+no-op or client-report capacity does not suppress unrelated error or
+attachment traffic.
+
+When either project-scoped TUS staging budget is exhausted, the active
+`X-Sentry-Rate-Limits` entry is one of these exact namespace-bearing forms:
+
+- byte budget: `<seconds>:default:project:tus_staging:bytes`;
+- upload-count budget: `<seconds>:default:project:tus_staging:uploads`.
+
+Both entries use category `default`, scope `project`, reason `tus_staging`,
+and no `all`, `error`, or `attachment` category. The `bytes` and `uploads`
+namespaces distinguish the two independent staging dimensions. The header
+lists every currently exhausted staging dimension, sorted by the general
+canonical-entry ordering. The singleton rate-limit headers and `Retry-After`
+use the one selected bucket from the existing restrictive ordering, with the
+canonical entry as the final tie-breaker. These entries apply to TUS creation
+only; they do not suppress ordinary error or attachment admission.
+
+When a new environment would exceed the project-scoped active-registration
+capacity, the active `X-Sentry-Rate-Limits` entry is exactly
+`<seconds>:default:project:environment_registration`, with no namespace
+component. Category is `default`, scope is `project`, and reason is
+`environment_registration`; the entry applies only to first registration or
+explicit reactivation of a name and never suppresses collection for an
+already-active environment. The singleton rate-limit headers and
+`Retry-After` use this same bucket. `<seconds>` is the ceiling until the next
+known registration slot release; when no release deadline can be evaluated,
+the #16 fallback is `5` seconds.
+
+When the final project-scoped attachment-byte budget is exhausted, the active
+entry is exactly `<seconds>:default:project:attachment_bytes`, also with no
+namespace component. The singleton headers and `Retry-After` use that bucket,
+where `<seconds>` is the earliest charged-byte expiry from the rolling window.
+If that deadline cannot be evaluated safely, quota evaluation returns `503`
+with the existing fallback behavior.
+
+## Authentication, lifecycle, and environment admission
+
+Collection accepts only a current project-scoped collection DSN in the exact
+#16 `X-Sentry-Auth`, DSN query, or DSN URL forms. The forms must agree on the
+public key and route project. A DSN grants collection only; it grants no
+management, query, artifact, release, issue, or event-read authority.
+Management tokens cannot acquire collection authority implicitly.
+
+DSN rotation immediately revokes the old credential by default. Explicit
+overlap is at most 24 hours, emergency revocation has no grace period, and
+overlapping credentials count toward the project limit. Project deletion
+revokes every DSN before deleted-resource access is exposed; a pre-deletion DSN
+is invalid authentication and cannot select a deleted project.
+
+Ingest performs the first authorization check and the final acceptance commit
+rechecks tenant, project, DSN scope, current authorization revision, project
+state, organization suspension, retention/deletion fences, and the local
+security projection generation. A security projection must have completed its
+initial snapshot and be no older than 60 seconds. An unavailable or stale
+projection fails closed as `503 unavailable`; an immediate API-owned
+`AuthorizationRevocationFenceV1` is enforced independently and cannot be
+masked by the freshness window. A revocation fence that invalidates the DSN
+returns `401 invalid_authentication`.
+
+| Current state | Collection result |
+| --- | --- |
+| Active project and organization | Continue to transport and unit validation. |
+| Disabled project or suspended organization | `403 permission_denied`, no payload or quota side effect. |
+| Deleting project | `409 conflict` while the current authenticated lifecycle fence applies; deleted/pre-deletion credentials are `401 invalid_authentication` as defined above. |
+| Deleted project | `401 invalid_authentication` for its former DSN before project lookup. |
+| Missing, stale, or unavailable security authority | `503 unavailable`, no acceptance side effect. |
+
+Environment names are data, not authorization boundaries. The first valid
+collection for an unregistered name creates or resumes an idempotent API-owned
+`pending` registration tied to the admission group's correlation and
+idempotency identity. A pending registration reserves one slot against the
+1,000 active-environment limit but is not active, listable, or usable by other
+collections. It becomes `active` only when the matching durable acceptance
+commits. A failed admission group rolls the pending registration back
+idempotently; an uncertain post-acceptance activation remains retryable through
+the durable acceptance handoff and cannot roll back the committed acceptance.
+Concurrent first registration, retirement, reactivation, and quota state
+serialize on `(tenant_id, project_id, environment_name,
+registration_generation)`. Capacity exhaustion is `429 rate_limited` with the
+canonical environment-registration entry above and does not affect existing
+environments.
+
+Retirement creates a durable name tombstone and an Ingest admission fence
+before releasing the slot. It is idempotent, preserves historical data, and
+does not automatically re-register the name. A new event for a retired name
+is `409 conflict`. Explicit Owner/Admin reactivation, or an explicitly scoped
+authorized personal token, must reserve capacity and advance the generation
+before collection resumes. Stale registration changes, backup replay, and
+late callbacks cannot reopen a retired name. Final acceptance rechecks the
+environment generation; a retirement that wins the race rejects the new unit
+and removes any uncommitted staging.
+
+## Acceptance units, identity, and comparison
+
+An acceptance unit is the smallest atomic raw-acceptance transaction:
+
+1. An initial error unit is one supported `event` or legacy error event plus
+   its associated initial attachments.
+2. A native-crash unit is one supported multipart minidump, or one supported
+   error event plus its `event.minidump` attachment.
+3. A later-attachment unit is one new attachment associated with an already
+   accepted parent.
+4. Each `client_report` item is one bounded client-report unit, and a no-op
+   unit contains diagnostic metadata only; neither creates an error event or
+   attachment payload.
+
+An invalid unit never accepts one of its constituent items. Across separate
+initial-event, native-crash, TUS-binding, later-attachment, and bounded no-op
+units, one valid unit's duplicate, conflict, exclusion, or temporary outcome
+does not roll back another valid unit. Within one #16 Envelope, the
+one-event-per-Envelope and invalid-supported-item rules remain request-atomic:
+a second event item or malformed supported item rejects the whole Envelope
+before any unit is selected. There is no server-side sampling. Valid traffic
+within the stated limits is admitted; excess or unsupported traffic is
+explicitly rejected or excluded.
+
+When an Envelope contains an event-bearing unit or a correlated later-attachment
+unit, that primary payload-bearing unit and any accompanying client-report or
+no-op units form one request-atomic admission group after structural validation.
+All primary and auxiliary reservations are evaluated and held before any new
+acceptance, charge, outbox, handoff, or pending-environment activation commit.
+A conflict, quota failure, temporary admission failure, or other rejection of
+either unit rolls back every new reservation, staged payload, acceptance,
+handoff, and pending registration in the group. A new primary therefore cannot
+return `200` when an auxiliary `no_op_admission` or other reservation fails: an
+auxiliary quota failure returns its `429` response and active bucket, while an
+unavailable auxiliary dependency returns `503`.
+When the primary is an already durable matching duplicate, that existing result
+cannot be rolled back; a failed auxiliary still creates no new auxiliary state
+and the request returns the auxiliary failure. Successful auxiliary units may
+commit with a new primary or alongside an already matching duplicate.
+
+Repository-owned identities are canonical lowercase UUID v7 strings and
+PostgreSQL `uuid` values. Ingest generates non-reused IDs for the accepted raw
+unit, parent event, attachment, upload, and internal operation as applicable.
+An SDK event ID is never a Watchtower primary key. Supported SDK event IDs are
+exactly 32 hexadecimal characters, normalized to lowercase, and are external
+identifiers scoped to tenant, project, and source protocol. The #16
+cross-transport compatibility record remains project/tenant scoped across
+Envelope, `store`, minidump, and TUS-bound attachment transports. For #16 v1,
+their source-protocol namespace is the single bounded value `sentry`; route,
+transport, and format version remain separate metadata. A future protocol gets
+a distinct source-protocol namespace and cannot collide with `sentry`. The
+source protocol is retained as bounded identity metadata and never creates
+global uniqueness.
+
+The raw admission identity is the tuple
+`(tenant_id, project_id, source_protocol, external_event_id)` together with
+the admission generation and its effective raw-retention cutoff. The first
+accepted event ID installs a minimal raw deduplication record through the
+earlier of the seven-day default cutoff and the active project's raw-retention
+cutoff, measured from its first `accepted_at`. Retries do not extend that
+period. A matching event ID and matching content digest reuses the original
+acceptance only when an initial error unit also has the same initial attachment
+identity multiset, including occurrence multiplicity; a different content
+digest or attachment identity multiset is `409 conflict`.
+The public external event ID is also an alias fence: the compatibility record
+continues to own that alias while its canonical event remains queryable, for
+90 days by default or the shorter effective query-retention cutoff. A matching
+retry while that alias is retained resolves to the existing compatibility
+record; conflicting content or an attempted new generation returns `409
+conflict`. The compatibility projection cannot replace the alias until the
+older canonical event leaves query visibility. The effective raw fence and
+this query-retention alias fence are independent. Expiry of both fences does
+not permit reuse: the scoped external event ID remains permanently reserved by
+an Ingest-owned non-payload fence, so a later public acceptance generation
+returns `409 conflict` rather than reusing the ID.
+
+When the raw handoff completes, raw objects, acceptance metadata, outbox state,
+and payload references may retire according to the storage contract, but an
+Ingest-owned non-payload admission tombstone remains through the effective
+raw-retention cutoff. It stores the scoped event identity, admission
+generation, content digest, original acceptance result, and applicable cutoff.
+Separately, the scoped external event ID has a permanent non-payload
+non-reuse fence that retains only its identity and first admission generation;
+it stores no event bytes, object key, payload digest, or storage reference. A
+payload-bearing request that reaches this fence after the query-retention alias
+expires returns `409 conflict` without creating a new generation.
+Ordinary parent-binding and attachment identity state remains alongside it
+until the same parent cutoff. For a bound TUS attachment, the minimal
+non-payload binding evidence—scoped parent/event identity, upload ID, the
+immutable creation `Location`, `attachment_identity_digest`, semantic
+`payload_digest`, attachment digest and length, and original acceptance—remains
+through the effective query-retention alias cutoff while the canonical event is
+queryable. The retained `Location` is the exact bounded absolute HTTP(S) value
+issued at creation; a retry compares the submitted `url` byte-for-byte with
+that value before accepting the retained upload identity. Ingest never
+reconstructs it from the current public origin or base path, so a configuration
+change or restore cannot turn another textual URL for the same upload ID into
+an exact retry. This evidence is sufficient to resolve an exact retry or a
+binding conflict after the raw object has retired; alias-horizon cleanup
+removes the retained `Location` with the rest of the binding evidence. It
+never retains upload bytes, a usable object key or storage reference,
+credentials, or unrestricted payload.
+Deletion and lifecycle fences supersede all such state and cannot be reopened
+by retry or restore. A supported protocol that permits a missing event ID
+creates a new identity for every submission; later attachment association then
+requires that protocol's supported correlation identifier. Current #16 v1
+supported error and minidump paths require an event ID.
+
+For a no-op or client-report unit, the payload-free acceptance record or retry
+tombstone retains the semantic `payload_digest` needed for the supplied
+`X-Request-ID` retry identity while omitting the raw-object key, digest, size,
+and reference.
+
+For raw admission comparison, Ingest computes an
+`admission_content_digest` after complete structural validation. For Envelope
+and legacy `store` event units, it is the lowercase hexadecimal SHA-256 of the
+decompressed original supported event bytes; authentication, transport
+compression, Envelope framing, and request IDs are excluded, but whitespace,
+member ordering, and other byte changes remain different content. For a
+multipart minidump, it is exactly the #16 `minidump_digest`: lowercase
+hexadecimal SHA-256 over the UTF-8 bytes of the RFC 8785 canonical-JSON
+encoding of this object:
+
+```text
+{
+  "schema": "watchtower.sentry.minidump.v1",
+  "minidump_sha256": lowercase_hex_sha256(decompressed_upload_file_minidump_bytes),
+  "annotations": sorted_allowed_crashpad_scalar_annotation_map,
+  "sentry": {
+    "event_id": normalized_lowercase_event_id,
+    "release": optional_bounded_string_if_present,
+    "dist": optional_bounded_string_if_present,
+    "platform": optional_bounded_string_if_present
+  }
+}
+```
+
+The minidump preimage excludes multipart boundaries, part ordering, transport
+compression, authentication, DSNs, and request IDs, while changes to the
+minidump bytes, normalized annotations, or Sentry metadata produce a different
+digest and therefore `409 conflict` under the active fence. Attachment content
+is compared through its own identity, not folded into an ordinary event-body
+identity. The #16 `payload_digest` remains the semantic RFC 8785 digest for
+compatibility and downstream canonical processing; it does not widen the
+effective raw-admission fence or turn byte-different event retries into
+duplicates.
+
+For an initial error unit, the event ID and event-byte
+`admission_content_digest` are compared together with the canonical sorted
+multiset of initial attachment identities. Each multiset member uses the
+attachment identity fields `(filename, content_type, attachment_type,
+sha256(content_bytes))` defined below, with the candidate event as the parent;
+an empty multiset is also part of the comparison. The attachment multiset is
+not folded into the ordinary event-byte digest, but a multiset mismatch,
+including a multiplicity change, is still a conflicting initial unit and
+cannot be silently dropped or charged as a separate unseen attachment.
+
+An attachment identity is `(parent_acceptance_id, filename, content_type,
+attachment_type, sha256(content_bytes))`, using the decoded ordinary bytes or
+completed TUS bytes. The `filename` component uses only the accepted
+`filename` value; when absent, it is omitted from the canonical identity
+representation, never substituted from an unknown `name` member or encoded as
+`null`, an empty string, or a default value. An equal identity on a retry of
+the same accepted unit is an idempotent duplicate and adds no new object or
+charge. Duplicate occurrences within one initial unit remain separate
+multiset members and are not coalesced. Equal filename and type with a
+different content hash is a distinct immutable attachment, subject to parent
+and quota rules. Attachment length is checked against decoded or dereferenced
+bytes, never against compressed bytes or the TUS reference JSON.
+
+For retained TUS binding evidence, `attachment_identity_digest` is the
+lowercase SHA-256 of the UTF-8 RFC 8785 canonical encoding of this exact JSON
+preimage:
+
+```text
+{
+  "schema": "watchtower.sentry.attachment-identity.v1",
+  "parent_acceptance_id": canonical_lowercase_uuid_v7,
+  "content_type": accepted_string_or_null,
+  "attachment_type": accepted_string_or_null,
+  "sha256": lowercase_hex_sha256(decoded_or_completed_bytes)
+}
+```
+
+When an accepted `filename` is present, the preimage also includes
+`"filename": "<accepted-filename>"`; when it is absent, the `filename` member
+is omitted entirely. It is never encoded as `null`, an empty string, or a
+default value. RFC 8785 orders the complete object before hashing. The digest
+is retained independently of the aggregate `payload_digest`; the TUS
+attachment identity also retains its validated byte length for binding
+comparison.
+
+Initial attachments are committed atomically with their parent error unit.
+The TUS upload is event-unbound until the subsequent Envelope binding. At
+binding, the DSN must authorize the same tenant and project, the parent event
+must be the eligible current parent, and the upload must be the matching
+project-bound upload. An exact retry of an existing binding reuses it; a
+different upload or digest for the same binding identity is `409 conflict`.
+
+Later attachments use the exact #16 correlation shape: an Envelope header with
+a normalized `event_id`, exactly one `attachment` item, zero or more
+`client_report` items, no `event` item, and no other supported item. The item
+may contain ordinary decoded bytes or the supported TUS reference. This unit
+requires a current collection DSN. After authentication and lifecycle/deletion
+fence checks, a TUS reference first resolves retained binding evidence. A
+matching scoped parent/event identity, upload ID, `attachment_identity_digest`,
+attachment digest, and length returns the original acceptance as an exact
+retry, even after the parent's raw cutoff while its query-retention alias is
+still live. A mismatch in that retained binding identity returns `409 conflict`.
+Only when no retained binding matches does a new later-attachment admission
+require an existing authorized parent acceptance within its effective
+raw-retention cutoff. This retry exception never creates a new binding or
+bypasses lifecycle, deletion, tenant, or project fences. Auxiliary client
+reports use the request-atomic reservation rules above. An already matching
+primary TUS binding remains unchanged when an auxiliary is replayed or fails,
+but a failed auxiliary creates no new report state and returns its failure. The
+aggregate `payload_digest` is not used to turn such a primary duplicate into a
+conflict.
+
+The unit may arrive before the parent has completed processing, because parent
+processing order is asynchronous, but it may not create a new binding before
+the parent acceptance exists. A missing or inaccessible scoped parent returns
+`404 not_found` with no attachment acceptance side effect. A known parent that
+is deleted, expired, fenced, or outside its effective cutoff returns `409
+conflict` for a new admission. A later attachment never extends the parent or
+its deduplication window; its raw cutoff is the earlier of its own applicable
+raw-retention cutoff and the parent's remaining raw-retention cutoff. Parent
+linkage is resolved by the eligible scoped parent acceptance, never by an
+unscoped event ID or stale historical record.
+
+## Durable acceptance and handoff state machine
+
+The request-to-handoff states are:
+
+| State | Required invariant | Public result |
+| --- | --- | --- |
+| Received/authenticating | Route, method, DSN source, tenant, project, lifecycle, and security authority are bounded and checked. | #16 authentication/lifecycle mapping. |
+| Transport decoded | Content type, encoding, framing, decoded bytes, duration, concurrency, and memory bounds hold. | `400`/`413`/`415`/`invalid_compression`/`invalid_multipart`/`504` as applicable. |
+| Unit validated | Supported event, crash, attachment, or no-op shape is valid; unsupported items have no allocated payload retention. | `400 invalid_envelope` or `400 invalid_request` for invalid units; valid exclusions remain eligible for bounded no-op success. |
+| Identity checked | Deduplication, event content, parent, upload, environment, and lifecycle generations are checked. | `200` duplicate, `404 not_found` for a missing or inaccessible resource, `409 conflict` for a known fenced or lifecycle-conflicting state, or continued admission. |
+| Quota reserved | API-owned policy and Ingest reservation state agree for the unit, including no-op/client-report capacity where applicable; reservation is scoped and idempotent. | `429 rate_limited`, `503 unavailable`, or continued admission. |
+| Raw staged and verified | For a payload-bearing unit, the immutable S3 object is complete and its SHA-256 and exact byte size match the accepted content. A valid no-op or client-report unit allocates no raw object and instead carries only bounded metadata. | No payload-bearing success is reported before verification. Failed or uncertain attempts are cleaned or reconciled. |
+| Acceptance committed | For a payload-bearing unit, PostgreSQL acceptance metadata, final quota charge state, dedup/attachment identity, and transactional outbox commit together. For a no-op or client-report unit, bounded acceptance metadata, its no-op admission reservation/charge state, and a recoverable no-op handoff commit without a raw object. | `200` with empty body and request IDs. |
+| Handoff pending/published | Outbox publication to MSK is retryable and carries only bounded protocol-neutral metadata or an owner-issued raw reference. | Public success remains valid; no synchronous Processor visibility is claimed. |
+| Processor dispositioned | Processor has durably completed a canonical result or payload-free no-op, or terminally rejected the handoff; Ingest has a matching `claim_finalized` outcome plus terminal disposition, or has installed the applicable expiry/lifecycle fence. | No later public response is generated; raw retirement and no-op reservation cleanup follow the terminal disposition/fence contract. |
+| Expired/fenced/quarantined | Retention, deletion, or permanent-failure fence prevents stale fetch, completion claim, disposition, replay, and resurrection. | New requests map to the appropriate #16 `401`, `403`, `409`, or `503`; no payload revival. |
+
+For a payload-bearing unit, public success means only that the immutable raw
+object, verified digest and size, acceptance metadata, final reservation/charge
+state, and recoverable outbox are committed. For a valid no-op or client-report
+unit, public success means that its bounded acceptance metadata, committed
+`no_op_admission` reservation/charge state, and recoverable no-op handoff are
+committed; it has no raw object or raw-object key, digest, or size, and no
+payload reference; its semantic `payload_digest` remains available for the
+no-op/client-report retry identity. A matching `completed_no_op` disposition
+records terminal completion and retires the recoverable no-op handoff while
+retaining the bounded acceptance/retry tombstone; it creates no canonical
+generation or result. It does not release the live no-op admission reservation.
+The reservation remains held until the tombstone expires and confirmed
+physical cleanup releases it exactly once.
+Neither form of success
+means MSK publication, Processor completion, normalization, grouping,
+symbolication, canonical storage, or Query visibility.
+
+Payload-bearing raw objects use the canonical storage path:
+
+```text
+environment/component/tenant/project/accepted-date/<watchtower-uuid-v7>
+```
+
+Each payload-bearing object is a deterministic `RawUnitContainerV1`, not the
+original request. Its bytes consist of the ASCII magic
+`WATCHTOWER-RAW-UNIT` followed by one NUL byte, one-byte version `1`, a
+four-byte big-endian manifest length, an RFC 8785 canonical-JSON manifest, and,
+for each manifest item in order, a four-byte big-endian section length followed
+by exactly that many payload bytes. The manifest has schema
+`watchtower.raw-unit.v1` and one descriptor per retained payload:
+
+```json
+{
+  "schema": "watchtower.raw-unit.v1",
+  "items": [
+    {
+      "kind": "event",
+      "content_type": "application/json",
+      "length": 123,
+      "sha256": "lowercase-hex-sha256-of-this-payload"
+    },
+    {
+      "kind": "attachment",
+      "content_type": "application/octet-stream",
+      "filename": "example.log",
+      "attachment_type": "event.attachment",
+      "length": 456,
+      "sha256": "lowercase-hex-sha256-of-this-payload"
+    },
+    {
+      "kind": "minidump",
+      "content_type": "application/octet-stream",
+      "length": 789,
+      "sha256": "lowercase-hex-sha256-of-this-payload",
+      "metadata": {
+        "schema": "watchtower.sentry.minidump.v1",
+        "minidump_sha256": "lowercase-hex-sha256-of-this-payload",
+        "annotations": {
+          "prod": "optional-normalized-value"
+        },
+        "sentry": {
+          "event_id": "normalized-lowercase-event-id",
+          "release": "optional-bounded-string-if-present",
+          "dist": "optional-bounded-string-if-present",
+          "platform": "optional-bounded-string-if-present"
+        }
+      }
+    }
+  ]
+}
+```
+
+The event section contains the RFC 8785 canonical-JSON bytes for the retained,
+normalized event object after the adapter boundary removes unknown event
+members; it never contains the original decompressed event bytes. Within an
+ordinary attachment descriptor, `filename`, `content_type`, and
+`attachment_type` are serialized only when present in the accepted metadata.
+An absent field is omitted entirely, never encoded as `null`, an empty string,
+or a default value. Present fields and all retained descriptors use their
+accepted values in the canonical manifest. A TUS reference is the exception:
+because its section contains dereferenced binary upload bytes, its descriptor
+uses the effective payload type `application/octet-stream` and `kind: minidump`
+for v1 `event.minidump` uploads; the accepted
+`application/vnd.sentry.attachment-ref+json` request type is not presented as
+the section's binary media type. Each attachment section contains the
+validated decoded or dereferenced attachment bytes, and a minidump section
+contains the validated decompressed `upload_file_minidump` bytes. A minidump
+descriptor's `metadata` is the exact
+normalized `watchtower.sentry.minidump.v1` digest object, including the Sentry
+event context and Crashpad annotation map, so all validated multipart inputs
+needed by Processor are retained in the raw object rather than only in
+acceptance metadata. Multipart boundaries, part ordering, transport
+compression, DSNs, and request IDs are not retained. The event descriptor
+precedes attachment and minidump descriptors, which are sorted by canonical
+descriptor bytes; duplicate attachment identities are retained as separate
+sorted multiset entries, with one descriptor and section per occurrence.
+
+For a TUS-backed minidump, the same metadata schema uses the exact binding-time
+preimage below because TUS creation is event-unbound and supplies no multipart
+`sentry` part or Crashpad annotations:
+
+```json
+{
+  "schema": "watchtower.sentry.minidump.v1",
+  "minidump_sha256": "lowercase_hex_sha256(completed_tus_upload_bytes)",
+  "annotations": {},
+  "sentry": {
+    "event_id": "normalized_lowercase_binding_event_id"
+  }
+}
+```
+
+The TUS `minidump_sha256` covers the completed identity-encoded upload bytes.
+The binding Envelope supplies `event_id`; `release`, `dist`, and `platform`
+are omitted because the TUS workflow supplies none, and no multipart or
+Crashpad values may be invented. The TUS metadata object is RFC 8785
+canonicalized as part of the `RawUnitContainerV1` manifest and therefore
+participates in the container and object digests. The multipart minidump
+preimage remains unchanged and may retain its supplied annotations and
+optional Sentry fields.
+
+Excluded item payloads and client-report-only metadata are never placed in the
+container. The object digest is the lowercase SHA-256 of the
+complete container bytes, including framing, manifest, metadata, and all
+sections, and its size is the complete byte length. Per-item digests cover only
+their respective payload sections. `admission_content_digest` and the #16
+semantic `payload_digest` remain separate identities. `RawPayloadReferenceV1`
+identifies this schema version so Processor can verify and decode it across the
+supported handoff compatibility window.
+
+Acceptance metadata for payload-bearing units records the object key, digest,
+size, container schema, `accepted_at`, tenant, project, raw-unit `watchtower_id`,
+parent linkage where applicable, source protocol/format version, dedup
+generation, retention cutoff, quota reservation/charge identity, and outbox
+state. No-op and client-report records omit the payload object key,
+raw-object digest, size, and reference, but retain the semantic
+`payload_digest` alongside their bounded diagnostics, no-op admission
+reservation/charge state, and handoff state. No incomplete object or
+unverified raw-object digest is a payload-bearing accepted record.
+
+The versioned raw handoff family includes protocol-neutral initial-unit and
+later-attachment variants. Payload-bearing variants carry project scope,
+tenant UUID, raw-unit UUID, parent UUID when applicable, accepted time, source
+protocol and format version, content/attachment digests, retention and policy
+generations, correlation/idempotency context, and an opaque owner-issued
+`RawPayloadReferenceV1` for the `RawUnitContainerV1` object. A no-op handoff
+carries bounded disposition metadata and no payload reference; its successful
+`RawHandoffCompletionClaimV1` `no_op` variant carries the no-op retry identity
+and semantic `payload_digest` but no `processing_generation`, canonical digest,
+or canonical result. Its terminal `completed_no_op` disposition is accepted
+only when it matches that owner-recorded `claim_finalized` outcome. Messages contain no Sentry DTO,
+DSN, credential, private key, unrestricted payload, or usable S3 grant.
+
+MSK uses the canonical storage settings: replication factor `3`,
+`min.insync.replicas=2`, producer `acks=all`, and seven-day log retention.
+Delivery is at least once; consumers are idempotent and no global ordering is
+assumed. Processor retrieves bytes only through authenticated bounded
+`RawPayloadFetchV1` requests. Ingest retires raw state only after it durably
+records a matching terminal `RawHandoffDispositionV1` or a matching
+`RawHandoffExpiryFenceV1` or `RawHandoffLifecycleFenceV1` outcome. A
+provisional or finalized completion claim is not itself a retirement outcome; a
+provisional claim remains recoverable until the owner-mediated finalization
+either finalizes it for completion or cancels it under a lifecycle fence.
+Redelivered identical dispositions, claims, and finalization outcomes are
+idempotent. A conflicting disposition, claim, generation, digest, lifecycle
+fence, or raw-unit identity is an integrity failure: raw state is retained, no
+retirement occurs, and the condition pages immediately.
+
+## Quotas, capacity, and final fences
+
+API owns configured quota policy and generations. Ingest consumes the
+project-scoped policy through the existing authenticated versioned internal
+boundary and owns the acceptance-side reservation/charge state. A reservation
+is keyed by tenant, project, quota class, raw-unit identity, and content
+identity. It is not reusable across projects or units.
+
+The final attachment-byte quota is a project-scoped `attachment_bytes` bucket
+with an initial capacity of exactly `1,073,741,824` bytes (1 GiB) in each
+rolling 24-hour window. Ordinary decoded attachment bytes and completed TUS
+bytes consume the same bucket at final durable attachment acceptance; TUS
+creation and append consume only `tus_staging`. Ingest reserves the measured
+attachment bytes before acceptance, commits the charge with acceptance, and
+releases an uncertain reservation only through idempotent reconciliation.
+Matching durable duplicates consume no additional bytes; rejection,
+processing failure, and retention expiry do not refund an accepted charge.
+Bytes leave the rolling bucket at their recorded acceptance time plus 24 hours.
+
+In addition to final accepted-unit charges, the project policy includes a
+project-scoped TUS staging byte budget and upload-count budget with a policy
+generation. Ingest owns an idempotent `tus_staging` reservation keyed by
+tenant, project, upload ID, and policy generation, plus a creation-idempotency
+record keyed by tenant, project, and caller-supplied `X-Request-ID`. Creation
+reserves one slot and the declared upload bytes before any staging write and
+atomically binds that result to the generated upload ID; append uses only that
+reservation. Binding creates the final attachment reservation while retaining
+the `tus_staging` reservation. Logical expiry, cancellation, and lifecycle
+fencing stop access but retain the staging reservation until the bytes and
+staging record are physically deleted; deletion-confirmation reconciliation
+then releases the staging reservation exactly once.
+Staging exhaustion returns `429 rate_limited`; an unavailable or stale staging
+policy returns `503 unavailable`. These reservations are separate from error
+quantity and final attachment-byte charges.
+
+When a TUS upload binds, its staging record enters `bound` and records the
+attachment's effective raw-retention cutoff: the earlier of its own applicable
+raw cutoff and the parent attachment's remaining cutoff. Jobs includes bound
+staging in the cutoff cleanup sweep. Ingest must physically delete the bound
+staging bytes and record or fence that deletion no later than the cutoff;
+uncertain or failed deletion remains reconciliable and continues to consume
+the reservation. The `tus_staging` slot and bytes are released exactly once
+only after confirmed physical deletion.
+
+At each 24-hour logical expiry, Jobs must schedule a project-scoped staging
+expiry sweep for `pending` and `complete-unbound` records, including
+zero-length uploads. Ingest idempotently enumerates the expired unbound state,
+fences `HEAD`, `PATCH`, and binding, physically deletes its staging bytes and
+record, and records deletion or a retryable deletion fence. Uncertain or failed
+cleanup retains the reservation until physical deletion is confirmed; the
+staging slot and bytes are released exactly once after confirmation. This sweep
+is mandatory and separate from bound raw-retention cleanup, including while
+Processor is unavailable and during restore reconciliation.
+
+The project policy also includes a project-scoped `no_op_admission` count
+budget, rate budget, and rate window with a policy generation. The class applies
+to every durably accepted empty, unsupported-only, client-report-only, or
+uncorrelated attachment-only unit. Ingest reserves one count and consumes the
+configured rate capacity after duplicate resolution and before acceptance,
+keyed by tenant, project, no-op/client-report retry identity, and policy
+generation. A matching durable duplicate reuses its reservation and consumes
+neither another count nor another rate unit. For an event-bearing or correlated
+later-attachment request, auxiliary no-op or client-report reservations commit
+or roll back atomically with the primary payload-bearing result.
+
+The count reservation remains held while the acceptance metadata, no-op
+handoff/outbox, or retry tombstone remains live. Terminal handoff plus expiry
+and confirmed physical cleanup release it exactly once; delayed or failed
+cleanup continues to consume the project count budget. Rate capacity expires
+at the configured window and is reconciled by the same reservation identity.
+
+For a client report accompanying an event-bearing or correlated later-attachment
+unit, the base retry identity is
+`(tenant_id, project_id, client_request_id, primary_unit_identity)` when the
+caller supplied a valid canonical `X-Request-ID`. `primary_unit_identity` is
+the existing stable primary idempotency identity: the scoped raw-admission
+identity, admission generation, content identity, and initial-attachment
+identity multiset for an initial event, or the scoped parent/event and
+attachment-binding identity, upload ID, attachment digest, and length for a
+later attachment. It is never the semantic `payload_digest` alone. Each
+client-report unit then adds `unit_kind=client_report`, the canonical
+`client_report_item_digest`, and its zero-based occurrence among equal item
+digests in canonical item order. This keeps multiple and duplicate items
+distinct, makes reordered retries stable, and prevents response-loss retries
+from creating duplicate reservations or handoffs. Under one auxiliary base, a
+retry must reproduce the complete set of unit keys or it returns `409 conflict`
+without changing the primary acceptance. If no client request ID was supplied,
+the generated response request ID is diagnostic only and each auxiliary retry
+is a new submission. A standalone empty or unsupported-only unit retains the
+#16 identity and uses `unit_kind=no_op` instead.
+
+Exhausted no-op count or rate capacity returns `429 rate_limited` with the
+exact active `default`/`project`/`no_op_admission` rate-limit entry defined
+above; an absent, stale, or unsafe no-op policy returns `503 unavailable`.
+No-op admission reservations are separate from error-quantity and final
+attachment-byte charges, and they cannot be bypassed by the shared safe-backlog
+limit.
+
+The admission sequence is:
+
+1. Resolve a matching durable duplicate before creating a new reservation.
+2. Reserve the applicable error quantity, attachment bytes, and/or
+   `no_op_admission` capacity with an idempotent reservation identity.
+3. Before the acceptance transaction, revalidate the reservation generation,
+   project/organization state, DSN authorization revision, environment
+   generation, retention/deletion fence, and security-projection freshness.
+4. In the final Ingest transaction, mark the reservation charged and commit
+   acceptance metadata and the processing outbox together.
+5. Reconcile any uncertain reservation or acceptance outcome by identity;
+   never assume rollback and never charge a retry twice.
+
+Error quantity limits and quantities are owned by #19. Protocol limits are
+owned by #16. API owns the project policy generation; the #17 operating
+contract owns the initial `attachment_bytes` value of 1,073,741,824 bytes per
+rolling 24 hours and the required `no_op_admission` count, rate, and rate-window
+values. Ingest owns attachment-byte and no-op admission reservation mechanics
+and their fences, but it does not invent #19's quantity values. Rejections,
+exclusions, conflicts, and
+duplicates add no charge or new reservation. Processing failure, quarantine,
+and retention expiry do not refund a durable accepted charge; no-op reservation
+release follows the cleanup lifecycle above.
+
+Accepted work may accumulate only within configured safe backlog count, bytes,
+and age. When safe capacity is exhausted, new work returns `503 unavailable`
+and already accepted work remains recoverable. A project quota or environment
+registration limit returns `429 rate_limited`. An unavailable or unsafe quota,
+authorization, lifecycle, or retention evaluation returns `503 unavailable`.
+These outcomes remain distinguishable through status and retry policy even
+though their public JSON detail is intentionally generic.
+
+Required operating values are implementation gates. Before implementation, the
+owning operating contract must record and load-validate request deadline,
+maximum concurrent requests, maximum concurrent decoders/decompressors, bounded
+decoded-memory budget, the project `attachment_bytes` capacity of
+1,073,741,824 bytes and rolling 24-hour window, project TUS staging byte/count
+budgets, project no-op/client-report admission count/rate/window budgets and
+reservation reconciliation, retry base/max/jitter,
+reconciliation cadence, quarantine count/bytes/age, backlog count/bytes/age,
+and `Retry-After` derivation. Missing or invalid values prevent startup.
+Load testing must verify that malformed, oversized, compressed, slow, or
+concurrent inputs cannot bypass these limits or allocate unbounded memory.
+
+## Retention, deletion, and recovery
+
+Raw accepted data has a seven-day default cutoff from `accepted_at`; the
+effective cutoff is the earlier of that class default and the active project
+retention policy. The project policy never extends the class default. A
+shortened policy installs the existing generation-matched pending and active
+fences. Project deletion installs its irreversible lifecycle fence and blocks
+new acceptance before the final commit; restore cannot reopen the project or
+revive a deleted DSN, event dedup record, parent, attachment, reservation, or
+handoff.
+
+At every effective raw cutoff, Jobs must send the project-scoped
+`RawRetentionExpiryV1` sweep for each eligible handoff whose terminal
+disposition is absent, each completed payload-bearing handoff whose admission
+or parent-binding tombstones have reached the cutoff, and each expiry-eligible
+no-op acceptance or retry tombstone, including one with a `completed_no_op`
+disposition. This sweep is mandatory when Processor is unavailable and is an
+idempotent safety net for any handoff that remains unresolved at the cutoff and
+for scheduled cleanup of terminal payload and no-op tombstones. Ingest verifies
+idempotently enumerates its own eligible handoff, payload tombstone, no-op
+tombstone, and bound staging state. A payload handoff with a terminal
+`completed` disposition, or a no-op tombstone with `completed_no_op`, receives
+no new disposition and no expiry fence; the sweep only removes or makes its
+terminal tombstone, raw object, acceptance metadata, outbox entry, payload
+reference, or bound staging bytes unavailable as applicable. Before installing
+a fence for an otherwise unresolved payload or no-op handoff, Ingest reconciles
+the owner-mediated completion arbitration described below. The effective
+raw-retention cutoff is the hard completion-lease deadline. At cutoff
+arbitration, only a matching terminal disposition already recorded before the
+cutoff keeps completion authoritative; a provisional or finalized claim without
+that disposition receives the applicable expiry fence and cannot keep raw state
+eligible indefinitely. A pending or active shortened-policy or deletion fence
+is different: the finalization phase
+serializes with that lifecycle state and either records `claim_finalized` or
+records a matching `RawHandoffLifecycleFenceV1` cancellation outcome. A
+`claim_finalized` result is authoritative for completion arbitration but cannot
+by itself authorize canonical publication; it cannot be invalidated by a later
+lifecycle fence. A `lifecycle_fenced` result forbids canonical publication and
+is closed by a matching `lifecycle_rejected` disposition. Ingest retires raw
+state only after that terminal disposition or
+the matching lifecycle/expiry fence, never from the provisional claim alone.
+A handoff without a terminal disposition at cutoff causes Ingest to record
+`default_expired` or `policy_rejected` and publish `RawHandoffExpiryFenceV1`.
+A `completed_no_op`
+tombstone releases its retained `no_op_admission` reservation only after
+confirmed physical cleanup, exactly once. Bound staging cleanup likewise
+releases its staging reservation only after confirmed physical deletion. If no
+terminal disposition exists before cutoff arbitration, the expiry fence wins.
+Late fetches,
+arbitration requests, and completion claims are rejected as stale after an
+expiry or lifecycle fence; a matching terminal disposition may close that
+owner-recorded outcome idempotently.
+
+`RawHandoffCompletionArbitrationV1` is an authenticated, idempotent unary
+Processor-to-Ingest handshake under `/internal/v1` with two phases. In the
+claim phase, Processor stages the verified canonical candidate or payload-free
+no-op and submits its scoped identity, completion kind, applicable digest or
+no-op identity, accepted time, cutoff, correlation identifier, and idempotency
+key. Ingest serializes the claim with its expiry state and records the
+provisional `RawHandoffCompletionClaimV1` or expiry outcome before responding.
+In the finalization phase, Processor submits the same claim identity and
+idempotency key immediately before canonical commit or no-op completion. Ingest
+serializes that request with pending and active retention/deletion fences and
+returns either `claim_finalized` or `lifecycle_fenced` with the matching
+`RawHandoffLifecycleFenceV1`. That fence carries the scoped `watchtower_id`,
+fence kind (`retention_policy` or `project_deletion`), lifecycle generation,
+claim identity, correlation identifier, and idempotency key, but no canonical
+result or payload. Processor may commit a canonical candidate or finalize a
+no-op only after `claim_finalized` and before a raw-expiry fence. It must then
+deliver the matching terminal `completed` or `completed_no_op`
+`RawHandoffDispositionV1` and wait for Ingest's idempotent durable-recording
+acknowledgement before publishing the corresponding canonical change. A
+pending arbitration, disposition recording, or finalization record is retried
+by identity after a crash. A project-deletion fence does not cancel a previously finalized claim;
+Jobs keeps that claim as an outstanding deletion dependency. An expiry fence
+that wins after a claim was finalized but before its terminal disposition is
+authoritative: Processor discards or removes any
+unpublished result and publishes the matching expiry disposition instead of a
+late completion. A lifecycle-fenced claim is never promoted, and its matching
+`lifecycle_rejected` disposition is the terminal outcome that permits raw
+retirement. A
+payload claim carries canonical lowercase UUID v7 `processing_generation` and
+canonical content digest. A no-op claim carries its bounded retry identity and
+semantic `payload_digest`, and explicitly carries neither processing generation
+nor canonical result. The normal `RawHandoffDispositionV1` remains terminal
+delivery on the asynchronous envelope and is idempotent. Ingest must
+transactionally record a `completed` disposition and return its durable,
+identity-bound acknowledgement before Processor publishes the corresponding
+canonical change; a missing acknowledgement blocks publication and leaves the
+candidate recoverable. `completed` and `completed_no_op` dispositions must
+match the corresponding owner-recorded `claim_finalized` outcome. `default_expired` and `policy_rejected` dispositions
+instead carry and must match the owner-recorded `RawHandoffExpiryFenceV1`
+identity, expiry outcome, basis, and applicable policy generation;
+`lifecycle_rejected` dispositions carry and must match the owner-recorded
+`RawHandoffLifecycleFenceV1` identity and lifecycle generation. None of the
+fence dispositions carry completed-result claim fields. A matching expiry or
+lifecycle disposition closes its fence outcome idempotently, while a conflicting
+disposition is an integrity failure.
+If no matching terminal disposition exists when cutoff arbitration commits, the
+expiry fence wins and a later completion handshake or claim cannot resurrect
+the handoff.
+
+At every effective query-retention alias cutoff, Jobs schedules a project-scoped
+alias-retention cleanup run for Ingest. Ingest idempotently enumerates
+compatibility aliases and retained parent-binding/TUS evidence whose aliases
+are no longer queryable, then removes the alias horizon, canonical reference,
+semantic payload digest, upload ID, attachment identity/digest/length, and any
+usable payload reference. Only the permanent payload-free event-ID fence
+remains. The run is replay-safe; uncertain or failed cleanup remains
+reconcilable and retains the evidence until deletion is confirmed. This sweep
+is separate from raw-cutoff cleanup: it does not release TUS staging capacity,
+which remains governed by raw-cutoff cleanup and confirmed physical deletion.
+
+Recovery is deterministic across each durable boundary:
+
+| Failure point | Recovery rule |
+| --- | --- |
+| Before S3 write | No acceptance, charge, or payload persistence. |
+| During/after S3 write before verification | Verify size/digest; delete or quarantine the incomplete orphan without acknowledging it. |
+| After S3 verification before PostgreSQL commit | Reconcile the object against the idempotent acceptance identity; either commit the full acceptance or clean the orphan. Never report success from S3 existence alone. |
+| After PostgreSQL/outbox commit before response | Treat response loss as unknown; retry resolves the one committed acceptance or conflict and reuses one charge. |
+| After TUS creation commit before the `201` response | Treat response loss as unknown; a retry with the same caller-supplied `X-Request-ID` and creation preimage replays the original `Location` and reuses the one upload, slot, and byte reservation. |
+| After local commit before MSK publication | Outbox publication resumes; public success remains durable and recoverable. |
+| After duplicate MSK delivery | Processor applies the same handoff identity idempotently. |
+| After Processor fetch or processing before disposition | Redelivery resumes the same raw-unit outcome; Ingest retains raw state through a provisional or finalized claim until a matching terminal disposition or expiry/lifecycle fence. Processor publishes no canonical change until Ingest acknowledges the recorded completed disposition. A completed disposition or `completed_no_op` disposition leaves the minimal admission and parent-binding tombstones through their cutoffs. An expiry-fenced claim publishes no canonical result, and a lifecycle-fenced claim publishes no canonical result. For `completed_no_op`, the no-op reservation remains held until tombstone expiry and confirmed physical cleanup. |
+| After disposition send before Ingest recording or acknowledgement | Processor does not publish the canonical change; redelivery records or acknowledges the same disposition idempotently. If the cutoff wins first, the candidate is removed and its reserved sequence receives the matching skip. A conflicting disposition is quarantined as an integrity failure and pages immediately. |
+| During shutdown or restore | Readiness is removed, checkpoints/outboxes are persisted, registry and fence snapshots are reconciled, and accepted work is retried only while eligible. |
+
+Orphan cleanup is bounded, tenant-scoped, digest-verified, and cannot delete a
+committed object. Permanent handoff failures enter a bounded quarantine with
+only safe metadata and remain operator-retryable until the applicable cutoff.
+Quarantine never creates an unsupported terminal disposition, extends
+retention, or bypasses deletion. Backlog overflow stops new acceptance before
+the safe boundary and does not discard already committed work.
+
+## Diagnostics, security, and operations
+
+Structured diagnostics carry only bounded route/method, tenant/project scope,
+source protocol/version, request/operation/message IDs, unit outcome, item
+counts, exclusion reason, byte counts, latency, quota class, fence generation,
+backlog state, and handoff state. They never contain DSNs, tokens, keys,
+opaque session material, raw payloads, attachment bytes, or unrestricted user
+data. High-cardinality IDs are correlation fields, not metric labels.
+
+Page immediately for accepted-data-loss risk, unverifiable or conflicting raw
+integrity, unrecoverable handoff, tenant-isolation risk, failed revocation or
+deletion fences, and a disposition conflict. Ordinary retry, quota, backlog,
+and projection lag metrics alert through the owning operational boundary.
+Operator recovery is authenticated, least-privileged, time-limited, audited,
+and cannot bypass authorization, retention, deletion, or project isolation.
+
+All handoffs use the runtime contract's versioned project scope, common
+envelope, mTLS/workload ACLs, idempotency, correlation, and W3C trace context.
+Consumers must understand every handoff version retained during the replay
+horizon. No public client consumes MSK or invokes an internal RPC.
+
+## Implementation prerequisites and verification specification
+
+Implementation is blocked until these separately owned prerequisites are
+recorded and testable:
+
+| Prerequisite | Owner | Required decision |
+| --- | --- | --- |
+| Supported protocol formats, routes, limits, and compatibility responses | #16 | The exact values restated in this contract. |
+| Error quantity limits and collection quantity semantics | #19 | Error-unit quantities and their authoritative quota windows. |
+| Operating values and final attachment quota | #17 operating contract | Deadlines, concurrency, decoder/decompressor limits, memory, the 1,073,741,824-byte rolling-24-hour attachment budget, TUS staging byte/count budgets, no-op/client-report admission count/rate/window budgets, backlog, quarantine, retry, reconciliation, and alert thresholds. |
+
+The verification specification must use synthetic fixtures and prove:
+
+- every #16 route, content type, encoding, limit, framing error, unsupported
+  item, response, retry header, and no-payload guarantee;
+- valid errors, native crashes, initial attachments, later attachments,
+  client reports, no-ops, payload-bearing mixed-request rejection rollback for
+  event and later-attachment units, including auxiliary client-report
+  atomicity, atomic invalid units, and independent valid-unit behavior;
+- missing, malformed, rotated, revoked, cross-project, suspended, deleted,
+  stale, and concurrently revoked DSNs, including 60-second projection and
+  immediate-fence boundaries;
+- concurrent identical event IDs, conflicting decompressed bytes, compressed
+  retries, whitespace changes, protocol scope, effective raw-cutoff expiry
+  without retry extension, query-retention alias fencing while canonical events remain
+  queryable, idempotent alias-cutoff cleanup of compatibility and retained TUS
+  evidence, permanent payload-free event-ID non-reuse after alias expiry, a
+  bound TUS retry after raw retention but before alias expiry using retained
+  upload/attachment-identity evidence, a changed filename or attachment type
+  conflict, a TUS creation response-loss retry with the same caller-supplied
+  `X-Request-ID` that replays the original `Location` without another staging
+  reservation, changed creation metadata conflict, a client-report-only change that preserves the primary binding,
+  conflicting TUS binding evidence, retained original TUS `Location` comparison
+  after public-origin/base-path changes and raw cleanup, missing IDs, and
+  deletion/restore fencing;
+- equal and different attachment identities, initial-attachment multiset
+  duplicate and conflict behavior, attachment-before-parent `404` handling,
+  pre-processing attachment delivery, known expired/deleted/fenced parent
+  `409` handling, TUS binding, and parent retention cutoffs;
+- request-ID validation before authentication, including malformed,
+  non-canonical, and duplicate headers with an invalid DSN, authentication
+  precedence over malformed transport, reservation races,
+  one-charge duplicate handling, TUS staging byte/count exhaustion,
+  no-op/client-report count/rate exhaustion and per-project isolation, repeated
+  no-op retries with the same semantic digest, and changed-digest `409`
+  conflicts; duplicate reservation reuse, delayed-cleanup reservation retention,
+  deletion-confirmed release of retained staging capacity, mandatory cleanup of
+  logically expired `pending` and `complete-unbound` TUS staging (including
+  zero-length uploads), exact
+  `default:project:no_op_admission`,
+  `default:project:environment_registration`,
+  `default:project:attachment_bytes`, and
+  `default:project:tus_staging:bytes`/`uploads` rate-limit entries,
+  deterministic owner-mediated claim/finalization arbitration versus
+  expiry-cutoff ordering for payload and no-op claims, expiry fencing of a
+  stalled provisional or finalized claim before cleanup, cancellation by a later retention/deletion
+  fence with matching `lifecycle_rejected` dispositions, bound-staging cleanup by the effective
+  raw cutoff, the 1,073,741,824-byte rolling-24-hour attachment quota,
+  auxiliary-reservation rollback, and quota exhaustion,
+  distinct client-report item reservations, stable reordered and duplicate-item
+  retries, and changed per-unit-key conflicts,
+  pending environment registration rollback and activation with durable
+  acceptance, response-loss reconciliation, environment
+  registration/retirement/reactivation races, unsafe enforcement,
+  service overload, and bounded Retry-After behavior;
+- failures before and after S3 verification, PostgreSQL/outbox commit, MSK
+  publication, Processor fetch/processing, disposition acknowledgement,
+  shutdown, restore, orphan cleanup, quarantine, duplicate delivery, and
+  conflicting dispositions;
+- bounded decoding, decompression, duration, concurrency, memory, no-op and
+  client-report acceptance without a raw object, client-report cardinality
+  mapping, no-op reservation lifecycle and operating-value validation,
+  deterministic multipart minidump digests with retained metadata,
+  versioned attachment-identity preimages with present and absent filenames,
+  deterministic `RawUnitContainerV1` framing/digests with unknown event-member
+  removal, effective media typing for dereferenced TUS minidumps, and absent
+  attachment-field omission, `completed_no_op` without a
+  processing generation or canonical result, no-op reservation retention until
+  tombstone cleanup and exactly-once release, completed payload admission and
+  parent-binding tombstone cleanup, backlog, quarantine, mandatory
+  Processor-outage and completed-no-op-tombstone expiry sweeps, absence of
+  expiry dispositions or fences for terminal tombstones, retention expiry, and
+  deletion behavior; and
+- safe logs/traces/metrics, immediate risk paging, mTLS/ACL isolation,
+  tenant-scoped references, N/N-1 message compatibility, and absence of raw
+  payloads or credentials in diagnostics.
+
+## Non-goals and acceptance
+
+This contract does not define normalization, privacy transformations,
+enrichment, grouping, symbolication, canonical/query behavior, signal-specific
+metrics/logs/traces, production rollout, UI, CLI, translations, a new SLA,
+customer raw downloads, historical imports, or server-side sampling.
+
+The contract is accepted only when every request-to-handoff state has a #16
+external response; payload-bearing success requires verified immutable raw
+storage while valid no-op success requires bounded metadata and a recoverable
+no-op handoff; error units are atomic; concurrent duplicates reuse one
+acceptance and one charge; conflicts reject content; public event aliases stay
+unique while canonical events are queryable; later attachments obey parent
+authorization, identity, deduplication, and retention rules; TUS staging is
+bounded, retained through delayed cleanup, and released exactly once after
+deletion confirmation; quota, unsafe, and overload
+failures have distinguishable retry behavior; accepted work remains recoverable
+through its retention cutoff; and all handoffs remain versioned,
+protocol-neutral, tenant-scoped, and compatible with the existing fetch,
+disposition, and fence interfaces.
