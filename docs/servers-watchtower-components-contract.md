@@ -876,8 +876,10 @@ reference; `policy_rejected` includes the `retention_policy_generation`; and
 the message through its durable outbox after recording the canonical result or
 payload-free no-op completion; transient processing failures publish no
 terminal disposition. Ingest transactionally persists the disposition and
-idempotency state before retiring the matching outbox entry and raw acceptance
-data, releasing the live no-op admission reservation for `completed_no_op`.
+idempotency state before retiring the matching outbox entry and eligible raw
+  acceptance data. For `completed_no_op`, the bounded acceptance/retry tombstone
+  remains live and the no-op admission reservation stays held until tombstone
+  expiry and confirmed physical cleanup release it exactly once.
 Redelivery of the same message is idempotent, and a conflicting disposition or
 generation is an integrity failure that cannot retire raw state.
 

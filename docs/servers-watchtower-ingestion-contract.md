@@ -276,9 +276,9 @@ before acceptance, as required by #16. It never returns
 
 Durable acceptance and a matching duplicate return the #16 success response:
 HTTP `200`, zero-length body, `X-Request-ID`, and `X-Watchtower-Request-ID`.
-A mixed request returns the same `200` response only when no event-bearing unit
-is rejected and at least one unit is accepted. A valid standalone no-op also
-returns `200` with the same headers.
+A mixed request returns the same `200` response only when no payload-bearing
+unit is rejected and at least one unit is accepted. A valid standalone no-op
+also returns `200` with the same headers.
 Envelope `OPTIONS` returns `204`. TUS creation returns `201`; successful TUS
 `HEAD` returns `200`; successful TUS `PATCH` returns `204`; each retains the
 exact #16 TUS headers. A failed TUS `HEAD` is bodyless, and a failed TUS
@@ -380,14 +380,15 @@ before any unit is selected. There is no server-side sampling. Valid traffic
 within the stated limits is admitted; excess or unsupported traffic is
 explicitly rejected or excluded.
 
-When an Envelope contains an event-bearing unit, that unit and any accompanying
-client-report or no-op units form one request-atomic admission group after
-structural validation. A conflict, quota failure, temporary admission failure,
-or other rejection of the event-bearing unit rolls back every auxiliary unit's
-acceptance, reservation, and handoff, and the event result determines the
-response. Auxiliary acceptance can never turn a rejected event into `200`.
-When the event-bearing unit is accepted or is a matching duplicate, auxiliary
-units may commit according to their normal rules.
+When an Envelope contains an event-bearing unit or a correlated later-attachment
+unit, that primary payload-bearing unit and any accompanying client-report or
+no-op units form one request-atomic admission group after structural validation.
+A conflict, quota failure, temporary admission failure, or other rejection of
+the primary payload-bearing unit rolls back every auxiliary unit's acceptance,
+reservation, and handoff, and the primary result determines the response.
+Auxiliary acceptance can never turn a rejected primary payload-bearing unit
+into `200`. When the primary payload-bearing unit is accepted or is a matching
+duplicate, auxiliary units may commit according to their normal rules.
 
 Repository-owned identities are canonical lowercase UUID v7 strings and
 PostgreSQL `uuid` values. Ingest generates non-reused IDs for the accepted raw
@@ -484,22 +485,25 @@ duplicates.
 For an initial error unit, the event ID and event-byte
 `admission_content_digest` are compared together with the canonical sorted
 multiset of initial attachment identities. Each multiset member uses the
-attachment identity fields `(filename/name, content_type, attachment_type,
+attachment identity fields `(filename, content_type, attachment_type,
 sha256(content_bytes))` defined below, with the candidate event as the parent;
 an empty multiset is also part of the comparison. The attachment multiset is
 not folded into the ordinary event-byte digest, but a multiset mismatch,
 including a multiplicity change, is still a conflicting initial unit and
 cannot be silently dropped or charged as a separate unseen attachment.
 
-An attachment identity is `(parent_acceptance_id, filename/name,
-content_type, attachment_type, sha256(content_bytes))`, using the decoded
-ordinary bytes or completed TUS bytes. An equal identity on a retry of the
-same accepted unit is an idempotent duplicate and adds no new object or
+An attachment identity is `(parent_acceptance_id, filename, content_type,
+attachment_type, sha256(content_bytes))`, using the decoded ordinary bytes or
+completed TUS bytes. The `filename` component uses only the accepted
+`filename` value; when absent, it is omitted from the canonical identity
+representation, never substituted from an unknown `name` member or encoded as
+`null`, an empty string, or a default value. An equal identity on a retry of
+the same accepted unit is an idempotent duplicate and adds no new object or
 charge. Duplicate occurrences within one initial unit remain separate
-multiset members and are not coalesced. Equal name and type with a different
-content hash is a distinct immutable attachment, subject to parent and quota
-rules. Attachment length is checked against decoded or dereferenced bytes,
-never against compressed bytes or the TUS reference JSON.
+multiset members and are not coalesced. Equal filename and type with a
+different content hash is a distinct immutable attachment, subject to parent
+and quota rules. Attachment length is checked against decoded or dereferenced
+bytes, never against compressed bytes or the TUS reference JSON.
 
 Initial attachments are committed atomically with their parent error unit.
 The TUS upload is event-unbound until the subsequent Envelope binding. At
@@ -549,8 +553,11 @@ unit, public success means that its bounded acceptance metadata, committed
 committed; it has no raw object or raw-object key, digest, or size, and no
 payload reference; its semantic `payload_digest` remains available for the
 no-op/client-report retry identity. A matching `completed_no_op` disposition
-releases the live no-op admission reservation and retires the recoverable
-no-op handoff without creating a canonical generation or result.
+records terminal completion and retires the recoverable no-op handoff while
+retaining the bounded acceptance/retry tombstone; it creates no canonical
+generation or result. It does not release the live no-op admission reservation.
+The reservation remains held until the tombstone expires and confirmed
+physical cleanup releases it exactly once.
 Neither form of success
 means MSK publication, Processor completion, normalization, grouping,
 symbolication, canonical storage, or Query visibility.
@@ -698,9 +705,9 @@ uncorrelated attachment-only unit. Ingest reserves one count and consumes the
 configured rate capacity after duplicate resolution and before acceptance,
 keyed by tenant, project, no-op/client-report retry identity, and policy
 generation. A matching durable duplicate reuses its reservation and consumes
-neither another count nor another rate unit. For an event-bearing request,
-auxiliary no-op or client-report reservations commit or roll back atomically
-with the event result.
+neither another count nor another rate unit. For an event-bearing or correlated
+later-attachment request, auxiliary no-op or client-report reservations commit
+or roll back atomically with the primary payload-bearing result.
 
 The count reservation remains held while the acceptance metadata, no-op
 handoff/outbox, or retry tombstone remains live. Terminal handoff plus expiry
@@ -786,7 +793,7 @@ Recovery is deterministic across each durable boundary:
 | After PostgreSQL/outbox commit before response | Treat response loss as unknown; retry resolves the one committed acceptance or conflict and reuses one charge. |
 | After local commit before MSK publication | Outbox publication resumes; public success remains durable and recoverable. |
 | After duplicate MSK delivery | Processor applies the same handoff identity idempotently. |
-| After Processor fetch or processing before disposition | Redelivery resumes the same raw-unit outcome; Ingest retains raw state until a durable disposition or expiry fence, and a `completed` or `completed_no_op` disposition leaves the minimal admission and parent-binding tombstones through their cutoffs while settling any no-op reservation. |
+| After Processor fetch or processing before disposition | Redelivery resumes the same raw-unit outcome; Ingest retains raw state until a durable disposition or expiry fence, and a `completed` or `completed_no_op` disposition leaves the minimal admission and parent-binding tombstones through their cutoffs. For `completed_no_op`, the no-op reservation remains held until tombstone expiry and confirmed physical cleanup. |
 | After disposition send before Ingest recording | Redelivery is idempotent. A conflicting disposition is quarantined as an integrity failure and pages immediately. |
 | During shutdown or restore | Readiness is removed, checkpoints/outboxes are persisted, registry and fence snapshots are reconciled, and accepted work is retried only while eligible. |
 
@@ -834,8 +841,9 @@ The verification specification must use synthetic fixtures and prove:
 - every #16 route, content type, encoding, limit, framing error, unsupported
   item, response, retry header, and no-payload guarantee;
 - valid errors, native crashes, initial attachments, later attachments,
-  client reports, no-ops, event-bearing mixed-request rejection rollback,
-  atomic invalid units, and independent valid-unit behavior;
+  client reports, no-ops, payload-bearing mixed-request rejection rollback for
+  event and later-attachment units, atomic invalid units, and independent
+  valid-unit behavior;
 - missing, malformed, rotated, revoked, cross-project, suspended, deleted,
   stale, and concurrently revoked DSNs, including 60-second projection and
   immediate-fence boundaries;
@@ -869,8 +877,9 @@ The verification specification must use synthetic fixtures and prove:
   deterministic multipart minidump digests with retained metadata,
   deterministic `RawUnitContainerV1` framing/digests with unknown event-member
   removal and absent attachment-field omission, `completed_no_op` without a
-  processing generation or canonical result, no-op reservation release,
-  completed-disposition tombstones, backlog, quarantine, mandatory
+  processing generation or canonical result, no-op reservation retention until
+  tombstone cleanup and exactly-once release, completed-disposition tombstones,
+  backlog, quarantine, mandatory
   Processor-outage expiry sweeps, retention expiry, and deletion behavior; and
 - safe logs/traces/metrics, immediate risk paging, mTLS/ACL isolation,
   tenant-scoped references, N/N-1 message compatibility, and absence of raw
