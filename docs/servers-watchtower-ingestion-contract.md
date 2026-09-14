@@ -319,6 +319,21 @@ bucket. This class never uses `all`, `error`, or `attachment`, so exhausting
 no-op or client-report capacity does not suppress unrelated error or
 attachment traffic.
 
+When either project-scoped TUS staging budget is exhausted, the active
+`X-Sentry-Rate-Limits` entry is one of these exact namespace-bearing forms:
+
+- byte budget: `<seconds>:default:project:tus_staging:bytes`;
+- upload-count budget: `<seconds>:default:project:tus_staging:uploads`.
+
+Both entries use category `default`, scope `project`, reason `tus_staging`,
+and no `all`, `error`, or `attachment` category. The `bytes` and `uploads`
+namespaces distinguish the two independent staging dimensions. The header
+lists every currently exhausted staging dimension, sorted by the general
+canonical-entry ordering. The singleton rate-limit headers and `Retry-After`
+use the one selected bucket from the existing restrictive ordering, with the
+canonical entry as the final tie-breaker. These entries apply to TUS creation
+only; they do not suppress ordinary error or attachment admission.
+
 ## Authentication, lifecycle, and environment admission
 
 Collection accepts only a current project-scoped collection DSN in the exact
@@ -598,8 +613,8 @@ The request-to-handoff states are:
 | Raw staged and verified | For a payload-bearing unit, the immutable S3 object is complete and its SHA-256 and exact byte size match the accepted content. A valid no-op or client-report unit allocates no raw object and instead carries only bounded metadata. | No payload-bearing success is reported before verification. Failed or uncertain attempts are cleaned or reconciled. |
 | Acceptance committed | For a payload-bearing unit, PostgreSQL acceptance metadata, final quota charge state, dedup/attachment identity, and transactional outbox commit together. For a no-op or client-report unit, bounded acceptance metadata, its no-op admission reservation/charge state, and a recoverable no-op handoff commit without a raw object. | `200` with empty body and request IDs. |
 | Handoff pending/published | Outbox publication to MSK is retryable and carries only bounded protocol-neutral metadata or an owner-issued raw reference. | Public success remains valid; no synchronous Processor visibility is claimed. |
-| Processor dispositioned | Processor has durably completed a canonical result, completed a payload-free no-op, or terminally rejected the handoff and Ingest has durably recorded the disposition. | No later public response is generated; raw retirement and no-op reservation cleanup follow the disposition/fence contract. |
-| Expired/fenced/quarantined | Retention, deletion, or permanent-failure fence prevents stale fetch, disposition, replay, and resurrection. | New requests map to the appropriate #16 `401`, `403`, `409`, or `503`; no payload revival. |
+| Processor dispositioned | Processor has durably completed a canonical result or payload-free no-op, or terminally rejected the handoff; Ingest has a matching completion claim or terminal disposition, or has installed the applicable expiry fence. | No later public response is generated; raw retirement and no-op reservation cleanup follow the disposition/claim/fence contract. |
+| Expired/fenced/quarantined | Retention, deletion, or permanent-failure fence prevents stale fetch, completion claim, disposition, replay, and resurrection. | New requests map to the appropriate #16 `401`, `403`, `409`, or `503`; no payload revival. |
 
 For a payload-bearing unit, public success means only that the immutable raw
 object, verified digest and size, acceptance metadata, final reservation/charge
@@ -697,6 +712,31 @@ compression, DSNs, and request IDs are not retained. The event descriptor
 precedes attachment and minidump descriptors, which are sorted by canonical
 descriptor bytes; duplicate attachment identities are retained as separate
 sorted multiset entries, with one descriptor and section per occurrence.
+
+For a TUS-backed minidump, the same metadata schema uses the exact binding-time
+preimage below because TUS creation is event-unbound and supplies no multipart
+`sentry` part or Crashpad annotations:
+
+```json
+{
+  "schema": "watchtower.sentry.minidump.v1",
+  "minidump_sha256": "lowercase_hex_sha256(completed_tus_upload_bytes)",
+  "annotations": {},
+  "sentry": {
+    "event_id": "normalized_lowercase_binding_event_id"
+  }
+}
+```
+
+The TUS `minidump_sha256` covers the completed identity-encoded upload bytes.
+The binding Envelope supplies `event_id`; `release`, `dist`, and `platform`
+are omitted because the TUS workflow supplies none, and no multipart or
+Crashpad values may be invented. The TUS metadata object is RFC 8785
+canonicalized as part of the `RawUnitContainerV1` manifest and therefore
+participates in the container and object digests. The multipart minidump
+preimage remains unchanged and may retain its supplied annotations and
+optional Sentry fields.
+
 Excluded item payloads and client-report-only metadata are never placed in the
 container. The object digest is the lowercase SHA-256 of the
 complete container bytes, including framing, manifest, metadata, and all
@@ -732,11 +772,12 @@ MSK uses the canonical storage settings: replication factor `3`,
 Delivery is at least once; consumers are idempotent and no global ordering is
 assumed. Processor retrieves bytes only through authenticated bounded
 `RawPayloadFetchV1` requests. Ingest retires raw state only after it durably
-records a matching terminal `RawHandoffDispositionV1` or a matching
-`RawRetentionExpiryV1` fence. Redelivered identical dispositions are
-idempotent. A conflicting disposition, generation, digest, or raw-unit
-identity is an integrity failure: raw state is retained, no retirement occurs,
-and the condition pages immediately.
+records a matching terminal `RawHandoffDispositionV1`, reconciles a matching
+durable `RawHandoffCompletionClaimV1`, or records a matching
+`RawRetentionExpiryV1` fence. Redelivered identical dispositions and claims
+are idempotent. A conflicting disposition, claim, generation, digest, or
+raw-unit identity is an integrity failure: raw state is retained, no retirement
+occurs, and the condition pages immediately.
 
 ## Quotas, capacity, and final fences
 
@@ -865,18 +906,39 @@ disposition. This sweep is mandatory when Processor is unavailable and is an
 idempotent safety net for any handoff that remains unresolved at the cutoff and
 for scheduled cleanup of terminal payload and no-op tombstones. Ingest verifies
 idempotently enumerates its own eligible handoff, payload tombstone, no-op
-tombstone, and bound staging state. For an unresolved handoff it records
-`default_expired` or `policy_rejected` and publishes
-`RawHandoffExpiryFenceV1`. A payload handoff with a terminal `completed`
-disposition, or a no-op tombstone with `completed_no_op`, receives no new
-disposition and no expiry fence; the sweep only removes or makes its terminal
-tombstone, raw object, acceptance metadata, outbox entry, payload reference,
-or bound staging bytes unavailable as applicable. A `completed_no_op` tombstone
+tombstone, and bound staging state. A payload handoff with a terminal
+`completed` disposition, or a no-op tombstone with `completed_no_op`, receives
+no new disposition and no expiry fence; the sweep only removes or makes its
+terminal tombstone, raw object, acceptance metadata, outbox entry, payload
+reference, or bound staging bytes unavailable as applicable. Before installing
+a fence for an otherwise unresolved payload handoff, Ingest reconciles the
+durable Processor completion claim described below. A matching claim wins the
+cutoff arbitration and is recorded as the equivalent completed outcome; a
+missing claim causes Ingest to record `default_expired` or `policy_rejected`
+and publish `RawHandoffExpiryFenceV1`. A `completed_no_op` tombstone
 releases its retained `no_op_admission` reservation only after confirmed
 physical cleanup, exactly once. Bound staging cleanup likewise releases its
 staging reservation only after confirmed physical deletion. Late fetches and
-dispositions are rejected as stale. Processor performs its final current-cutoff
-and local-fence check immediately before any canonical or derived commit.
+dispositions and claims are rejected as stale after an expiry fence. Processor
+performs its final current-cutoff and local-fence check immediately before any
+canonical or derived commit.
+
+`RawHandoffCompletionClaimV1` is a versioned internal Processor-to-Ingest
+completion claim carrying the scoped `watchtower_id`, canonical lowercase UUID
+v7 `processing_generation`, canonical content digest, `accepted_at`, effective
+cutoff, correlation identifier, and idempotency key. Processor records the claim in
+the same durable arbitration state as the authoritative canonical
+default-generation promotion, after the canonical result is verified; an
+unpromoted candidate row is not a completion claim. Ingest reconciles claims
+before expiry fencing, and only a matching claim whose durable arbitration
+state predates or reaches the effective cutoff can win. The normal
+`RawHandoffDispositionV1` remains the terminal delivery and may arrive later;
+it must match the claim and is idempotent. If no matching claim exists when
+the cutoff arbitration commits, the expiry fence wins and a later claim or
+disposition cannot resurrect the handoff. Concurrent claim and expiry actions
+use this per-handoff durable ordering, so a canonical result cannot be
+silently converted to `default_expired` merely because its disposition
+delivery was delayed.
 
 At every effective query-retention alias cutoff, Jobs schedules a project-scoped
 alias-retention cleanup run for Ingest. Ingest idempotently enumerates
@@ -899,7 +961,7 @@ Recovery is deterministic across each durable boundary:
 | After PostgreSQL/outbox commit before response | Treat response loss as unknown; retry resolves the one committed acceptance or conflict and reuses one charge. |
 | After local commit before MSK publication | Outbox publication resumes; public success remains durable and recoverable. |
 | After duplicate MSK delivery | Processor applies the same handoff identity idempotently. |
-| After Processor fetch or processing before disposition | Redelivery resumes the same raw-unit outcome; Ingest retains raw state until a durable disposition or expiry fence, and a `completed` or `completed_no_op` disposition leaves the minimal admission and parent-binding tombstones through their cutoffs. For `completed_no_op`, the no-op reservation remains held until tombstone expiry and confirmed physical cleanup. |
+| After Processor fetch or processing before disposition | Redelivery resumes the same raw-unit outcome; Ingest retains raw state until a durable completion claim, terminal disposition, or expiry fence, and a `completed` claim/disposition or `completed_no_op` disposition leaves the minimal admission and parent-binding tombstones through their cutoffs. For `completed_no_op`, the no-op reservation remains held until tombstone expiry and confirmed physical cleanup. |
 | After disposition send before Ingest recording | Redelivery is idempotent. A conflicting disposition is quarantined as an integrity failure and pages immediately. |
 | During shutdown or restore | Readiness is removed, checkpoints/outboxes are persisted, registry and fence snapshots are reconciled, and accepted work is retried only while eligible. |
 
@@ -974,7 +1036,9 @@ The verification specification must use synthetic fixtures and prove:
   no-op retries with the same semantic digest, and changed-digest `409`
   conflicts; duplicate reservation reuse, delayed-cleanup reservation retention,
   deletion-confirmed release of retained staging capacity, exact
-  `default:project:no_op_admission` rate-limit entries, bound-staging cleanup by
+  `default:project:no_op_admission` and
+  `default:project:tus_staging:bytes`/`uploads` rate-limit entries,
+  deterministic completion-claim versus expiry-cutoff arbitration, bound-staging cleanup by
   the effective raw cutoff, quota exhaustion,
   distinct client-report item reservations, stable reordered and duplicate-item
   retries, and changed per-unit-key conflicts,

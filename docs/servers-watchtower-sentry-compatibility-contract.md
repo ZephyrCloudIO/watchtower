@@ -400,7 +400,13 @@ equal the completed TUS upload's actual byte count and the declared
 `Upload-Length`; the small JSON reference payload itself is not measured
 against that value. The upload is deliberately event-unbound: TUS creation
 stores no event ID and the pinned creation metadata remains only
-`attachment_type`. At binding, the adapter authorizes the collection DSN for
+`attachment_type`. At binding, the raw minidump descriptor uses the exact
+TUS-specific `watchtower.sentry.minidump.v1` metadata preimage: the SHA-256 of
+the completed identity-encoded upload bytes, an empty `annotations` object,
+and a `sentry` object containing only the normalized binding `event_id`.
+`release`, `dist`, and `platform` are omitted because this workflow supplies
+none, and multipart or Crashpad fields are never invented. The adapter then
+authorizes the collection DSN for
 the same tenant and project, requires the `Location` to resolve to that
 project-bound upload, and requires the Envelope/event ID to identify the
 accepted event in that same tenant and project. It evaluates the #17 raw
@@ -1722,8 +1728,9 @@ compressed bytes. A missing `sentry` part or missing/malformed `event_id`
 returns `400 invalid_request` before acceptance. Minidump submissions use the
 same cross-transport event-ID compatibility record as Envelope and legacy
 `store` ingestion. That record is keyed by
-`(tenant_id, project_id, external_event_id)`, stores the accepted transport
-digest, source protocol metadata, and canonical event reference. The #17 raw
+`(tenant_id, project_id, source_protocol, external_event_id)`, stores the accepted transport
+digest and canonical event reference, and keeps protocol namespaces isolated.
+The #17 raw
 admission fence governs whether it is still an admission duplicate or conflict:
 it lasts through the earlier of the seven-day default cutoff and the active
 project raw-retention cutoff from first acceptance, and is not extended by a
@@ -3087,12 +3094,13 @@ unsupported release-health behavior.
   identifiers are never reused across generations.
 - Supported event IDs from Envelope, legacy `store`, and minidump ingestion use
   one cross-transport compatibility record keyed by
-  `(tenant_id, project_id, external_event_id)`. Two projects may use the same
-  event ID without collision or disclosure, and source protocol is retained as
-  bounded identity metadata. The record stores the `alias_horizon_digest` and
-  canonical event reference for the current admission generation. It is a
+  `(tenant_id, project_id, source_protocol, external_event_id)`. Two projects
+  and two source protocols may use the same event ID without collision or
+  disclosure. The record stores the `alias_horizon_digest` and canonical event
+  reference for the current admission generation. It is a
   compatibility projection, not the raw-admission deduplication fence, but it
-  also owns the public alias while the referenced canonical event remains
+  and its permanent non-reuse fence both use the full tuple. It also owns the
+  public alias while the referenced canonical event remains
   queryable, for 90 days by default or the shorter effective query-retention
   cutoff. The separate #17 raw-admission duplicate and conflict fence lasts
   through the earlier of the seven-day default cutoff and the active project
@@ -3100,9 +3108,10 @@ unsupported release-health behavior.
   A matching retry resolves to the retained compatibility record by comparing
   `alias_horizon_digest`; conflicting primary content or attachment identity
   returns `409 conflict`. The projection cannot point to a later generation.
-  After the alias expires, the canonical reference may be retired, but an
-  Ingest-owned permanent payload-free event-ID non-reuse fence remains and
-  rejects any later public generation with `409 conflict`. An event ID is
+  After the alias expires, the canonical reference may be retired, but the
+  Ingest-owned permanent payload-free per-protocol event-ID non-reuse fence
+  remains and rejects any later public generation in that protocol with `409
+  conflict`. An event ID is
   never a canonical Watchtower primary key. An event ID carried only by an
   empty or excluded-only Envelope is not registered and may be reused by a
   later supported event.

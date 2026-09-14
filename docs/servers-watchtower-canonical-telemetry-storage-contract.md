@@ -178,9 +178,11 @@ its digest and size have been verified, and the acceptance metadata and
 transactional outbox commit. Orphaned or incomplete attempts are reconciled
 without being reported as successful acceptance. The raw object, acceptance
 metadata, and recoverable handoff remain until Processor durably confirms
-completion through the versioned `RawHandoffDispositionV1` message or Ingest
-durably records a class-default or shortened-policy expiry fence through
-`RawRetentionExpiryV1`.
+completion through a matching `RawHandoffCompletionClaimV1`; the versioned
+`RawHandoffDispositionV1` message may arrive later and is idempotent. Ingest
+may alternatively durably record a class-default or shortened-policy expiry
+fence through `RawRetentionExpiryV1`. The claim and expiry fence are mutually
+exclusive per handoff at the cutoff.
 
 TUS staging is a separate Ingest-owned boundary from accepted raw state. The
 staging record is authoritative for the project and upload identity, declared
@@ -204,13 +206,16 @@ reservation until physical deletion is confirmed; binding never permanently
 consumes capacity merely because the record is terminally bound.
 
 For a `completed` disposition, Processor commits the verified normalized replay
-representation before sending the disposition, so Ingest may retire raw state
-immediately without losing the reprocessing source. Ingest retries and
-reconciles pending handoffs while their raw acceptance remains eligible. If a
-handoff remains unprocessed at the seven-day class-default cutoff, the
-`RawRetentionExpiryV1` sweep causes Ingest to durably record `default_expired`
-and fence the handoff; it is not redelivered after the raw source or MSK
-handoff record expires, and late fetches or dispositions are rejected.
+representation and authoritative default-generation promotion together with a
+matching `RawHandoffCompletionClaimV1` before sending the disposition, so
+Ingest may retire raw state immediately without losing the reprocessing source.
+An unpromoted canonical candidate is not a completion claim. Ingest retries
+and reconciles pending handoffs while their raw acceptance remains eligible. If
+a handoff remains unprocessed at the seven-day class-default cutoff, the
+`RawRetentionExpiryV1` sweep first reconciles the durable claim: a matching
+claim wins, while its absence causes Ingest to durably record
+`default_expired` and fence the handoff. A later claim, fetch, or disposition
+cannot revive a fenced handoff.
 
 Canonical ClickHouse tables are partitioned monthly by `accepted_at` and
 ordered by:
@@ -678,11 +683,12 @@ shortened policy, it returns `default_expired` with
 `expiry_basis=class_default` and no retention-policy generation. If that cutoff
 arrives while Processor is unavailable, Jobs sends the versioned
 `RawRetentionExpiryV1` project-scoped sweep to Ingest. Ingest verifies the
-current cutoff, enumerates its own eligible acceptance state, durably records a
-`default_expired` fence for each handoff, retires each matching outbox entry,
-and purges the raw object and acceptance metadata without waiting for
-Processor. `RawPayloadFetchV1` and late Processor dispositions reject a handoff
-already fenced by Ingest expiry. When Ingest records that fence, it also emits
+current cutoff, enumerates its own eligible acceptance state, and reconciles
+each matching completion claim before recording a `default_expired` fence for
+an unclaimed handoff. It retires each matching outbox entry and purges the raw
+object and acceptance metadata without waiting for Processor. `RawPayloadFetchV1`
+and late Processor claims or dispositions reject a handoff already fenced by
+Ingest expiry. When Ingest records that fence, it also emits
 the durable project-scoped `RawHandoffExpiryFenceV1` to Processor. Processor
 persists the highest fence for the handoff and performs an authoritative
 current-cutoff and local-fence check immediately before committing or
@@ -1316,8 +1322,9 @@ Raw and export objects are checksum-validated. Reconciliation compares
 like-for-like dimensions: raw acceptance and handoff compare logical
 `watchtower_id` counts and ordered ID digests; before Ingest retires its
 recoverable state, each successfully completed handoff is generation-aware
-reconciled to the authoritative default-generation selection or a durable
-terminal disposition; canonical histories and replay compare physical
+reconciled to the authoritative default-generation selection, a matching
+`RawHandoffCompletionClaimV1`, or a durable terminal disposition; canonical
+histories and replay compare physical
 `(watchtower_id, processing_generation, canonical_content_digest)` counts and
 ordered content-aware digests; and Query projections and canonical exports
 compare the authoritative default-generation selection and canonical content
@@ -1494,11 +1501,12 @@ The owning implementation contracts must make these scenarios testable:
    `default_expired` disposition for an unprocessed handoff beyond the class
    default, the project-scoped Jobs-to-Ingest `RawRetentionExpiryV1` sweep
    during Processor outage, Ingest enumeration of expired state, rejection of
-   late fetches or dispositions after the Ingest expiry fence, durable
-   `RawHandoffExpiryFenceV1` delivery, and Processor's final cutoff/fence check
-   before canonical commit and publication, and
-   generation-aware reconciliation of each completed handoff to a promoted
-   canonical default or durable terminal disposition before raw retirement;
+   late fetches, completion claims, or dispositions after the Ingest expiry fence, durable
+   `RawHandoffExpiryFenceV1` delivery, Processor's durable completion claim and
+   final cutoff/fence check before canonical commit and publication, deterministic
+   claim-versus-expiry arbitration, and generation-aware reconciliation of each
+   completed handoff to a promoted canonical default or durable terminal
+   disposition before raw retirement;
    create, append, bind, expire, restore, and clean up positive-length TUS
    staging, including the `bound` state and its effective raw-cutoff cleanup
    deadline, and verify that its Ingest-owned S3/PostgreSQL boundaries retain
