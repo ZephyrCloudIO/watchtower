@@ -408,15 +408,17 @@ admission identity and attachment identity before transitioning the upload;
 the #16 Envelope identity
 `(tenant_id, project_id, external_event_id, payload_digest)` remains bounded
 compatibility metadata. An exact retry whose retained acceptance record already
-bound the same upload ID and attachment digest to the same event returns the
-original acceptance, even when the upload is now `bound`; it does not create a
-second attachment or transition. The retained binding record includes the
-upload ID, event ID, payload digest, attachment digest and length, and original
-acceptance. If the same raw admission identity matches a retained acceptance
-but references a different upload ID, or if the attachment identity differs,
-the adapter returns `409 conflict` without creating a second binding or
-attachment transition; the original binding remains authoritative and the
-other upload remains `complete-unbound` subject to expiry. A retry with the
+bound the same upload ID and complete attachment identity to the same event
+returns the original acceptance, even when the upload is now `bound`; it does
+not create a second attachment or transition. The retained binding record
+includes the upload ID, event ID, `attachment_identity_digest`, attachment
+digest and length, semantic `payload_digest`, and original acceptance. The
+attachment identity is compared independently of aggregate payload changes
+from auxiliary client reports. If the same raw admission identity matches a
+retained acceptance but references a different upload ID, or if the attachment
+identity differs, the adapter returns `409 conflict` without creating a second
+binding or attachment transition; the original binding remains authoritative
+and the other upload remains `complete-unbound` subject to expiry. A retry with the
 same event ID and different raw content remains the documented `409 conflict`
 under the #17 comparison; an otherwise unmatched `bound` upload remains
 inaccessible. Only a first acceptance requires `complete-unbound` with the

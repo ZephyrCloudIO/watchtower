@@ -308,6 +308,14 @@ actually supplied them. A known reset or dependency deadline is serialized as
 the ceiling of its remaining whole seconds, and the #16 fallback is exactly
 `Retry-After: 5` when no deadline can be evaluated.
 
+When the project-scoped `no_op_admission` count or rate bucket is exhausted,
+the active `X-Sentry-Rate-Limits` entry is exactly
+`<seconds>:default:project:no_op_admission`, with no namespace component. The
+singleton rate-limit headers and `Retry-After` describe that same project
+bucket. This class never uses `all`, `error`, or `attachment`, so exhausting
+no-op or client-report capacity does not suppress unrelated error or
+attachment traffic.
+
 ## Authentication, lifecycle, and environment admission
 
 Collection accepts only a current project-scoped collection DSN in the exact
@@ -440,12 +448,13 @@ payload-bearing request that reaches this fence after the query-retention alias
 expires returns `409 conflict` without creating a new generation.
 Ordinary parent-binding and attachment identity state remains alongside it
 until the same parent cutoff. For a bound TUS attachment, the minimal
-non-payload binding evidence—scoped parent/event identity, upload ID, semantic
-`payload_digest`, attachment digest and length, and original acceptance—remains
-through the effective query-retention alias cutoff while the canonical event is
-queryable. This evidence is sufficient to resolve an exact retry or a binding
-conflict after the raw object has retired; it never retains upload bytes, a
-usable object key or storage reference, credentials, or unrestricted payload.
+non-payload binding evidence—scoped parent/event identity, upload ID,
+`attachment_identity_digest`, semantic `payload_digest`, attachment digest and
+length, and original acceptance—remains through the effective query-retention
+alias cutoff while the canonical event is queryable. This evidence is
+sufficient to resolve an exact retry or a binding conflict after the raw object
+has retired; it never retains upload bytes, a usable object key or storage
+reference, credentials, or unrestricted payload.
 Deletion and lifecycle fences supersede all such state and cannot be reopened
 by retry or restore. A supported protocol that permits a missing event ID
 creates a new identity for every submission; later attachment association then
@@ -514,6 +523,13 @@ different content hash is a distinct immutable attachment, subject to parent
 and quota rules. Attachment length is checked against decoded or dereferenced
 bytes, never against compressed bytes or the TUS reference JSON.
 
+For retained TUS binding evidence, `attachment_identity_digest` is the
+lowercase SHA-256 of the RFC 8785 canonical encoding of that complete
+attachment identity tuple, including the presence or absence of `filename`.
+It is retained independently of the aggregate `payload_digest`; the TUS
+attachment identity also retains its validated byte length for binding
+comparison.
+
 Initial attachments are committed atomically with their parent error unit.
 The TUS upload is event-unbound until the subsequent Envelope binding. At
 binding, the DSN must authorize the same tenant and project, the parent event
@@ -525,18 +541,30 @@ Later attachments use the exact #16 correlation shape: an Envelope header with
 a normalized `event_id`, exactly one `attachment` item, zero or more
 `client_report` items, no `event` item, and no other supported item. The item
 may contain ordinary decoded bytes or the supported TUS reference. This unit
-requires a current collection DSN and an existing authorized parent acceptance
-within its effective raw-retention cutoff. It may arrive before the parent has
-completed processing, because parent
-processing order is asynchronous, but they may not arrive before the parent
-acceptance exists. A missing or inaccessible scoped parent returns `404
-not_found` with no attachment acceptance side effect. A known parent that is
-deleted, expired, fenced, or outside its effective cutoff returns `409
-conflict`. A later attachment never extends the parent or its deduplication
-window; its raw cutoff is the earlier of its own applicable raw-retention
-cutoff and the parent's remaining raw-retention cutoff. Parent linkage is
-resolved by the eligible scoped parent acceptance, never by an unscoped event
-ID or stale historical record.
+requires a current collection DSN. After authentication and lifecycle/deletion
+fence checks, a TUS reference first resolves retained binding evidence. A
+matching scoped parent/event identity, upload ID, `attachment_identity_digest`,
+attachment digest, and length returns the original acceptance as an exact
+retry, even after the parent's raw cutoff while its query-retention alias is
+still live. A mismatch in that retained binding identity returns `409 conflict`.
+Only when no retained binding matches does a new later-attachment admission
+require an existing authorized parent acceptance within its effective
+raw-retention cutoff. This retry exception never creates a new binding or
+bypasses lifecycle, deletion, tenant, or project fences. Auxiliary client
+reports follow the request-atomic rules above and may differ without changing
+the primary TUS attachment outcome; the aggregate `payload_digest` is not used
+to turn such a primary duplicate into a conflict.
+
+The unit may arrive before the parent has completed processing, because parent
+processing order is asynchronous, but it may not create a new binding before
+the parent acceptance exists. A missing or inaccessible scoped parent returns
+`404 not_found` with no attachment acceptance side effect. A known parent that
+is deleted, expired, fenced, or outside its effective cutoff returns `409
+conflict` for a new admission. A later attachment never extends the parent or
+its deduplication window; its raw cutoff is the earlier of its own applicable
+raw-retention cutoff and the parent's remaining raw-retention cutoff. Parent
+linkage is resolved by the eligible scoped parent acceptance, never by an
+unscoped event ID or stale historical record.
 
 ## Durable acceptance and handoff state machine
 
@@ -714,6 +742,15 @@ Staging exhaustion returns `429 rate_limited`; an unavailable or stale staging
 policy returns `503 unavailable`. These reservations are separate from error
 quantity and final attachment-byte charges.
 
+When a TUS upload binds, its staging record enters `bound` and records the
+attachment's effective raw-retention cutoff: the earlier of its own applicable
+raw cutoff and the parent attachment's remaining cutoff. Jobs includes bound
+staging in the cutoff cleanup sweep. Ingest must physically delete the bound
+staging bytes and record or fence that deletion no later than the cutoff;
+uncertain or failed deletion remains reconciliable and continues to consume
+the reservation. The `tus_staging` slot and bytes are released exactly once
+only after confirmed physical deletion.
+
 The project policy also includes a project-scoped `no_op_admission` count
 budget, rate budget, and rate window with a policy generation. The class applies
 to every durably accepted empty, unsupported-only, client-report-only, or
@@ -741,10 +778,12 @@ complete set of unit keys or it returns `409 conflict` without a new
 reservation. These per-unit identities apply equally to client reports that
 are auxiliary to an accepted event or correlated later attachment.
 
-Exhausted no-op count or rate capacity returns `429 rate_limited`; an absent,
-stale, or unsafe no-op policy returns `503 unavailable`. No-op admission
-reservations are separate from error-quantity and final attachment-byte
-charges, and they cannot be bypassed by the shared safe-backlog limit.
+Exhausted no-op count or rate capacity returns `429 rate_limited` with the
+exact active `default`/`project`/`no_op_admission` rate-limit entry defined
+above; an absent, stale, or unsafe no-op policy returns `503 unavailable`.
+No-op admission reservations are separate from error-quantity and final
+attachment-byte charges, and they cannot be bypassed by the shared safe-backlog
+limit.
 
 The admission sequence is:
 
@@ -807,16 +846,19 @@ no-op acceptance or retry tombstone, including one with a `completed_no_op`
 disposition. This sweep is mandatory when Processor is unavailable and is an
 idempotent safety net for any handoff that remains unresolved at the cutoff and
 for scheduled cleanup of terminal payload and no-op tombstones. Ingest verifies
-the current cutoff, enumerates its own eligible handoff, payload tombstone, and
-no-op tombstone state, records `default_expired` or `policy_rejected`,
-publishes `RawHandoffExpiryFenceV1` for any handoff, and removes or makes the
-raw object, acceptance metadata, outbox entry, payload reference, admission
-tombstone, parent-binding tombstone, or no-op tombstone unavailable as
-applicable. A `completed_no_op` tombstone releases its retained
-`no_op_admission` reservation only after confirmed physical cleanup, exactly
-once. Late fetches and dispositions are rejected as stale. Processor performs
-its final current-cutoff and local-fence check immediately before any canonical
-or derived commit.
+idempotently enumerates its own eligible handoff, payload tombstone, no-op
+tombstone, and bound staging state. For an unresolved handoff it records
+`default_expired` or `policy_rejected` and publishes
+`RawHandoffExpiryFenceV1`. A payload handoff with a terminal `completed`
+disposition, or a no-op tombstone with `completed_no_op`, receives no new
+disposition and no expiry fence; the sweep only removes or makes its terminal
+tombstone, raw object, acceptance metadata, outbox entry, payload reference,
+or bound staging bytes unavailable as applicable. A `completed_no_op` tombstone
+releases its retained `no_op_admission` reservation only after confirmed
+physical cleanup, exactly once. Bound staging cleanup likewise releases its
+staging reservation only after confirmed physical deletion. Late fetches and
+dispositions are rejected as stale. Processor performs its final current-cutoff
+and local-fence check immediately before any canonical or derived commit.
 
 Recovery is deterministic across each durable boundary:
 
@@ -887,8 +929,9 @@ The verification specification must use synthetic fixtures and prove:
   without retry extension, query-retention alias fencing while canonical events remain
   queryable, permanent payload-free event-ID non-reuse after alias expiry, a
   bound TUS retry after raw retention but before alias expiry using retained
-  upload/digest evidence, conflicting TUS binding evidence, missing IDs, and
-  deletion/restore fencing;
+  upload/attachment-identity evidence, a changed filename or attachment type
+  conflict, a client-report-only change that preserves the primary binding,
+  conflicting TUS binding evidence, missing IDs, and deletion/restore fencing;
 - equal and different attachment identities, initial-attachment multiset
   duplicate and conflict behavior, attachment-before-parent `404` handling,
   pre-processing attachment delivery, known expired/deleted/fenced parent
@@ -900,7 +943,9 @@ The verification specification must use synthetic fixtures and prove:
   no-op/client-report count/rate exhaustion and per-project isolation, repeated
   no-op retries with the same semantic digest, and changed-digest `409`
   conflicts; duplicate reservation reuse, delayed-cleanup reservation retention,
-  deletion-confirmed release of retained staging capacity, quota exhaustion,
+  deletion-confirmed release of retained staging capacity, exact
+  `default:project:no_op_admission` rate-limit entries, bound-staging cleanup by
+  the effective raw cutoff, quota exhaustion,
   distinct client-report item reservations, stable reordered and duplicate-item
   retries, and changed per-unit-key conflicts,
   environment registration/retirement/reactivation races, unsafe enforcement,
@@ -919,8 +964,9 @@ The verification specification must use synthetic fixtures and prove:
   processing generation or canonical result, no-op reservation retention until
   tombstone cleanup and exactly-once release, completed payload admission and
   parent-binding tombstone cleanup, backlog, quarantine, mandatory
-  Processor-outage and completed-no-op-tombstone expiry sweeps, retention
-  expiry, and deletion behavior; and
+  Processor-outage and completed-no-op-tombstone expiry sweeps, absence of
+  expiry dispositions or fences for terminal tombstones, retention expiry, and
+  deletion behavior; and
 - safe logs/traces/metrics, immediate risk paging, mTLS/ACL isolation,
   tenant-scoped references, N/N-1 message compatibility, and absence of raw
   payloads or credentials in diagnostics.

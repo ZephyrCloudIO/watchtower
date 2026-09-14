@@ -101,7 +101,7 @@ canonical telemetry.
 | Data class | Writer and authority | Storage boundary | Lifecycle |
 | --- | --- | --- | --- |
 | Raw accepted records and attachments | Ingest; authoritative for raw acceptance units under the [ingestion contract](servers-watchtower-ingestion-contract.md) | Encrypted immutable S3 objects plus Ingest PostgreSQL acceptance metadata and outbox state | Seven days from `accepted_at` by default; a project policy may shorten this cutoff but never extend it, and raw state may remain only until Processor durably confirms handoff completion or Ingest durably records class-default or shortened-policy expiry within that cutoff; never customer-downloadable |
-| TUS staging records and appendable bytes | Ingest; authoritative for pre-acceptance upload lifecycle, append state, binding, staging reservations, and deletion fences | Ingest-owned encrypted mutable S3 staging objects or multipart uploads plus Ingest PostgreSQL staging metadata, reservation state, and lifecycle-fence evidence | Pending and `complete-unbound` uploads retain their declared slot and bytes through the fixed 24-hour lifetime; binding creates the final attachment charge but does not release staging capacity; logical expiry blocks access, and confirmed physical deletion releases the staging reservation exactly once; never customer-, Processor-, or Query-readable |
+| TUS staging records and appendable bytes | Ingest; authoritative for pre-acceptance upload lifecycle, append state, binding, staging reservations, and deletion fences | Ingest-owned encrypted mutable S3 staging objects or multipart uploads plus Ingest PostgreSQL staging metadata, reservation state, and lifecycle-fence evidence | Pending and `complete-unbound` uploads retain their declared slot and bytes through the fixed 24-hour lifetime; binding transitions the record to `bound`, creates the final attachment charge, retains staging capacity, and records the attachment's effective raw-retention cutoff for cleanup no later than that cutoff; logical expiry blocks access, and confirmed physical deletion releases the staging reservation exactly once; never customer-, Processor-, or Query-readable |
 | Normalized records | Processor; authoritative only as processing input | Processor-owned encrypted S3 replay-batch prefix, with separate class metadata | Retained as needed for replay; when raw may retire after a successful handoff, a verified normalized representation has a retention floor through the applicable raw-retention cutoff even if a class policy is shorter, and is never retained longer than 90 days |
 | Enriched records | Processor; authoritative only as processing input | Processor-owned encrypted S3 replay-batch prefix, with separate class metadata | Retained only as needed for replay, no longer than 90 days |
 | Canonical telemetry | Processor; authoritative for the four signal histories | Four independent ClickHouse canonical table families | Immutable history for 90 days from `accepted_at` |
@@ -193,6 +193,15 @@ metadata with the staged object or multipart state, retains the reservation and
 blocks access when either side is uncertain, and releases capacity only after
 confirmed physical deletion. Processor receives bytes only through the normal
 post-acceptance owner-mediated handoff and never reads the staging prefix.
+
+When binding succeeds, the staging record becomes `bound` and records the
+earlier of the attachment's own applicable raw-retention cutoff and the
+parent's remaining raw-retention cutoff. Jobs schedules bound-staging cleanup
+through the project-scoped retention sweep, and Ingest physically deletes the
+staging bytes and records the deletion no later than that cutoff. A failed or
+uncertain cleanup remains fenced and retryable, retaining the staging
+reservation until physical deletion is confirmed; binding never permanently
+consumes capacity merely because the record is terminally bound.
 
 For a `completed` disposition, Processor commits the verified normalized replay
 representation before sending the disposition, so Ingest may retire raw state
@@ -1491,7 +1500,8 @@ The owning implementation contracts must make these scenarios testable:
    generation-aware reconciliation of each completed handoff to a promoted
    canonical default or durable terminal disposition before raw retirement;
    create, append, bind, expire, restore, and clean up positive-length TUS
-   staging and verify that its Ingest-owned S3/PostgreSQL boundaries retain
+   staging, including the `bound` state and its effective raw-cutoff cleanup
+   deadline, and verify that its Ingest-owned S3/PostgreSQL boundaries retain
    capacity through uncertainty and release it exactly once after confirmed
    deletion.
 4. Rebuild eligible canonical and derived Query projections through an
