@@ -111,7 +111,8 @@ The allowed protocol and data-flow direction is:
    retrieves referenced
    raw bytes only through Ingest's authenticated `RawPayloadFetchV1` interface,
    and Ingest's
-   durable expiry fence rejects late fetches, claims, or dispositions. Ingest also
+   durable expiry fence rejects late fetches, arbitration requests, and claims;
+   only a matching expiry disposition may close that fence idempotently. Ingest also
    publishes the durable `RawHandoffExpiryFenceV1` to Processor when it
    records an expiry fence.
 3. API accepts control-plane, release, artifact, and Sentry management
@@ -236,8 +237,9 @@ retrieves bounded authenticated selection pages, derived
    `policy_rejected`, or `default_expired` raw handoff when it remains
    authoritative. It suppresses late processing for an Ingest expiry fence,
    persists the highest `RawHandoffExpiryFenceV1` for each handoff, and performs
-   the authoritative cutoff and local-fence check immediately before canonical
-   commit and publication. A candidate canonical row without the matching
+   the authoritative owner-claim or expiry-outcome check immediately before
+   canonical commit and publication. A winning claim remains promotable across
+   the cutoff boundary; a candidate canonical row without the matching
    owner-recorded claim is not authoritative and is reconciled as a candidate
    if an expiry fence wins. Canonical changes use the Processor-owned
    `(tenant_id, project_id, signal_family)` partition and monotonic sequence
@@ -879,18 +881,19 @@ owner-recorded arbitration state before installing a terminal
 matching payload or no-op claim wins; without one, Ingest durably records the
 fence and retires each matching raw object, acceptance metadata, and outbox
 entry without waiting for Processor. A later `RawPayloadFetchV1`, arbitration
-request, completion claim, or `RawHandoffDispositionV1` delivery for a fenced
-handoff is rejected as stale and cannot publish or revive canonical work.
+request, or completion claim for a fenced handoff is rejected as stale and
+cannot publish or revive canonical work; only a matching expiry disposition
+may close the recorded fence outcome, idempotently.
 
 When Ingest records a class-default or shortened-policy expiry fence, it also
 publishes a versioned durable `RawHandoffExpiryFenceV1` message to Processor.
 The message carries the scoped `watchtower_id`, accepted-at cutoff, retention
 policy or class-default basis, fence generation, correlation identifier, and
-idempotency key. Processor persists the highest fence and must perform a
-final authoritative cutoff and local-fence check immediately before canonical
-or derived commit and
-publication; a denied check records the matching terminal disposition without
-publishing canonical changes.
+idempotency key. Processor persists the highest fence and must validate the
+owner-recorded claim or expiry outcome immediately before canonical or derived
+commit and publication; a claim granted before the cutoff remains valid across
+the wall-clock boundary. A denied check records the matching terminal
+disposition without publishing canonical changes.
 
 The raw-handoff completion path uses the authenticated owner-mediated unary
 `RawHandoffCompletionArbitrationV1` handshake from Processor to Ingest,
@@ -904,12 +907,15 @@ no processing generation, canonical result, or payload reference. Both variants
 also carry the scoped lowercase UUID v7 `watchtower_id`, `accepted_at`, effective
 cutoff, correlation identifier, and idempotency key. The disposition's bounded
 payload contains a terminal `disposition` of `completed`, `completed_no_op`,
-`policy_rejected`, or `default_expired`; `policy_rejected` includes the
-`retention_policy_generation`, and `default_expired` includes a bounded
-rejection reason with `expiry_basis=class_default` and no policy generation.
-Processor publishes the disposition through its durable outbox only after the
+`policy_rejected`, or `default_expired`. `completed` and `completed_no_op`
+match the successful completion claim; `policy_rejected` and `default_expired`
+carry the matching `RawHandoffExpiryFenceV1` identity, outcome, basis, and
+applicable policy generation, with no completion-claim fields. Processor
+publishes a completion disposition through its durable outbox only after the
 canonical result or payload-free no-op completion is covered by the successful
-claim; transient failures publish no terminal disposition. Ingest
+claim; it publishes an expiry disposition only after the owner-recorded expiry
+outcome is covered by the matching fence. Transient failures publish no
+terminal disposition. Ingest
 transactionally persists the disposition and idempotency state before retiring
 the matching outbox entry and eligible raw acceptance data. For
 `completed_no_op`, the bounded acceptance/retry tombstone remains live and the
@@ -1359,8 +1365,8 @@ become runtime acceptance criteria for the owning implementation issues:
    Ingest-authoritative project-scoped `RawRetentionExpiryV1` sweep durably
    records `default_expired` fences for Ingest-enumerated state, including
    `policy_rejected` and `default_expired`, and late Processor fetches or
-   dispositions and claims are rejected; admission stops at the documented capacity
-   boundary.
+   claims are rejected while a matching expiry disposition is accepted
+   idempotently; admission stops at the documented capacity boundary.
 3. Follow a native control command from Web to API through defense-in-depth
    authorization, authoritative persistence, and change publication.
 4. Follow a Sentry management read through API compatibility translation and

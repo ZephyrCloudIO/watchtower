@@ -207,6 +207,16 @@ uncertain cleanup remains fenced and retryable, retaining the staging
 reservation until physical deletion is confirmed; binding never permanently
 consumes capacity merely because the record is terminally bound.
 
+At each 24-hour logical expiry, Jobs also schedules a project-scoped staging
+expiry sweep for `pending` and `complete-unbound` records, including
+zero-length uploads. Ingest idempotently enumerates the expired unbound state,
+fences `HEAD`, `PATCH`, and binding, physically deletes its staging bytes and
+record, and records deletion or a retryable deletion fence. Uncertain or failed
+cleanup retains the reservation until physical deletion is confirmed; the
+staging slot and bytes are released exactly once after confirmation. This sweep
+is mandatory and separate from bound raw-retention cleanup, including while
+Processor is unavailable and during restore reconciliation.
+
 For a `completed` disposition, Processor stages the verified normalized replay
 representation, obtains the owner-mediated arbitration outcome from Ingest, and
 only then makes the authoritative default-generation promotion. Ingest records
@@ -214,13 +224,17 @@ the matching `RawHandoffCompletionClaimV1` in its own arbitration state before
 the disposition is sent, so raw retirement cannot depend on delayed message
 delivery. An unpromoted canonical candidate is not a completion claim. The same
 handshake has a no-op variant for payload-free completion and carries no
-canonical digest or processing generation. Ingest retries and reconciles
-pending handoffs while their raw acceptance remains eligible. If a handoff
-remains unprocessed at the seven-day class-default cutoff, the
-`RawRetentionExpiryV1` sweep serializes with the owner-mediated arbitration: a
-matching payload or no-op claim wins, while its absence causes Ingest to
-durably record `default_expired` and fence the handoff. A later claim, fetch, or
-disposition cannot revive a fenced handoff.
+canonical digest or processing generation. A claim granted while the handoff
+is eligible is the serialized cutoff decision and remains promotable if the
+clock crosses the cutoff before promotion; Processor's final check validates
+the owner decision and later lifecycle fences rather than rejecting solely on
+the newly crossed wall-clock cutoff. If a handoff remains unprocessed at the
+seven-day class-default cutoff, the `RawRetentionExpiryV1` sweep serializes with
+the owner-mediated arbitration: a matching payload or no-op claim wins, while
+its absence causes Ingest to durably record `default_expired` and fence the
+handoff. A later claim, fetch, or conflicting disposition cannot revive a fenced
+handoff; a matching expiry disposition may close the recorded expiry outcome
+idempotently.
 
 Canonical ClickHouse tables are partitioned monthly by `accepted_at` and
 ordered by:
@@ -682,22 +696,25 @@ post-commit phase or release any held revision until the required
 acknowledgements and normal hold-release command are durably accepted. Processor returns a durable
 `RawHandoffDispositionV1`
 message with a terminal
-`policy_rejected` disposition for each handoff rejected by the shortened policy;
-for an unprocessed handoff that crosses the seven-day class default without a
-shortened policy, it returns `default_expired` with
-`expiry_basis=class_default` and no retention-policy generation. If that cutoff
-arrives while Processor is unavailable, Jobs sends the versioned
-`RawRetentionExpiryV1` project-scoped sweep to Ingest. Ingest verifies the
-current cutoff, enumerates its own eligible acceptance state, and reconciles
-each matching owner-mediated completion arbitration before recording a
-`default_expired` fence for an unclaimed handoff. It retires each matching
-outbox entry and purges the raw
-object and acceptance metadata without waiting for Processor. `RawPayloadFetchV1`
-and late Processor arbitration requests, claims, or dispositions reject a
-handoff already fenced by Ingest expiry. When Ingest records that fence, it also emits
-the durable project-scoped `RawHandoffExpiryFenceV1` to Processor. Processor
-persists the highest fence for the handoff and performs an authoritative
-current-cutoff and local-fence check immediately before committing or
+`policy_rejected` disposition for each handoff rejected by the shortened policy
+and an owner-recorded expiry outcome. For an unprocessed handoff that crosses
+the seven-day class default without a shortened policy, the owner-recorded
+disposition is `default_expired` with `expiry_basis=class_default` and no
+retention-policy generation. Both variants carry the matching
+`RawHandoffExpiryFenceV1` identity, outcome, basis, and applicable policy
+generation rather than completion-claim fields. If that cutoff arrives while
+Processor is unavailable, Jobs sends the versioned `RawRetentionExpiryV1`
+project-scoped sweep to Ingest. Ingest verifies the current cutoff, enumerates
+its own eligible acceptance state, and reconciles each matching owner-mediated
+completion arbitration before recording a `default_expired` fence for an
+unclaimed handoff. It retires each matching outbox entry and purges the raw
+object and acceptance metadata without waiting for Processor.
+`RawPayloadFetchV1` and late Processor arbitration requests or completion claims
+reject a handoff already fenced by Ingest expiry; only a matching expiry
+disposition may close that fence, idempotently. When Ingest records that fence,
+it also emits the durable project-scoped `RawHandoffExpiryFenceV1` to Processor.
+Processor persists the highest fence for the handoff and validates the
+owner-recorded claim or expiry outcome immediately before committing or
 publishing any canonical or derived result. A denied final check records the
 appropriate terminal disposition and cannot publish canonical changes. Jobs
 owns a durable recurring
@@ -1507,18 +1524,19 @@ The owning implementation contracts must make these scenarios testable:
    `default_expired` disposition for an unprocessed handoff beyond the class
    default, the project-scoped Jobs-to-Ingest `RawRetentionExpiryV1` sweep
    during Processor outage, Ingest enumeration of expired state, rejection of
-   late fetches, arbitration requests, completion claims, or dispositions after
-   the Ingest expiry fence, durable `RawHandoffExpiryFenceV1` delivery,
-   Processor's owner-mediated completion claim and final cutoff/fence check
-   before canonical commit and publication, deterministic claim-versus-expiry
-   arbitration including the no-op variant, and generation-aware reconciliation of each
+   late fetches, arbitration requests, or completion claims after the Ingest
+   expiry fence, durable `RawHandoffExpiryFenceV1` delivery, matching expiry
+   dispositions, Processor's owner-mediated completion claim and claim-aware
+   final fence check before canonical commit and publication, deterministic
+   claim-versus-expiry arbitration including the no-op variant, and generation-aware reconciliation of each
    completed handoff to a promoted canonical default or durable terminal
    disposition before raw retirement;
-   create, append, bind, expire, restore, and clean up positive-length TUS
-   staging, including the `bound` state and its effective raw-cutoff cleanup
-   deadline, and verify that its Ingest-owned S3/PostgreSQL boundaries retain
-   capacity through uncertainty and release it exactly once after confirmed
-   deletion.
+   create, append, bind, logically expire, restore, and clean up zero-length and
+   positive-length TUS staging in `pending`, `complete-unbound`, and `bound`
+   states, including the unbound logical-expiry sweep and bound effective
+   raw-cutoff cleanup deadline, and verify that its Ingest-owned S3/PostgreSQL
+   boundaries retain capacity through uncertainty and release it exactly once
+   after confirmed deletion.
 4. Rebuild eligible canonical and derived Query projections through an
    authorized, durably acknowledged Query-to-Processor `ProjectionRebuildV1`
    request and Processor republishing without direct Processor storage access;

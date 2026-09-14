@@ -385,11 +385,17 @@ returns `401 invalid_authentication`.
 | Missing, stale, or unavailable security authority | `503 unavailable`, no acceptance side effect. |
 
 Environment names are data, not authorization boundaries. The first valid
-collection for an unregistered name requests an idempotent API-owned
-registration. Concurrent first registration, retirement, reactivation, and
-quota state serialize on `(tenant_id, project_id, environment_name,
-registration_generation)`. The initial active-environment limit is 1,000,
-including hidden entries. Capacity exhaustion is `429 rate_limited` with the
+collection for an unregistered name creates or resumes an idempotent API-owned
+`pending` registration tied to the admission group's correlation and
+idempotency identity. A pending registration reserves one slot against the
+1,000 active-environment limit but is not active, listable, or usable by other
+collections. It becomes `active` only when the matching durable acceptance
+commits. A failed admission group rolls the pending registration back
+idempotently; an uncertain post-acceptance activation remains retryable through
+the durable acceptance handoff and cannot roll back the committed acceptance.
+Concurrent first registration, retirement, reactivation, and quota state
+serialize on `(tenant_id, project_id, environment_name,
+registration_generation)`. Capacity exhaustion is `429 rate_limited` with the
 canonical environment-registration entry above and does not affect existing
 environments.
 
@@ -431,12 +437,13 @@ When an Envelope contains an event-bearing unit or a correlated later-attachment
 unit, that primary payload-bearing unit and any accompanying client-report or
 no-op units form one request-atomic admission group after structural validation.
 All primary and auxiliary reservations are evaluated and held before any new
-acceptance, charge, outbox, or handoff commit. A conflict, quota failure,
-temporary admission failure, or other rejection of either unit rolls back every
-new reservation, staged payload, acceptance, and handoff in the group. A new
-primary therefore cannot return `200` when an auxiliary `no_op_admission` or
-other reservation fails: an auxiliary quota failure returns its `429` response
-and active bucket, while an unavailable auxiliary dependency returns `503`.
+acceptance, charge, outbox, handoff, or pending-environment activation commit.
+A conflict, quota failure, temporary admission failure, or other rejection of
+either unit rolls back every new reservation, staged payload, acceptance,
+handoff, and pending registration in the group. A new primary therefore cannot
+return `200` when an auxiliary `no_op_admission` or other reservation fails: an
+auxiliary quota failure returns its `429` response and active bucket, while an
+unavailable auxiliary dependency returns `503`.
 When the primary is an already durable matching duplicate, that existing result
 cannot be rolled back; a failed auxiliary still creates no new auxiliary state
 and the request returns the auxiliary failure. Successful auxiliary units may
@@ -849,6 +856,16 @@ uncertain or failed deletion remains reconciliable and continues to consume
 the reservation. The `tus_staging` slot and bytes are released exactly once
 only after confirmed physical deletion.
 
+At each 24-hour logical expiry, Jobs must schedule a project-scoped staging
+expiry sweep for `pending` and `complete-unbound` records, including
+zero-length uploads. Ingest idempotently enumerates the expired unbound state,
+fences `HEAD`, `PATCH`, and binding, physically deletes its staging bytes and
+record, and records deletion or a retryable deletion fence. Uncertain or failed
+cleanup retains the reservation until physical deletion is confirmed; the
+staging slot and bytes are released exactly once after confirmation. This sweep
+is mandatory and separate from bound raw-retention cleanup, including while
+Processor is unavailable and during restore reconciliation.
+
 The project policy also includes a project-scoped `no_op_admission` count
 budget, rate budget, and rate window with a policy generation. The class applies
 to every durably accepted empty, unsupported-only, client-report-only, or
@@ -866,15 +883,25 @@ and confirmed physical cleanup release it exactly once; delayed or failed
 cleanup continues to consume the project count budget. Rate capacity expires
 at the configured window and is reconciled by the same reservation identity.
 
-For each client-report unit, the reservation and handoff identity additionally
-includes `unit_kind=client_report`, the canonical `client_report_item_digest`,
-and its zero-based occurrence among equal item digests in canonical item order.
-This keeps multiple and duplicate client-report items distinct while making
-reordered retries resolve to the same units. A standalone empty or
-unsupported-only unit uses `unit_kind=no_op`; a durable retry must match the
-complete set of unit keys or it returns `409 conflict` without a new
-reservation. These per-unit identities apply equally to client reports that
-are auxiliary to an accepted event or correlated later attachment.
+For a client report accompanying an event-bearing or correlated later-attachment
+unit, the base retry identity is
+`(tenant_id, project_id, client_request_id, primary_unit_identity)` when the
+caller supplied a valid canonical `X-Request-ID`. `primary_unit_identity` is
+the existing stable primary idempotency identity: the scoped raw-admission
+identity, admission generation, content identity, and initial-attachment
+identity multiset for an initial event, or the scoped parent/event and
+attachment-binding identity, upload ID, attachment digest, and length for a
+later attachment. It is never the semantic `payload_digest` alone. Each
+client-report unit then adds `unit_kind=client_report`, the canonical
+`client_report_item_digest`, and its zero-based occurrence among equal item
+digests in canonical item order. This keeps multiple and duplicate items
+distinct, makes reordered retries stable, and prevents response-loss retries
+from creating duplicate reservations or handoffs. Under one auxiliary base, a
+retry must reproduce the complete set of unit keys or it returns `409 conflict`
+without changing the primary acceptance. If no client request ID was supplied,
+the generated response request ID is diagnostic only and each auxiliary retry
+is a new submission. A standalone empty or unsupported-only unit retains the
+#16 identity and uses `unit_kind=no_op` instead.
 
 Exhausted no-op count or rate capacity returns `429 rate_limited` with the
 exact active `default`/`project`/`no_op_admission` rate-limit entry defined
@@ -959,10 +986,16 @@ completed outcome; a missing claim causes Ingest to record `default_expired` or
 `policy_rejected` and publish `RawHandoffExpiryFenceV1`. A `completed_no_op` tombstone
 releases its retained `no_op_admission` reservation only after confirmed
 physical cleanup, exactly once. Bound staging cleanup likewise releases its
-staging reservation only after confirmed physical deletion. Late fetches,
-arbitration requests, dispositions, and claims are rejected as stale after an
-expiry fence. Processor performs its final current-cutoff and local-fence check
-immediately before any canonical or derived commit.
+staging reservation only after confirmed physical deletion. The serialized
+arbitration decision is authoritative at the cutoff: a matching payload or
+no-op claim granted while the handoff is eligible remains the winning completed
+outcome, even if the wall clock crosses the cutoff before Processor promotes
+its staged candidate. Processor's final check must validate that owner-recorded
+claim and any later lifecycle fence, but a newly crossed cutoff alone cannot
+invalidate a winning claim. If no claim is granted before cutoff arbitration,
+the expiry fence wins. Late fetches, arbitration requests, and completion
+claims are rejected as stale after an expiry fence; a matching expiry
+disposition may close that owner-recorded expiry outcome idempotently.
 
 `RawHandoffCompletionArbitrationV1` is an authenticated, idempotent unary
 Processor-to-Ingest handshake under `/internal/v1`. Processor stages the
@@ -976,11 +1009,16 @@ wins; a pending arbitration record is retried by identity after a crash. A
 payload claim carries canonical lowercase UUID v7 `processing_generation` and
 canonical content digest. A no-op claim carries its bounded retry identity and
 semantic `payload_digest`, and explicitly carries neither processing generation
-nor canonical result. The normal `RawHandoffDispositionV1` remains terminal
-delivery on the asynchronous envelope and must match the owner-recorded claim;
-it is idempotent. If no matching claim exists when cutoff arbitration commits,
-the expiry fence wins and a later handshake, claim, or disposition cannot
-resurrect the handoff.
+nor canonical result. The normal `RawHandoffDispositionV1` remains terminal delivery
+on the asynchronous envelope and is idempotent. `completed` and
+`completed_no_op` dispositions must match the corresponding owner-recorded
+completion claim. `default_expired` and `policy_rejected` dispositions instead
+carry and must match the owner-recorded `RawHandoffExpiryFenceV1` identity,
+expiry outcome, basis, and applicable policy generation; they carry no
+completed-result claim fields. A matching expiry disposition closes the fence
+outcome idempotently, while a conflicting disposition is an integrity failure.
+If no matching claim exists when cutoff arbitration commits, the expiry fence
+wins and a later completion handshake or claim cannot resurrect the handoff.
 
 At every effective query-retention alias cutoff, Jobs schedules a project-scoped
 alias-retention cleanup run for Ingest. Ingest idempotently enumerates
@@ -1077,18 +1115,23 @@ The verification specification must use synthetic fixtures and prove:
   no-op/client-report count/rate exhaustion and per-project isolation, repeated
   no-op retries with the same semantic digest, and changed-digest `409`
   conflicts; duplicate reservation reuse, delayed-cleanup reservation retention,
-  deletion-confirmed release of retained staging capacity, exact
+  deletion-confirmed release of retained staging capacity, mandatory cleanup of
+  logically expired `pending` and `complete-unbound` TUS staging (including
+  zero-length uploads), exact
   `default:project:no_op_admission`,
   `default:project:environment_registration`,
   `default:project:attachment_bytes`, and
   `default:project:tus_staging:bytes`/`uploads` rate-limit entries,
   deterministic owner-mediated completion arbitration versus expiry-cutoff
-  ordering for payload and no-op claims, bound-staging cleanup by the effective
+  ordering for payload and no-op claims, promotion after a winning claim crosses
+  the cutoff, matching expiry dispositions, bound-staging cleanup by the effective
   raw cutoff, the 1,073,741,824-byte rolling-24-hour attachment quota,
   auxiliary-reservation rollback, and quota exhaustion,
   distinct client-report item reservations, stable reordered and duplicate-item
   retries, and changed per-unit-key conflicts,
-  environment registration/retirement/reactivation races, unsafe enforcement,
+  pending environment registration rollback and activation with durable
+  acceptance, response-loss reconciliation, environment
+  registration/retirement/reactivation races, unsafe enforcement,
   service overload, and bounded Retry-After behavior;
 - failures before and after S3 verification, PostgreSQL/outbox commit, MSK
   publication, Processor fetch/processing, disposition acknowledgement,
