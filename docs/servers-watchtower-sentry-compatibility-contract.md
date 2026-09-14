@@ -2229,6 +2229,32 @@ tie-breaker.
   A client-report-only Envelope uses `event: null`, an empty attachment array,
   and its canonical client-report records.
 
+  `alias_horizon_digest` is lowercase hexadecimal SHA-256 over the UTF-8 bytes
+  of the RFC 8785 canonical-JSON encoding of the primary event and its initial
+  attachment multiset only:
+
+  ```text
+  {
+    "schema": "watchtower.sentry.alias-horizon.v1",
+    "event": normalized_event_object,
+    "attachments": sort_by_canonical_json([
+      {
+        "content_type": string_or_null,
+        "filename": string_or_null,
+        "attachment_type": string_or_null,
+        "sha256": lowercase_hex_sha256(dereferenced_or_decoded_attachment_bytes),
+        "size": dereferenced_or_decoded_attachment_byte_count
+      }
+    ])
+  }
+  ```
+
+  It excludes auxiliary `client_report` units and is retained with the
+  compatibility alias for comparison after the raw-admission fence expires.
+  Therefore a matching primary event and initial attachment multiset remains
+  a matching alias retry when auxiliary reports are added, removed, or
+  changed; a primary or attachment change remains `409 conflict`.
+
   For admission accounting, each normalized `client_report` item also retains
   its item boundary. Its `client_report_item_digest` is the lowercase
   hexadecimal SHA-256 of the RFC 8785 canonical JSON bytes for that item's
@@ -2257,9 +2283,11 @@ tie-breaker.
   duplicate/conflict state may expire, but the same external event ID cannot create a new public
   generation while the older canonical event remains queryable. The
   compatibility record continues to own the alias through the effective query
-  retention cutoff; matching retries resolve to that record and conflicting
-  content returns `409 conflict`. Only after that alias fence expires may a new
-  public acceptance generation reuse the event ID.
+  retention cutoff; matching retries compare `alias_horizon_digest`, resolve to
+  that record, and allow auxiliary reports to vary independently. Conflicting
+  primary content or attachment identity returns `409 conflict`. After the
+  alias fence expires, the canonical reference may retire, but a permanent
+  payload-free event-ID fence still rejects reuse with `409 conflict`.
 - An accepted Envelope with no retained supported event item, excluding a
   correlated later-attachment unit, uses a separate
   no-op/client-report retry identity when the caller supplied a valid canonical
@@ -3035,21 +3063,23 @@ unsupported release-health behavior.
   one cross-transport compatibility record keyed by
   `(tenant_id, project_id, external_event_id)`. Two projects may use the same
   event ID without collision or disclosure, and source protocol is retained as
-  bounded identity metadata. The record stores the accepted transport digest
-  and canonical event reference for the current admission generation. It is a
+  bounded identity metadata. The record stores the `alias_horizon_digest` and
+  canonical event reference for the current admission generation. It is a
   compatibility projection, not the raw-admission deduplication fence, but it
   also owns the public alias while the referenced canonical event remains
   queryable, for 90 days by default or the shorter effective query-retention
   cutoff. The separate #17 raw-admission duplicate and conflict fence lasts
-  lasts through the earlier of the seven-day default cutoff and the active
-  project raw-retention cutoff from first acceptance and is not extended by
-  retries. A matching
-  retry resolves to the retained compatibility record; conflicting content or
-  an attempted new public generation returns `409 conflict`. The projection
-  cannot point to a later generation until the older alias fence expires. An
-  event ID is never a canonical Watchtower primary key. An event ID carried
-  only by an empty or excluded-only Envelope is not registered and may be
-  reused by a later supported event.
+  through the earlier of the seven-day default cutoff and the active project
+  raw-retention cutoff from first acceptance and is not extended by retries.
+  A matching retry resolves to the retained compatibility record by comparing
+  `alias_horizon_digest`; conflicting primary content or attachment identity
+  returns `409 conflict`. The projection cannot point to a later generation.
+  After the alias expires, the canonical reference may be retired, but an
+  Ingest-owned permanent payload-free event-ID non-reuse fence remains and
+  rejects any later public generation with `409 conflict`. An event ID is
+  never a canonical Watchtower primary key. An event ID carried only by an
+  empty or excluded-only Envelope is not registered and may be reused by a
+  later supported event.
 - API owns control-plane, project, DSN, release, artifact, operation, and audit
   authority. Ingest owns raw accepted records and recoverable handoff. Processor
   owns processing, canonical telemetry, symbolication, and derived issue data.
@@ -3225,8 +3255,11 @@ exercise:
   unsupported_media_type`;
 - duplicate, case-variant, malformed, and conflicting event IDs, including
   effective raw-admission-fence expiry while the canonical event remains
-  queryable, identical retries after environment retirement, and deletion
-  fencing; raw-byte differences such as compression-independent whitespace
+  queryable, auxiliary client-report changes that preserve the
+  `alias_horizon_digest`, primary-content conflicts after the raw fence,
+  permanent event-ID non-reuse after alias expiry, identical retries after
+  environment retirement, and deletion fencing; raw-byte differences such as
+  compression-independent whitespace
   or JSON ordering conflicts at admission while equivalent semantic
   `payload_digest` values remain deterministic downstream; message-only and
   stacktrace-only error events, exception events, deterministic multi-entry

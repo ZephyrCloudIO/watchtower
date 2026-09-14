@@ -423,14 +423,21 @@ retry while that alias is retained resolves to the existing compatibility
 record; conflicting content or an attempted new generation returns `409
 conflict`. The compatibility projection cannot replace the alias until the
 older canonical event leaves query visibility. The effective raw fence and
-this query-retention alias fence are independent; a new public acceptance
-generation may use the external event ID only after both have expired.
+this query-retention alias fence are independent. Expiry of both fences does
+not permit reuse: the scoped external event ID remains permanently reserved by
+an Ingest-owned non-payload fence, so a later public acceptance generation
+returns `409 conflict` rather than reusing the ID.
 
 When the raw handoff completes, raw objects, acceptance metadata, outbox state,
 and payload references may retire according to the storage contract, but an
 Ingest-owned non-payload admission tombstone remains through the effective
 raw-retention cutoff. It stores the scoped event identity, admission
 generation, content digest, original acceptance result, and applicable cutoff.
+Separately, the scoped external event ID has a permanent non-payload
+non-reuse fence that retains only its identity and first admission generation;
+it stores no event bytes, object key, payload digest, or storage reference. A
+payload-bearing request that reaches this fence after the query-retention alias
+expires returns `409 conflict` without creating a new generation.
 Ordinary parent-binding and attachment identity state remains alongside it
 until the same parent cutoff. For a bound TUS attachment, the minimal
 non-payload binding evidence—scoped parent/event identity, upload ID, semantic
@@ -627,8 +634,13 @@ ordinary attachment descriptor, `filename`, `content_type`, and
 `attachment_type` are serialized only when present in the accepted metadata.
 An absent field is omitted entirely, never encoded as `null`, an empty string,
 or a default value. Present fields and all retained descriptors use their
-accepted values in the canonical manifest. Each attachment section contains
-the validated decoded or dereferenced attachment bytes, and a minidump section
+accepted values in the canonical manifest. A TUS reference is the exception:
+because its section contains dereferenced binary upload bytes, its descriptor
+uses the effective payload type `application/octet-stream` and `kind: minidump`
+for v1 `event.minidump` uploads; the accepted
+`application/vnd.sentry.attachment-ref+json` request type is not presented as
+the section's binary media type. Each attachment section contains the
+validated decoded or dereferenced attachment bytes, and a minidump section
 contains the validated decompressed `upload_file_minidump` bytes. A minidump
 descriptor's `metadata` is the exact
 normalized `watchtower.sentry.minidump.v1` digest object, including the Sentry
@@ -873,9 +885,10 @@ The verification specification must use synthetic fixtures and prove:
 - concurrent identical event IDs, conflicting decompressed bytes, compressed
   retries, whitespace changes, protocol scope, effective raw-cutoff expiry
   without retry extension, query-retention alias fencing while canonical events remain
-  queryable, a bound TUS retry after raw retention but before alias expiry using
-  retained upload/digest evidence, conflicting TUS binding evidence, missing
-  IDs, and deletion/restore fencing;
+  queryable, permanent payload-free event-ID non-reuse after alias expiry, a
+  bound TUS retry after raw retention but before alias expiry using retained
+  upload/digest evidence, conflicting TUS binding evidence, missing IDs, and
+  deletion/restore fencing;
 - equal and different attachment identities, initial-attachment multiset
   duplicate and conflict behavior, attachment-before-parent `404` handling,
   pre-processing attachment delivery, known expired/deleted/fenced parent
@@ -901,7 +914,8 @@ The verification specification must use synthetic fixtures and prove:
   mapping, no-op reservation lifecycle and operating-value validation,
   deterministic multipart minidump digests with retained metadata,
   deterministic `RawUnitContainerV1` framing/digests with unknown event-member
-  removal and absent attachment-field omission, `completed_no_op` without a
+  removal, effective media typing for dereferenced TUS minidumps, and absent
+  attachment-field omission, `completed_no_op` without a
   processing generation or canonical result, no-op reservation retention until
   tombstone cleanup and exactly-once release, completed payload admission and
   parent-binding tombstone cleanup, backlog, quarantine, mandatory
