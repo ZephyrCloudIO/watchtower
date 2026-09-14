@@ -772,16 +772,21 @@ new acceptance before the final commit; restore cannot reopen the project or
 revive a deleted DSN, event dedup record, parent, attachment, reservation, or
 handoff.
 
-At every effective raw cutoff, when no matching terminal disposition has been
-durably recorded, Jobs must send the project-scoped `RawRetentionExpiryV1`
-sweep. This sweep is mandatory when Processor is unavailable and is an
-idempotent safety net for any handoff that remains unresolved at the cutoff.
-Ingest verifies the current cutoff, enumerates its own eligible state, records
-`default_expired` or `policy_rejected`, publishes
-`RawHandoffExpiryFenceV1`, and removes or makes the raw object, acceptance
-metadata, outbox entry, and payload reference unavailable. Late fetches and
-dispositions are rejected as stale. Processor performs its final current-cutoff
-and local-fence check immediately before any canonical or derived commit.
+At every effective raw cutoff, Jobs must send the project-scoped
+`RawRetentionExpiryV1` sweep for each eligible handoff whose terminal
+disposition is absent and for each expiry-eligible no-op acceptance or retry
+tombstone, including one with a `completed_no_op` disposition. This sweep is
+mandatory when Processor is unavailable and is an idempotent safety net for any
+handoff that remains unresolved at the cutoff and for scheduled cleanup of
+terminal no-op tombstones. Ingest verifies the current cutoff, enumerates its
+own eligible handoff and tombstone state, records `default_expired` or
+`policy_rejected`, publishes `RawHandoffExpiryFenceV1` for any handoff, and
+removes or makes the raw object, acceptance metadata, outbox entry, payload
+reference, or no-op tombstone unavailable as applicable. A `completed_no_op`
+tombstone releases its retained `no_op_admission` reservation only after
+confirmed physical cleanup, exactly once. Late fetches and dispositions are
+rejected as stale. Processor performs its final current-cutoff and local-fence
+check immediately before any canonical or derived commit.
 
 Recovery is deterministic across each durable boundary:
 
@@ -842,8 +847,8 @@ The verification specification must use synthetic fixtures and prove:
   item, response, retry header, and no-payload guarantee;
 - valid errors, native crashes, initial attachments, later attachments,
   client reports, no-ops, payload-bearing mixed-request rejection rollback for
-  event and later-attachment units, atomic invalid units, and independent
-  valid-unit behavior;
+  event and later-attachment units, including auxiliary client-report
+  atomicity, atomic invalid units, and independent valid-unit behavior;
 - missing, malformed, rotated, revoked, cross-project, suspended, deleted,
   stale, and concurrently revoked DSNs, including 60-second projection and
   immediate-fence boundaries;
@@ -879,8 +884,8 @@ The verification specification must use synthetic fixtures and prove:
   removal and absent attachment-field omission, `completed_no_op` without a
   processing generation or canonical result, no-op reservation retention until
   tombstone cleanup and exactly-once release, completed-disposition tombstones,
-  backlog, quarantine, mandatory
-  Processor-outage expiry sweeps, retention expiry, and deletion behavior; and
+  backlog, quarantine, mandatory Processor-outage and completed-no-op-tombstone
+  expiry sweeps, retention expiry, and deletion behavior; and
 - safe logs/traces/metrics, immediate risk paging, mTLS/ACL isolation,
   tenant-scoped references, N/N-1 message compatibility, and absence of raw
   payloads or credentials in diagnostics.

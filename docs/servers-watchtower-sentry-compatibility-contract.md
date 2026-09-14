@@ -1964,7 +1964,10 @@ comparison. A missing, malformed, or mismatched value is rejected with
 its accepted event or its resolved existing parent.
 
 A later-attachment Envelope has a valid normalized envelope-level `event_id`,
-exactly one `attachment` item, no `event` item, and no other supported item.
+exactly one `attachment` item, zero or more `client_report` items, no `event`
+item, and no other supported item. The `client_report` items are auxiliary
+bounded units; they do not change the attachment's correlated parent or its
+request-atomic admission outcome.
 The envelope-level ID is the scoped external ID of an already accepted parent;
 the attachment item carries no parent or event-ID field. This shape is a
 payload-bearing later-attachment unit, not an attachment-only no-op. The
@@ -3181,7 +3184,8 @@ exercise:
   binding, and the logical deletion fence at the exact expiry boundary;
 - empty, unsupported-only, client-report-only, uncorrelated attachment-only,
   supported-only, mixed, and correlated later-attachment Envelopes, including
-  unassociated-attachment exclusion and an envelope-level event ID on an
+  correlated later attachments with auxiliary client reports,
+  unassociated-attachment exclusion, and an envelope-level event ID on an
   excluded-only Envelope, all expecting the applicable `200`
   with a zero-length response body, plus malformed, non-canonical, and duplicate
   `X-Request-ID` headers returning `400 invalid_request` before lookup or
