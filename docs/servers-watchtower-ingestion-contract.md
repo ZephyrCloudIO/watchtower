@@ -74,8 +74,19 @@ Processor handoff. Each upload nevertheless reserves one project-scoped
 `tus_staging` slot and its declared `Upload-Length` bytes at creation,
 including a slot for a zero-length upload. The reservation is keyed by the
 upload ID and covers both `pending` and `complete-unbound` states; `PATCH`
-cannot exceed it or extend it. Binding records the final attachment-byte
-charge but retains the `tus_staging` reservation; it does not release or
+cannot exceed it or extend it. When the caller supplies a valid `X-Request-ID`,
+creation also records an idempotency result scoped to the authenticated tenant,
+project, and exact `Upload-Length`/metadata preimage. The upload allocation,
+staging reservation, and that result commit atomically. A retry with the same
+request identity and preimage returns the original `201` and exact `Location`
+and TUS response headers without creating another upload or reservation; reuse
+of the identity with a different length or metadata returns `409 conflict`
+without mutation. The mapping remains live while the upload can be retried and
+is replaced by a non-payload creation tombstone through the retry horizon after
+physical cleanup is confirmed, so response-loss recovery cannot create a second
+staging record. An absent `X-Request-ID` uses the generated request ID for
+diagnostics only and does not provide response-loss idempotency. Binding records
+the final attachment-byte charge but retains the `tus_staging` reservation; it does not release or
 transfer staging capacity while the staging record or its bytes still exist.
 Logical expiry blocks `HEAD`, `PATCH`, and binding. Confirmed physical
 deletion, including lifecycle cleanup, releases the staging slot and bytes
@@ -283,7 +294,9 @@ A mixed request returns the same `200` response only when no payload-bearing
 unit is rejected and at least one unit is accepted. A standalone no-op that
 passes its `no_op_admission` reservation and other dependency checks also
 returns `200` with the same headers.
-Envelope `OPTIONS` returns `204`. TUS creation returns `201`; successful TUS
+Envelope `OPTIONS` returns `204`. TUS creation returns `201`; an exact TUS
+creation retry returns the original `201` and `Location` without a new staging
+reservation; successful TUS
 `HEAD` returns `200`; successful TUS `PATCH` returns `204`; each retains the
 exact #16 TUS headers. A failed TUS `HEAD` is bodyless, and a failed TUS
 `PATCH` uses the standard JSON error and never appends bytes.
@@ -846,8 +859,10 @@ Bytes leave the rolling bucket at their recorded acceptance time plus 24 hours.
 In addition to final accepted-unit charges, the project policy includes a
 project-scoped TUS staging byte budget and upload-count budget with a policy
 generation. Ingest owns an idempotent `tus_staging` reservation keyed by
-tenant, project, upload ID, and policy generation. Creation reserves one slot
-and the declared upload bytes before any staging write; append uses only that
+tenant, project, upload ID, and policy generation, plus a creation-idempotency
+record keyed by tenant, project, and caller-supplied `X-Request-ID`. Creation
+reserves one slot and the declared upload bytes before any staging write and
+atomically binds that result to the generated upload ID; append uses only that
 reservation. Binding creates the final attachment reservation while retaining
 the `tus_staging` reservation. Logical expiry, cancellation, and lifecycle
 fencing stop access but retain the staging reservation until the bytes and
@@ -1085,6 +1100,7 @@ Recovery is deterministic across each durable boundary:
 | During/after S3 write before verification | Verify size/digest; delete or quarantine the incomplete orphan without acknowledging it. |
 | After S3 verification before PostgreSQL commit | Reconcile the object against the idempotent acceptance identity; either commit the full acceptance or clean the orphan. Never report success from S3 existence alone. |
 | After PostgreSQL/outbox commit before response | Treat response loss as unknown; retry resolves the one committed acceptance or conflict and reuses one charge. |
+| After TUS creation commit before the `201` response | Treat response loss as unknown; a retry with the same caller-supplied `X-Request-ID` and creation preimage replays the original `Location` and reuses the one upload, slot, and byte reservation. |
 | After local commit before MSK publication | Outbox publication resumes; public success remains durable and recoverable. |
 | After duplicate MSK delivery | Processor applies the same handoff identity idempotently. |
 | After Processor fetch or processing before disposition | Redelivery resumes the same raw-unit outcome; Ingest retains raw state through a provisional or finalized claim until a matching terminal disposition or expiry/lifecycle fence. Processor publishes no canonical change until Ingest acknowledges the recorded completed disposition. A completed disposition or `completed_no_op` disposition leaves the minimal admission and parent-binding tombstones through their cutoffs. An expiry-fenced claim publishes no canonical result, and a lifecycle-fenced claim publishes no canonical result. For `completed_no_op`, the no-op reservation remains held until tombstone expiry and confirmed physical cleanup. |
@@ -1148,7 +1164,9 @@ The verification specification must use synthetic fixtures and prove:
   evidence, permanent payload-free event-ID non-reuse after alias expiry, a
   bound TUS retry after raw retention but before alias expiry using retained
   upload/attachment-identity evidence, a changed filename or attachment type
-  conflict, a client-report-only change that preserves the primary binding,
+  conflict, a TUS creation response-loss retry with the same caller-supplied
+  `X-Request-ID` that replays the original `Location` without another staging
+  reservation, changed creation metadata conflict, a client-report-only change that preserves the primary binding,
   conflicting TUS binding evidence, retained original TUS `Location` comparison
   after public-origin/base-path changes and raw cleanup, missing IDs, and
   deletion/restore fencing;

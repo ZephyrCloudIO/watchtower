@@ -231,9 +231,10 @@ Ingest, and invokes its finalization phase immediately before authoritative
 default-generation promotion. Ingest records the matching provisional
 `RawHandoffCompletionClaimV1` and then serializes finalization with pending and
 active retention/deletion fences. `claim_finalized` permits candidate commit
-before a raw-expiry fence, but canonical promotion remains gated on the
-matching terminal disposition acknowledgement; a project-deletion fence leaves
-an already finalized claim as a deletion dependency. A
+before a raw-expiry fence, and a later retention/deletion lifecycle fence does
+not invalidate a claim whose finalization already won; canonical promotion
+remains gated on the matching terminal disposition acknowledgement, and the
+resulting canonical state remains a lifecycle-purge dependency. A
 `lifecycle_fenced` result records `RawHandoffLifecycleFenceV1`, forbids
 promotion, and requires a matching `lifecycle_rejected` disposition. The same
 handshake has a no-op variant for payload-free completion and carries no
@@ -281,27 +282,34 @@ ClickHouse using the partition and sequence identity. After verifying the same
 digest, it marks the staging record `clickhouse_committed`; only that state is
 eligible for durable outbox publication. Processor performs the final
 owner-mediated completion check before committing the row. A matching
-`claim_finalized` result permits commit only while the handoff remains before
-an expiry or lifecycle fence; a provisional claim without finalization, or a
-`lifecycle_fenced` result, cannot commit or publish. If that check fails before commit
-without a terminally eligible claim, the
+`claim_finalized` result permits commit while no raw-expiry fence has won; it
+remains eligible across a later retention/deletion lifecycle fence when
+finalization won first. A provisional claim without finalization, or a
+`lifecycle_fenced` result, cannot commit or publish. If that check fails before
+commit without a terminally eligible claim, the
 reconciler marks the staged write retention/lifecycle-fenced and, after proving
 that no authoritative row exists, publishes an idempotent no-row
 `CanonicalChangeSkipV1` marker for the reserved sequence through the same
 canonical-change path. If ClickHouse committed the row while it was still
 within its cutoff and canonical publication then failed, recovery verifies its
 digest and marks the staging record `clickhouse_committed`. Processor delivers
-the matching terminal `completed` `RawHandoffDispositionV1` to Ingest and
-waits for Ingest's idempotent durable-recording acknowledgement before
-publishing the actual canonical change. If the current cutoff arrives after
-ClickHouse commits the row but before that acknowledgement, recovery marks
+the matching terminal `completed` `RawHandoffDispositionV1` to Ingest for an
+initial handoff and waits for Ingest's idempotent durable-recording
+acknowledgement before publishing the actual canonical change. A reprocessing
+candidate does not issue a second disposition; its original terminal
+disposition and reprocessing lifecycle/publication checks remain the evidence.
+If the raw-retention cutoff arrives
+after ClickHouse commits the row but before that acknowledgement, recovery marks
 the staging record retention/lifecycle-expired, removes the authoritative row,
 verifies its absence, and publishes the idempotent no-row
 `CanonicalChangeSkipV1` marker. If the disposition was durably acknowledged
-before the cutoff and canonical publication then failed, recovery retains the
-row and publishes the actual canonical change. Canonical publication cannot
-precede that acknowledgement, so it never publishes a skip while the row exists
-or publishes an expired row. A skip after
+before the raw-retention cutoff and canonical publication then failed, recovery
+retains the row and publishes the actual canonical change. A later
+retention/deletion lifecycle fence does not remove a row whose claim finalized
+first; its canonical state remains subject to the owning purge or
+anonymization dependency. Canonical publication cannot precede the required
+initial-handoff acknowledgement, so it never publishes a skip while the row
+exists or publishes an expired row. A skip after
 a reconciliation attempt is valid only after the row is durably removed and
 its absence is verified. The marker carries the partition, sequence, retention
 cutoff, expiry basis, marker integrity digest, and idempotency context; Query
@@ -915,21 +923,28 @@ an eligible raw source or a verified normalized replay representation is
 rejected rather than reprocessed from an unverified or unavailable source.
 
 A new result uses a new UUID v7 `processing_generation` and is a candidate until
-the complete requested range passes integrity validation. Processor commits each
-candidate row to canonical ClickHouse, obtains Ingest's durable acknowledgement
-for the matching terminal `completed` disposition, and then durably publishes
-its canonical change before it can promote that row's authoritative
-default-generation mapping.
+the complete requested range passes integrity validation. For initial handoff
+processing, Processor commits each candidate row to canonical ClickHouse,
+obtains Ingest's durable acknowledgement for the matching terminal `completed`
+disposition, and then durably publishes its canonical change. Reprocessing a
+previously completed record from a verified normalized replay representation
+does not issue a second raw-handoff disposition: its original terminal
+disposition and verified replay source are the handoff evidence, while the
+reprocessing attempt uses its own final lifecycle-eligibility and publication
+confirmation checks. Both paths promote the authoritative default-generation
+mapping only after the complete requested range succeeds.
 Publication confirmation is the existing Processor durable canonical publication
 state and published-contiguous watermark. It does not require a successful
 Query projection acknowledgement before initial publication, but a missing
 local confirmation is reconciled through `CanonicalPublicationReconcileV1`
 before an expired intent can become a skip. Promotion performs the
 owner-mediated finalization and row-existence check, treating a matching
-`claim_finalized` result as eligible only while no expiry or lifecycle fence
-has won, and requires the matching Ingest disposition acknowledgement before
-canonical publication. A provisional claim or `lifecycle_fenced` result cannot
-become authoritative. It updates the mapping only
+`claim_finalized` result as eligible while no raw-expiry fence has won. For an
+initial handoff candidate, the matching Ingest disposition acknowledgement is
+required before canonical publication; a reprocessing candidate uses its
+original terminal handoff evidence and reprocessing lifecycle/publication
+checks instead. A provisional claim or `lifecycle_fenced` result cannot become
+authoritative. It updates the mapping only
 after every candidate row has publication confirmation and the full range
 succeeds. A partial or failed range, an unconfirmed publication, or a failed
 final eligibility or row-existence check never becomes the default and the
@@ -1389,9 +1404,13 @@ operational boundary.
 Raw and export objects are checksum-validated. Reconciliation compares
 like-for-like dimensions: raw acceptance and handoff compare logical
 `watchtower_id` counts and ordered ID digests; before Ingest retires its
-recoverable state, each successfully completed handoff is generation-aware
-reconciled to the authoritative default-generation selection and a matching
-Ingest-recorded terminal disposition with its publication acknowledgement; canonical
+recoverable state, each successfully completed payload-bearing handoff is
+generation-aware reconciled to the authoritative default-generation selection
+and a matching Ingest-recorded terminal disposition with its publication
+acknowledgement; a `completed_no_op` handoff is instead reconciled by its
+matching terminal no-op disposition and no-op tombstone/reservation cleanup
+evidence, with no default-generation selection or canonical publication
+required; canonical
 histories and replay compare physical
 `(watchtower_id, processing_generation, canonical_content_digest)` counts and
 ordered content-aware digests; and Query projections and canonical exports
@@ -1540,8 +1559,10 @@ The owning implementation contracts must make these scenarios testable:
    as a row, while a cutoff before acknowledgement removes the row, verifies
    its absence, and publishes the idempotent skip. A winning completion claim
    finalized while eligible is insufficient by itself; a stalled finalized
-   claim is fenced and its row is removed when the cutoff arrives before the
-   disposition acknowledgement. Also verify that a
+   claim is fenced and its row is removed when the raw-retention cutoff arrives
+   before the disposition acknowledgement, while a finalized claim that
+   survives a later lifecycle fence is published after acknowledgement and
+   remains a purge dependency. Also verify that a
    provisional claim canceled by a retention/deletion fence produces no
    canonical row and a matching lifecycle disposition. For a row without an
    Ingest-recorded terminal completion before the cutoff, a cutoff reached
@@ -1585,9 +1606,11 @@ The owning implementation contracts must make these scenarios testable:
    expiry/lifecycle dispositions, Processor's owner-mediated claim and
    finalization check before canonical commit and publication, deterministic
    claim-versus-expiry/lifecycle arbitration including the no-op variant, and
-   generation-aware reconciliation of each
-   completed handoff to a promoted canonical default or durable terminal
-   disposition before raw retirement;
+   generation-aware reconciliation of each completed payload-bearing handoff to
+   a promoted canonical default or durable terminal disposition before raw
+   retirement; reconcile each `completed_no_op` handoff through its terminal
+   no-op disposition and cleanup evidence without requiring a canonical
+   selection;
    create, append, bind, logically expire, restore, and clean up zero-length and
    positive-length TUS staging in `pending`, `complete-unbound`, and `bound`
    states, including the unbound logical-expiry sweep and bound effective
@@ -1842,7 +1865,7 @@ The owning implementation contracts must make these scenarios testable:
    normalized or enriched processing-input replay batch before reprocessing or
    canonical publication; and successfully reprocess a record through its
    verified normalized replay representation after raw state was retired before
-   the seven-day cutoff.
+   the seven-day cutoff without requesting a second raw-handoff disposition.
 8. Attempt cross-tenant access through PostgreSQL, ClickHouse, S3, MSK,
    projections, exports, and break-glass workflows; verify denial and required
    audit evidence.

@@ -255,9 +255,11 @@ retrieves bounded authenticated selection pages, derived
    fence for each handoff, and performs the authoritative finalization outcome
    check immediately before canonical commit. It requires the Ingest
    disposition acknowledgement immediately before canonical publication. A
-   claim finalized before a later lifecycle fence remains eligible for commit
-   and publication only after that acknowledgement; an unfinalized claim that
-   receives `lifecycle_fenced` is never promoted and its candidate is discarded.
+   claim finalized before a later retention/deletion lifecycle fence remains
+   eligible for commit and publication after that acknowledgement; the
+   resulting canonical state remains a lifecycle cleanup or purge dependency.
+   An unfinalized claim that receives `lifecycle_fenced` is never promoted and
+   its candidate is discarded.
    A candidate canonical row without the matching finalized claim is not
    authoritative. Canonical changes use the Processor-owned
    `(tenant_id, project_id, signal_family)` partition and monotonic sequence
