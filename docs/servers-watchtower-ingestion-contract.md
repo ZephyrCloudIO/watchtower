@@ -74,12 +74,13 @@ Processor handoff. Each upload nevertheless reserves one project-scoped
 `tus_staging` slot and its declared `Upload-Length` bytes at creation,
 including a slot for a zero-length upload. The reservation is keyed by the
 upload ID and covers both `pending` and `complete-unbound` states; `PATCH`
-cannot exceed it or extend it. Binding atomically converts the reservation to
-the final attachment-byte charge. Logical expiry blocks `HEAD`, `PATCH`, and
-binding, but does not release the reservation while the staging record or its
-bytes still exist. Confirmed physical deletion, including lifecycle cleanup,
-releases the slot and bytes exactly once; delayed or failed cleanup therefore
-continues to consume the project staging budget. Exhausted staging capacity
+cannot exceed it or extend it. Binding records the final attachment-byte
+charge but retains the `tus_staging` reservation; it does not release or
+transfer staging capacity while the staging record or its bytes still exist.
+Logical expiry blocks `HEAD`, `PATCH`, and binding. Confirmed physical
+deletion, including lifecycle cleanup, releases the staging slot and bytes
+exactly once; delayed or failed cleanup therefore continues to consume the
+project staging budget. Exhausted staging capacity
 returns `429 rate_limited`; an unavailable staging-capacity projection returns
 `503 unavailable`.
 
@@ -513,11 +514,12 @@ project-bound upload. An exact retry of an existing binding reuses it; a
 different upload or digest for the same binding identity is `409 conflict`.
 
 Later attachments use the exact #16 correlation shape: an Envelope header with
-a normalized `event_id`, exactly one `attachment` item, no `event` item, and no
-other supported item. The item may contain ordinary decoded bytes or the
-supported TUS reference. They require a current collection DSN and an existing
-authorized parent acceptance within its effective raw-retention cutoff. They
-may arrive before the parent has completed processing, because parent
+a normalized `event_id`, exactly one `attachment` item, zero or more
+`client_report` items, no `event` item, and no other supported item. The item
+may contain ordinary decoded bytes or the supported TUS reference. This unit
+requires a current collection DSN and an existing authorized parent acceptance
+within its effective raw-retention cutoff. It may arrive before the parent has
+completed processing, because parent
 processing order is asynchronous, but they may not arrive before the parent
 acceptance exists. A missing or inaccessible scoped parent returns `404
 not_found` with no attachment acceptance side effect. A known parent that is
@@ -690,10 +692,11 @@ project-scoped TUS staging byte budget and upload-count budget with a policy
 generation. Ingest owns an idempotent `tus_staging` reservation keyed by
 tenant, project, upload ID, and policy generation. Creation reserves one slot
 and the declared upload bytes before any staging write; append uses only that
-reservation. Binding converts it to the final attachment reservation, while
-logical expiry, cancellation, and lifecycle fencing stop access but retain the
-staging reservation until the bytes and staging record are physically deleted;
-deletion-confirmation reconciliation releases it exactly once.
+reservation. Binding creates the final attachment reservation while retaining
+the `tus_staging` reservation. Logical expiry, cancellation, and lifecycle
+fencing stop access but retain the staging reservation until the bytes and
+staging record are physically deleted; deletion-confirmation reconciliation
+then releases the staging reservation exactly once.
 Staging exhaustion returns `429 rate_limited`; an unavailable or stale staging
 policy returns `503 unavailable`. These reservations are separate from error
 quantity and final attachment-byte charges.
@@ -774,19 +777,22 @@ handoff.
 
 At every effective raw cutoff, Jobs must send the project-scoped
 `RawRetentionExpiryV1` sweep for each eligible handoff whose terminal
-disposition is absent and for each expiry-eligible no-op acceptance or retry
-tombstone, including one with a `completed_no_op` disposition. This sweep is
-mandatory when Processor is unavailable and is an idempotent safety net for any
-handoff that remains unresolved at the cutoff and for scheduled cleanup of
-terminal no-op tombstones. Ingest verifies the current cutoff, enumerates its
-own eligible handoff and tombstone state, records `default_expired` or
-`policy_rejected`, publishes `RawHandoffExpiryFenceV1` for any handoff, and
-removes or makes the raw object, acceptance metadata, outbox entry, payload
-reference, or no-op tombstone unavailable as applicable. A `completed_no_op`
-tombstone releases its retained `no_op_admission` reservation only after
-confirmed physical cleanup, exactly once. Late fetches and dispositions are
-rejected as stale. Processor performs its final current-cutoff and local-fence
-check immediately before any canonical or derived commit.
+disposition is absent, each completed payload-bearing handoff whose admission
+or parent-binding tombstones have reached the cutoff, and each expiry-eligible
+no-op acceptance or retry tombstone, including one with a `completed_no_op`
+disposition. This sweep is mandatory when Processor is unavailable and is an
+idempotent safety net for any handoff that remains unresolved at the cutoff and
+for scheduled cleanup of terminal payload and no-op tombstones. Ingest verifies
+the current cutoff, enumerates its own eligible handoff, payload tombstone, and
+no-op tombstone state, records `default_expired` or `policy_rejected`,
+publishes `RawHandoffExpiryFenceV1` for any handoff, and removes or makes the
+raw object, acceptance metadata, outbox entry, payload reference, admission
+tombstone, parent-binding tombstone, or no-op tombstone unavailable as
+applicable. A `completed_no_op` tombstone releases its retained
+`no_op_admission` reservation only after confirmed physical cleanup, exactly
+once. Late fetches and dispositions are rejected as stale. Processor performs
+its final current-cutoff and local-fence check immediately before any canonical
+or derived commit.
 
 Recovery is deterministic across each durable boundary:
 
@@ -869,9 +875,9 @@ The verification specification must use synthetic fixtures and prove:
   no-op/client-report count/rate exhaustion and per-project isolation, repeated
   no-op retries with the same semantic digest, and changed-digest `409`
   conflicts; duplicate reservation reuse, delayed-cleanup reservation retention,
-  deletion-confirmed release/conversion, quota exhaustion, environment
-  registration/retirement/reactivation races, unsafe enforcement, service
-  overload, and bounded Retry-After behavior;
+  deletion-confirmed release of retained staging capacity, quota exhaustion,
+  environment registration/retirement/reactivation races, unsafe enforcement,
+  service overload, and bounded Retry-After behavior;
 - failures before and after S3 verification, PostgreSQL/outbox commit, MSK
   publication, Processor fetch/processing, disposition acknowledgement,
   shutdown, restore, orphan cleanup, quarantine, duplicate delivery, and
@@ -883,9 +889,10 @@ The verification specification must use synthetic fixtures and prove:
   deterministic `RawUnitContainerV1` framing/digests with unknown event-member
   removal and absent attachment-field omission, `completed_no_op` without a
   processing generation or canonical result, no-op reservation retention until
-  tombstone cleanup and exactly-once release, completed-disposition tombstones,
-  backlog, quarantine, mandatory Processor-outage and completed-no-op-tombstone
-  expiry sweeps, retention expiry, and deletion behavior; and
+  tombstone cleanup and exactly-once release, completed payload admission and
+  parent-binding tombstone cleanup, backlog, quarantine, mandatory
+  Processor-outage and completed-no-op-tombstone expiry sweeps, retention
+  expiry, and deletion behavior; and
 - safe logs/traces/metrics, immediate risk paging, mTLS/ACL isolation,
   tenant-scoped references, N/N-1 message compatibility, and absence of raw
   payloads or credentials in diagnostics.
