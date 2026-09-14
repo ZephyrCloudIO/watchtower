@@ -177,12 +177,14 @@ immutable object exists,
 its digest and size have been verified, and the acceptance metadata and
 transactional outbox commit. Orphaned or incomplete attempts are reconciled
 without being reported as successful acceptance. The raw object, acceptance
-metadata, and recoverable handoff remain until Processor durably confirms
-completion through a matching `RawHandoffCompletionClaimV1`; the versioned
+metadata, and recoverable handoff remain until Processor completes the
+owner-mediated `RawHandoffCompletionArbitrationV1` handshake and Ingest
+durably records the matching `RawHandoffCompletionClaimV1`; the versioned
 `RawHandoffDispositionV1` message may arrive later and is idempotent. Ingest
 may alternatively durably record a class-default or shortened-policy expiry
-fence through `RawRetentionExpiryV1`. The claim and expiry fence are mutually
-exclusive per handoff at the cutoff.
+fence through `RawRetentionExpiryV1`. The owner-mediated claim arbitration and
+expiry fence are mutually exclusive per handoff at the cutoff; asynchronous
+message arrival cannot decide the winner.
 
 TUS staging is a separate Ingest-owned boundary from accepted raw state. The
 staging record is authoritative for the project and upload identity, declared
@@ -205,17 +207,20 @@ uncertain cleanup remains fenced and retryable, retaining the staging
 reservation until physical deletion is confirmed; binding never permanently
 consumes capacity merely because the record is terminally bound.
 
-For a `completed` disposition, Processor commits the verified normalized replay
-representation and authoritative default-generation promotion together with a
-matching `RawHandoffCompletionClaimV1` before sending the disposition, so
-Ingest may retire raw state immediately without losing the reprocessing source.
-An unpromoted canonical candidate is not a completion claim. Ingest retries
-and reconciles pending handoffs while their raw acceptance remains eligible. If
-a handoff remains unprocessed at the seven-day class-default cutoff, the
-`RawRetentionExpiryV1` sweep first reconciles the durable claim: a matching
-claim wins, while its absence causes Ingest to durably record
-`default_expired` and fence the handoff. A later claim, fetch, or disposition
-cannot revive a fenced handoff.
+For a `completed` disposition, Processor stages the verified normalized replay
+representation, obtains the owner-mediated arbitration outcome from Ingest, and
+only then makes the authoritative default-generation promotion. Ingest records
+the matching `RawHandoffCompletionClaimV1` in its own arbitration state before
+the disposition is sent, so raw retirement cannot depend on delayed message
+delivery. An unpromoted canonical candidate is not a completion claim. The same
+handshake has a no-op variant for payload-free completion and carries no
+canonical digest or processing generation. Ingest retries and reconciles
+pending handoffs while their raw acceptance remains eligible. If a handoff
+remains unprocessed at the seven-day class-default cutoff, the
+`RawRetentionExpiryV1` sweep serializes with the owner-mediated arbitration: a
+matching payload or no-op claim wins, while its absence causes Ingest to
+durably record `default_expired` and fence the handoff. A later claim, fetch, or
+disposition cannot revive a fenced handoff.
 
 Canonical ClickHouse tables are partitioned monthly by `accepted_at` and
 ordered by:
@@ -684,11 +689,12 @@ shortened policy, it returns `default_expired` with
 arrives while Processor is unavailable, Jobs sends the versioned
 `RawRetentionExpiryV1` project-scoped sweep to Ingest. Ingest verifies the
 current cutoff, enumerates its own eligible acceptance state, and reconciles
-each matching completion claim before recording a `default_expired` fence for
-an unclaimed handoff. It retires each matching outbox entry and purges the raw
+each matching owner-mediated completion arbitration before recording a
+`default_expired` fence for an unclaimed handoff. It retires each matching
+outbox entry and purges the raw
 object and acceptance metadata without waiting for Processor. `RawPayloadFetchV1`
-and late Processor claims or dispositions reject a handoff already fenced by
-Ingest expiry. When Ingest records that fence, it also emits
+and late Processor arbitration requests, claims, or dispositions reject a
+handoff already fenced by Ingest expiry. When Ingest records that fence, it also emits
 the durable project-scoped `RawHandoffExpiryFenceV1` to Processor. Processor
 persists the highest fence for the handoff and performs an authoritative
 current-cutoff and local-fence check immediately before committing or
@@ -1501,10 +1507,11 @@ The owning implementation contracts must make these scenarios testable:
    `default_expired` disposition for an unprocessed handoff beyond the class
    default, the project-scoped Jobs-to-Ingest `RawRetentionExpiryV1` sweep
    during Processor outage, Ingest enumeration of expired state, rejection of
-   late fetches, completion claims, or dispositions after the Ingest expiry fence, durable
-   `RawHandoffExpiryFenceV1` delivery, Processor's durable completion claim and
-   final cutoff/fence check before canonical commit and publication, deterministic
-   claim-versus-expiry arbitration, and generation-aware reconciliation of each
+   late fetches, arbitration requests, completion claims, or dispositions after
+   the Ingest expiry fence, durable `RawHandoffExpiryFenceV1` delivery,
+   Processor's owner-mediated completion claim and final cutoff/fence check
+   before canonical commit and publication, deterministic claim-versus-expiry
+   arbitration including the no-op variant, and generation-aware reconciliation of each
    completed handoff to a promoted canonical default or durable terminal
    disposition before raw retirement;
    create, append, bind, expire, restore, and clean up positive-length TUS

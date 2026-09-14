@@ -334,6 +334,24 @@ use the one selected bucket from the existing restrictive ordering, with the
 canonical entry as the final tie-breaker. These entries apply to TUS creation
 only; they do not suppress ordinary error or attachment admission.
 
+When a new environment would exceed the project-scoped active-registration
+capacity, the active `X-Sentry-Rate-Limits` entry is exactly
+`<seconds>:default:project:environment_registration`, with no namespace
+component. Category is `default`, scope is `project`, and reason is
+`environment_registration`; the entry applies only to first registration or
+explicit reactivation of a name and never suppresses collection for an
+already-active environment. The singleton rate-limit headers and
+`Retry-After` use this same bucket. `<seconds>` is the ceiling until the next
+known registration slot release; when no release deadline can be evaluated,
+the #16 fallback is `5` seconds.
+
+When the final project-scoped attachment-byte budget is exhausted, the active
+entry is exactly `<seconds>:default:project:attachment_bytes`, also with no
+namespace component. The singleton headers and `Retry-After` use that bucket,
+where `<seconds>` is the earliest charged-byte expiry from the rolling window.
+If that deadline cannot be evaluated safely, quota evaluation returns `503`
+with the existing fallback behavior.
+
 ## Authentication, lifecycle, and environment admission
 
 Collection accepts only a current project-scoped collection DSN in the exact
@@ -371,8 +389,9 @@ collection for an unregistered name requests an idempotent API-owned
 registration. Concurrent first registration, retirement, reactivation, and
 quota state serialize on `(tenant_id, project_id, environment_name,
 registration_generation)`. The initial active-environment limit is 1,000,
-including hidden entries. Capacity exhaustion is `429 rate_limited` and does
-not affect existing environments.
+including hidden entries. Capacity exhaustion is `429 rate_limited` with the
+canonical environment-registration entry above and does not affect existing
+environments.
 
 Retirement creates a durable name tombstone and an Ingest admission fence
 before releasing the slot. It is idempotent, preserves historical data, and
@@ -411,12 +430,17 @@ explicitly rejected or excluded.
 When an Envelope contains an event-bearing unit or a correlated later-attachment
 unit, that primary payload-bearing unit and any accompanying client-report or
 no-op units form one request-atomic admission group after structural validation.
-A conflict, quota failure, temporary admission failure, or other rejection of
-the primary payload-bearing unit rolls back every auxiliary unit's acceptance,
-reservation, and handoff, and the primary result determines the response.
-Auxiliary acceptance can never turn a rejected primary payload-bearing unit
-into `200`. When the primary payload-bearing unit is accepted or is a matching
-duplicate, auxiliary units may commit according to their normal rules.
+All primary and auxiliary reservations are evaluated and held before any new
+acceptance, charge, outbox, or handoff commit. A conflict, quota failure,
+temporary admission failure, or other rejection of either unit rolls back every
+new reservation, staged payload, acceptance, and handoff in the group. A new
+primary therefore cannot return `200` when an auxiliary `no_op_admission` or
+other reservation fails: an auxiliary quota failure returns its `429` response
+and active bucket, while an unavailable auxiliary dependency returns `503`.
+When the primary is an already durable matching duplicate, that existing result
+cannot be rolled back; a failed auxiliary still creates no new auxiliary state
+and the request returns the auxiliary failure. Successful auxiliary units may
+commit with a new primary or alongside an already matching duplicate.
 
 Repository-owned identities are canonical lowercase UUID v7 strings and
 PostgreSQL `uuid` values. Ingest generates non-reused IDs for the accepted raw
@@ -584,9 +608,11 @@ Only when no retained binding matches does a new later-attachment admission
 require an existing authorized parent acceptance within its effective
 raw-retention cutoff. This retry exception never creates a new binding or
 bypasses lifecycle, deletion, tenant, or project fences. Auxiliary client
-reports follow the request-atomic rules above and may differ without changing
-the primary TUS attachment outcome; the aggregate `payload_digest` is not used
-to turn such a primary duplicate into a conflict.
+reports use the request-atomic reservation rules above. An already matching
+primary TUS binding remains unchanged when an auxiliary is replayed or fails,
+but a failed auxiliary creates no new report state and returns its failure. The
+aggregate `payload_digest` is not used to turn such a primary duplicate into a
+conflict.
 
 The unit may arrive before the parent has completed processing, because parent
 processing order is asynchronous, but it may not create a new binding before
@@ -763,9 +789,11 @@ protocol and format version, content/attachment digests, retention and policy
 generations, correlation/idempotency context, and an opaque owner-issued
 `RawPayloadReferenceV1` for the `RawUnitContainerV1` object. A no-op handoff
 carries bounded disposition metadata and no payload reference; its successful
-terminal `completed_no_op` disposition carries no `processing_generation` or
-canonical result. Messages contain no Sentry DTO, DSN, credential, private key,
-unrestricted payload, or usable S3 grant.
+`RawHandoffCompletionClaimV1` `no_op` variant carries the no-op retry identity
+and semantic `payload_digest` but no `processing_generation`, canonical digest,
+or canonical result. Its terminal `completed_no_op` disposition is accepted
+only when it matches that owner-recorded claim. Messages contain no Sentry DTO,
+DSN, credential, private key, unrestricted payload, or usable S3 grant.
 
 MSK uses the canonical storage settings: replication factor `3`,
 `min.insync.replicas=2`, producer `acks=all`, and seven-day log retention.
@@ -773,7 +801,7 @@ Delivery is at least once; consumers are idempotent and no global ordering is
 assumed. Processor retrieves bytes only through authenticated bounded
 `RawPayloadFetchV1` requests. Ingest retires raw state only after it durably
 records a matching terminal `RawHandoffDispositionV1`, reconciles a matching
-durable `RawHandoffCompletionClaimV1`, or records a matching
+owner-mediated `RawHandoffCompletionClaimV1`, or records a matching
 `RawRetentionExpiryV1` fence. Redelivered identical dispositions and claims
 are idempotent. A conflicting disposition, claim, generation, digest, or
 raw-unit identity is an integrity failure: raw state is retained, no retirement
@@ -786,6 +814,17 @@ project-scoped policy through the existing authenticated versioned internal
 boundary and owns the acceptance-side reservation/charge state. A reservation
 is keyed by tenant, project, quota class, raw-unit identity, and content
 identity. It is not reusable across projects or units.
+
+The final attachment-byte quota is a project-scoped `attachment_bytes` bucket
+with an initial capacity of exactly `1,073,741,824` bytes (1 GiB) in each
+rolling 24-hour window. Ordinary decoded attachment bytes and completed TUS
+bytes consume the same bucket at final durable attachment acceptance; TUS
+creation and append consume only `tus_staging`. Ingest reserves the measured
+attachment bytes before acceptance, commits the charge with acceptance, and
+releases an uncertain reservation only through idempotent reconciliation.
+Matching durable duplicates consume no additional bytes; rejection,
+processing failure, and retention expiry do not refund an accepted charge.
+Bytes leave the rolling bucket at their recorded acceptance time plus 24 hours.
 
 In addition to final accepted-unit charges, the project policy includes a
 project-scoped TUS staging byte budget and upload-count budget with a policy
@@ -859,10 +898,11 @@ The admission sequence is:
 
 Error quantity limits and quantities are owned by #19. Protocol limits are
 owned by #16. API owns the project policy generation; the #17 operating
-contract supplies the required `no_op_admission` count, rate, and rate-window
-values without defining numeric product defaults. Ingest owns attachment-byte
-and no-op admission reservation mechanics and their fences, but it does not
-invent #19's quantity values. Rejections, exclusions, conflicts, and
+contract owns the initial `attachment_bytes` value of 1,073,741,824 bytes per
+rolling 24 hours and the required `no_op_admission` count, rate, and rate-window
+values. Ingest owns attachment-byte and no-op admission reservation mechanics
+and their fences, but it does not invent #19's quantity values. Rejections,
+exclusions, conflicts, and
 duplicates add no charge or new reservation. Processing failure, quarantine,
 and retention expiry do not refund a durable accepted charge; no-op reservation
 release follows the cleanup lifecycle above.
@@ -875,12 +915,13 @@ authorization, lifecycle, or retention evaluation returns `503 unavailable`.
 These outcomes remain distinguishable through status and retry policy even
 though their public JSON detail is intentionally generic.
 
-Required operating values are implementation gates, not defaults in this
-contract. Before implementation, the owning operating contract must record and
-load-validate request deadline, maximum concurrent requests, maximum concurrent
-decoders/decompressors, bounded decoded-memory budget, project TUS staging
-byte/count budgets, project no-op/client-report admission count/rate/window
-budgets and reservation reconciliation, retry base/max/jitter,
+Required operating values are implementation gates. Before implementation, the
+owning operating contract must record and load-validate request deadline,
+maximum concurrent requests, maximum concurrent decoders/decompressors, bounded
+decoded-memory budget, the project `attachment_bytes` capacity of
+1,073,741,824 bytes and rolling 24-hour window, project TUS staging byte/count
+budgets, project no-op/client-report admission count/rate/window budgets and
+reservation reconciliation, retry base/max/jitter,
 reconciliation cadence, quarantine count/bytes/age, backlog count/bytes/age,
 and `Retry-After` derivation. Missing or invalid values prevent startup.
 Load testing must verify that malformed, oversized, compressed, slow, or
@@ -911,34 +952,35 @@ tombstone, and bound staging state. A payload handoff with a terminal
 no new disposition and no expiry fence; the sweep only removes or makes its
 terminal tombstone, raw object, acceptance metadata, outbox entry, payload
 reference, or bound staging bytes unavailable as applicable. Before installing
-a fence for an otherwise unresolved payload handoff, Ingest reconciles the
-durable Processor completion claim described below. A matching claim wins the
-cutoff arbitration and is recorded as the equivalent completed outcome; a
-missing claim causes Ingest to record `default_expired` or `policy_rejected`
-and publish `RawHandoffExpiryFenceV1`. A `completed_no_op` tombstone
+a fence for an otherwise unresolved payload or no-op handoff, Ingest reconciles
+the owner-mediated completion arbitration described below. A matching payload
+or no-op claim wins the cutoff arbitration and is recorded as the equivalent
+completed outcome; a missing claim causes Ingest to record `default_expired` or
+`policy_rejected` and publish `RawHandoffExpiryFenceV1`. A `completed_no_op` tombstone
 releases its retained `no_op_admission` reservation only after confirmed
 physical cleanup, exactly once. Bound staging cleanup likewise releases its
-staging reservation only after confirmed physical deletion. Late fetches and
-dispositions and claims are rejected as stale after an expiry fence. Processor
-performs its final current-cutoff and local-fence check immediately before any
-canonical or derived commit.
+staging reservation only after confirmed physical deletion. Late fetches,
+arbitration requests, dispositions, and claims are rejected as stale after an
+expiry fence. Processor performs its final current-cutoff and local-fence check
+immediately before any canonical or derived commit.
 
-`RawHandoffCompletionClaimV1` is a versioned internal Processor-to-Ingest
-completion claim carrying the scoped `watchtower_id`, canonical lowercase UUID
-v7 `processing_generation`, canonical content digest, `accepted_at`, effective
-cutoff, correlation identifier, and idempotency key. Processor records the claim in
-the same durable arbitration state as the authoritative canonical
-default-generation promotion, after the canonical result is verified; an
-unpromoted candidate row is not a completion claim. Ingest reconciles claims
-before expiry fencing, and only a matching claim whose durable arbitration
-state predates or reaches the effective cutoff can win. The normal
-`RawHandoffDispositionV1` remains the terminal delivery and may arrive later;
-it must match the claim and is idempotent. If no matching claim exists when
-the cutoff arbitration commits, the expiry fence wins and a later claim or
-disposition cannot resurrect the handoff. Concurrent claim and expiry actions
-use this per-handoff durable ordering, so a canonical result cannot be
-silently converted to `default_expired` merely because its disposition
-delivery was delayed.
+`RawHandoffCompletionArbitrationV1` is an authenticated, idempotent unary
+Processor-to-Ingest handshake under `/internal/v1`. Processor stages the
+verified canonical candidate or payload-free no-op and submits its scoped
+identity, completion kind, applicable digest or no-op identity, accepted time,
+cutoff, correlation identifier, and idempotency key. Ingest serializes the
+handshake with its own expiry state and records the resulting
+`RawHandoffCompletionClaimV1` or expiry outcome before responding. Processor
+does not promote a canonical candidate or finalize a no-op unless the claim
+wins; a pending arbitration record is retried by identity after a crash. A
+payload claim carries canonical lowercase UUID v7 `processing_generation` and
+canonical content digest. A no-op claim carries its bounded retry identity and
+semantic `payload_digest`, and explicitly carries neither processing generation
+nor canonical result. The normal `RawHandoffDispositionV1` remains terminal
+delivery on the asynchronous envelope and must match the owner-recorded claim;
+it is idempotent. If no matching claim exists when cutoff arbitration commits,
+the expiry fence wins and a later handshake, claim, or disposition cannot
+resurrect the handoff.
 
 At every effective query-retention alias cutoff, Jobs schedules a project-scoped
 alias-retention cleanup run for Ingest. Ingest idempotently enumerates
@@ -1002,7 +1044,7 @@ recorded and testable:
 | --- | --- | --- |
 | Supported protocol formats, routes, limits, and compatibility responses | #16 | The exact values restated in this contract. |
 | Error quantity limits and collection quantity semantics | #19 | Error-unit quantities and their authoritative quota windows. |
-| Operating values | #17 operating contract | Deadlines, concurrency, decoder/decompressor limits, memory, TUS staging byte/count budgets, no-op/client-report admission count/rate/window budgets, backlog, quarantine, retry, reconciliation, and alert thresholds. |
+| Operating values and final attachment quota | #17 operating contract | Deadlines, concurrency, decoder/decompressor limits, memory, the 1,073,741,824-byte rolling-24-hour attachment budget, TUS staging byte/count budgets, no-op/client-report admission count/rate/window budgets, backlog, quarantine, retry, reconciliation, and alert thresholds. |
 
 The verification specification must use synthetic fixtures and prove:
 
@@ -1036,10 +1078,14 @@ The verification specification must use synthetic fixtures and prove:
   no-op retries with the same semantic digest, and changed-digest `409`
   conflicts; duplicate reservation reuse, delayed-cleanup reservation retention,
   deletion-confirmed release of retained staging capacity, exact
-  `default:project:no_op_admission` and
+  `default:project:no_op_admission`,
+  `default:project:environment_registration`,
+  `default:project:attachment_bytes`, and
   `default:project:tus_staging:bytes`/`uploads` rate-limit entries,
-  deterministic completion-claim versus expiry-cutoff arbitration, bound-staging cleanup by
-  the effective raw cutoff, quota exhaustion,
+  deterministic owner-mediated completion arbitration versus expiry-cutoff
+  ordering for payload and no-op claims, bound-staging cleanup by the effective
+  raw cutoff, the 1,073,741,824-byte rolling-24-hour attachment quota,
+  auxiliary-reservation rollback, and quota exhaustion,
   distinct client-report item reservations, stable reordered and duplicate-item
   retries, and changed per-unit-key conflicts,
   environment registration/retirement/reactivation races, unsafe enforcement,

@@ -308,7 +308,7 @@ Operational upper bounds are independent of billing. Operator sets upper bounds;
 - Watchtower-owned preauthentication entry points enforce 60 requests per IP per preceding minute and five per normalized target per preceding 15 minutes. Hide account existence.
 - Rate-limit responses include `Retry-After`.
 - If enforcement cannot be evaluated safely, return 503. Security paths operate only when their independent budget can be verified; no unrestricted fallback is allowed.
-- Signal-specific collection/query quantities belong to their owning domain contracts. Issue #17 owns Ingest's reservation, final-commit fence, and attachment-byte charging mechanics; #19 owns error quantity values. Existing export-specific limits remain authoritative.
+- Signal-specific collection/query quantities belong to their owning domain contracts. Issue #17 owns Ingest's reservation, final-commit fence, and attachment-byte charging mechanics plus the initial project attachment budget of 1,073,741,824 bytes per rolling 24 hours; #19 owns error quantity values. Existing export-specific limits remain authoritative.
 
 ## Operators and support
 
