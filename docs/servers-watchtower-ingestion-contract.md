@@ -990,10 +990,13 @@ no new disposition and no expiry fence; the sweep only removes or makes its
 terminal tombstone, raw object, acceptance metadata, outbox entry, payload
 reference, or bound staging bytes unavailable as applicable. Before installing
 a fence for an otherwise unresolved payload or no-op handoff, Ingest reconciles
-the owner-mediated completion arbitration described below. A claim granted
-while the handoff is eligible wins a clock-only cutoff and remains eligible for
-finalization after the wall clock crosses that cutoff. A pending or active
-shortened-policy or deletion fence is different: the finalization phase
+the owner-mediated completion arbitration described below. The effective
+raw-retention cutoff is the hard completion-lease deadline. At cutoff
+arbitration, only a matching terminal disposition already recorded before the
+cutoff keeps completion authoritative; a provisional or finalized claim without
+that disposition receives the applicable expiry fence and cannot keep raw state
+eligible indefinitely. A pending or active shortened-policy or deletion fence
+is different: the finalization phase
 serializes with that lifecycle state and either records `claim_finalized` or
 records a matching `RawHandoffLifecycleFenceV1` cancellation outcome. A
 `claim_finalized` result is authoritative for completion and cannot be
@@ -1001,12 +1004,14 @@ invalidated by a later lifecycle fence; a `lifecycle_fenced` result forbids
 canonical publication and is closed by a matching `lifecycle_rejected`
 disposition. Ingest retires raw state only after that terminal disposition or
 the matching lifecycle/expiry fence, never from the provisional claim alone.
-A missing claim at cutoff causes Ingest to record `default_expired` or
-`policy_rejected` and publish `RawHandoffExpiryFenceV1`. A `completed_no_op`
+A handoff without a terminal disposition at cutoff causes Ingest to record
+`default_expired` or `policy_rejected` and publish `RawHandoffExpiryFenceV1`.
+A `completed_no_op`
 tombstone releases its retained `no_op_admission` reservation only after
 confirmed physical cleanup, exactly once. Bound staging cleanup likewise
 releases its staging reservation only after confirmed physical deletion. If no
-claim is granted before cutoff arbitration, the expiry fence wins. Late fetches,
+terminal disposition exists before cutoff arbitration, the expiry fence wins.
+Late fetches,
 arbitration requests, and completion claims are rejected as stale after an
 expiry or lifecycle fence; a matching terminal disposition may close that
 owner-recorded outcome idempotently.
@@ -1026,10 +1031,16 @@ returns either `claim_finalized` or `lifecycle_fenced` with the matching
 fence kind (`retention_policy` or `project_deletion`), lifecycle generation,
 claim identity, correlation identifier, and idempotency key, but no canonical
 result or payload. Processor may promote a canonical candidate or
-finalize a no-op only after `claim_finalized`; a pending arbitration or
-finalization record is retried by identity after a crash. A lifecycle-fenced
-claim is never promoted, and its matching `lifecycle_rejected` disposition is
-the terminal outcome that permits raw retirement. A
+finalize a no-op only after `claim_finalized` and before a raw-expiry fence;
+a pending arbitration or finalization record is retried by identity after a
+crash. A project-deletion fence does not cancel a previously finalized claim;
+Jobs keeps that claim as an outstanding deletion dependency. An expiry fence
+that wins after a claim was finalized but before its terminal disposition is
+authoritative: Processor discards or removes any
+unpublished result and publishes the matching expiry disposition instead of a
+late completion. A lifecycle-fenced claim is never promoted, and its matching
+`lifecycle_rejected` disposition is the terminal outcome that permits raw
+retirement. A
 payload claim carries canonical lowercase UUID v7 `processing_generation` and
 canonical content digest. A no-op claim carries its bounded retry identity and
 semantic `payload_digest`, and explicitly carries neither processing generation
@@ -1044,8 +1055,9 @@ identity, expiry outcome, basis, and applicable policy generation;
 fence dispositions carry completed-result claim fields. A matching expiry or
 lifecycle disposition closes its fence outcome idempotently, while a conflicting
 disposition is an integrity failure.
-If no matching claim exists when cutoff arbitration commits, the expiry fence
-wins and a later completion handshake or claim cannot resurrect the handoff.
+If no matching terminal disposition exists when cutoff arbitration commits, the
+expiry fence wins and a later completion handshake or claim cannot resurrect
+the handoff.
 
 At every effective query-retention alias cutoff, Jobs schedules a project-scoped
 alias-retention cleanup run for Ingest. Ingest idempotently enumerates
@@ -1068,7 +1080,7 @@ Recovery is deterministic across each durable boundary:
 | After PostgreSQL/outbox commit before response | Treat response loss as unknown; retry resolves the one committed acceptance or conflict and reuses one charge. |
 | After local commit before MSK publication | Outbox publication resumes; public success remains durable and recoverable. |
 | After duplicate MSK delivery | Processor applies the same handoff identity idempotently. |
-| After Processor fetch or processing before disposition | Redelivery resumes the same raw-unit outcome; Ingest retains raw state through a provisional or finalized claim until a matching terminal disposition or expiry/lifecycle fence, and a `completed` claim/disposition or `completed_no_op` disposition leaves the minimal admission and parent-binding tombstones through their cutoffs. A lifecycle-fenced claim publishes no canonical result. For `completed_no_op`, the no-op reservation remains held until tombstone expiry and confirmed physical cleanup. |
+| After Processor fetch or processing before disposition | Redelivery resumes the same raw-unit outcome; Ingest retains raw state through a provisional or finalized claim until a matching terminal disposition or expiry/lifecycle fence. A completed disposition or `completed_no_op` disposition leaves the minimal admission and parent-binding tombstones through their cutoffs. An expiry-fenced claim publishes no canonical result, and a lifecycle-fenced claim publishes no canonical result. For `completed_no_op`, the no-op reservation remains held until tombstone expiry and confirmed physical cleanup. |
 | After disposition send before Ingest recording | Redelivery is idempotent. A conflicting disposition is quarantined as an integrity failure and pages immediately. |
 | During shutdown or restore | Readiness is removed, checkpoints/outboxes are persisted, registry and fence snapshots are reconciled, and accepted work is retried only while eligible. |
 
@@ -1152,8 +1164,8 @@ The verification specification must use synthetic fixtures and prove:
   `default:project:attachment_bytes`, and
   `default:project:tus_staging:bytes`/`uploads` rate-limit entries,
   deterministic owner-mediated claim/finalization arbitration versus
-  expiry-cutoff ordering for payload and no-op claims, promotion after a
-  finalized claim crosses the cutoff, cancellation by a later retention/deletion
+  expiry-cutoff ordering for payload and no-op claims, expiry fencing of a
+  stalled provisional or finalized claim before cleanup, cancellation by a later retention/deletion
   fence with matching `lifecycle_rejected` dispositions, bound-staging cleanup by the effective
   raw cutoff, the 1,073,741,824-byte rolling-24-hour attachment quota,
   auxiliary-reservation rollback, and quota exhaustion,

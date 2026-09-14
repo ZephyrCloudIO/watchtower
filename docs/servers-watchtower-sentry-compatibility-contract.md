@@ -2297,18 +2297,31 @@ tie-breaker.
   items have stable, distinct unit keys.
 - A retained supported event submission uses the #17 raw admission identity:
   `(tenant_id, project_id, source_protocol, external_event_id,
-  admission_generation, admission_content_digest)`. Its minimal duplicate and
+  admission_generation, admission_content_digest)`. For an initial error unit,
+  the identity additionally includes the
+  `initial_attachment_identity_multiset`, which is the canonical sorted multiset
+  of the initial error unit's attachment identities, including an empty
+  multiset and repeated equal members. Each member uses the accepted
+  `(filename, content_type, attachment_type, sha256(content_bytes))` fields;
+  an absent filename remains absent rather than becoming a null or default.
+  Its multiplicity is part of the comparison, so adding, removing, changing,
+  or duplicating an initial attachment is a conflict even when the event bytes
+  are unchanged. This identity's minimal duplicate and
   conflict fence lasts through the earlier of the seven-day default cutoff and
   the active project raw-retention cutoff from first acceptance, and is not
   extended by retries. For Envelope and legacy `store`,
   `admission_content_digest` compares
   decompressed original supported event bytes, so JSON whitespace and
   member-order changes are different raw content; multipart minidumps use the
-  deterministic `minidump_digest` preimage defined above. Transport
-  authentication, compression, and framing are excluded.
+  deterministic `minidump_digest` preimage defined above and do not infer an
+  initial-event attachment multiset. Transport
+  authentication, compression, and framing are excluded. For an initial error
+  unit, the event content digest and attachment multiset are compared together;
+  the attachment identity is not folded into the event-byte digest.
   A matching identity returns the original acceptance, while different raw
-  content under the active event-ID fence returns `409 conflict` with no new
-  acceptance or charge. The #16 semantic `payload_digest` remains recorded for
+  content or an initial attachment identity multiset mismatch under the active
+  event-ID fence returns `409 conflict` with no new acceptance or charge. The
+  #16 semantic `payload_digest` remains recorded for
   compatibility and downstream canonical processing, but it does not extend
   or replace the raw admission fence. These checks occur after complete
   structural validation and before the environment retirement fence or any

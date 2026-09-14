@@ -106,8 +106,11 @@ The allowed protocol and data-flow direction is:
    `RawHandoffDispositionV1` message, or Jobs' `RawRetentionExpiryV1` command
    before retiring the corresponding raw state. A `RawRetentionExpiryV1`
    command may carry either the class-default or an active shortened-policy
-   basis; a clock-only cutoff cannot defeat a claim, while a pending or active
-   retention/deletion fence is resolved by the claim finalization phase. A
+   basis; the effective raw-retention cutoff is the hard completion-lease
+   deadline, so a provisional or finalized claim without a terminal disposition
+   receives the owner-recorded expiry fence. A pending or active lifecycle
+   fence is resolved by the claim finalization phase, while the raw-retention
+   cutoff is resolved by a terminal disposition or expiry fence. A
    provisional or finalized claim is not sufficient for raw retirement; only a
    matching terminal disposition or lifecycle/expiry fence may close the
    handoff. Processor
@@ -234,9 +237,12 @@ retrieves bounded authenticated selection pages, derived
    fences. It returns either `claim_finalized` or a matching
    `RawHandoffLifecycleFenceV1` `lifecycle_fenced` outcome. Processor may
    promote the canonical candidate or finalize a no-op only after
-   `claim_finalized`; a pending arbitration or finalization record is retained
-   and reconciled after a crash rather than being converted by message-arrival
-   order. The resulting `RawHandoffCompletionClaimV1` carries the scoped
+   `claim_finalized` and before a raw-expiry fence; a pending arbitration or
+   finalization record is retained and reconciled after a crash rather than
+   being converted by message-arrival order. A project-deletion fence does not
+   cancel a previously finalized claim; Jobs retains it as a deletion
+   dependency until its terminal disposition and purge cleanup complete. The
+   resulting `RawHandoffCompletionClaimV1` carries the scoped
    `watchtower_id`, completion kind, applicable digest or no-op identity,
    `accepted_at`, cutoff, correlation identifier, and idempotency key. It
    publishes a terminal `RawHandoffDispositionV1` to Ingest for every
@@ -886,15 +892,20 @@ applicable, correlation identifier, and idempotency key; it is a project-scoped
 sweep and does not require Jobs to know individual `watchtower_id` values.
 Ingest enumerates its own acceptance state and reconciles any matching
 owner-recorded arbitration state before installing a terminal
-`default_expired` or `policy_rejected` fence for an eligible handoff. A
-finalized payload or no-op claim wins a clock-only cutoff; a provisional claim
-remains available for finalization, while a pending or active retention/deletion
-fence may cancel it through the owner-mediated lifecycle outcome. Without a
-claim or successful finalization, Ingest durably records the expiry or lifecycle
-fence and retires each matching raw object, acceptance metadata, and outbox
-entry without waiting for Processor. A later `RawPayloadFetchV1`, arbitration
-request, or completion claim for a fenced handoff is rejected as stale and
-cannot publish or revive canonical work; only a matching expiry, lifecycle, or
+`default_expired` or `policy_rejected` fence for an eligible handoff. Only a
+matching terminal disposition recorded before the effective raw-retention
+cutoff keeps completion authoritative; a provisional or finalized claim
+without that disposition receives the expiry fence. A pending or active
+retention/deletion fence may cancel an unfinalized claim through the
+owner-mediated lifecycle outcome. Without a terminal disposition, Ingest
+durably records the expiry or lifecycle
+fence and, for raw-retention expiry, retires each matching raw object,
+acceptance metadata, and outbox entry without waiting for Processor. For a
+project-deletion fence, a previously finalized claim remains an outstanding
+dependency and raw state is retained until its matching terminal disposition
+and purge cleanup complete. A later `RawPayloadFetchV1`, arbitration request,
+or completion claim for a fenced handoff is rejected as stale and cannot
+publish or revive canonical work; only a matching expiry, lifecycle, or
 terminal disposition may close the recorded outcome, idempotently.
 
 When Ingest records a class-default or shortened-policy expiry fence, it also
@@ -903,9 +914,9 @@ The message carries the scoped `watchtower_id`, accepted-at cutoff, retention
 policy or class-default basis, fence generation, correlation identifier, and
 idempotency key. Processor persists the highest fence and must validate the
 owner-recorded finalization or expiry/lifecycle outcome immediately before
-canonical or derived commit and publication; a claim granted before a
-clock-only cutoff remains eligible for finalization across that wall-clock
-boundary. A lifecycle fence that wins before finalization returns
+canonical or derived commit and publication; a claim finalized before the
+effective raw-retention cutoff cannot publish after the matching expiry fence
+wins. A lifecycle fence that wins before finalization returns
 `lifecycle_fenced`, and Processor records the matching `lifecycle_rejected`
 disposition without publishing canonical changes.
 

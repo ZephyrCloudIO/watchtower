@@ -182,9 +182,16 @@ owner-mediated `RawHandoffCompletionArbitrationV1` finalization and Ingest
 durably records the matching terminal `RawHandoffDispositionV1`, expiry fence,
 or lifecycle fence. The initial `RawHandoffCompletionClaimV1` is provisional;
 even a `claim_finalized` result does not retire raw state before the terminal
-disposition. A clock-only cutoff cannot defeat an eligible claim, while a
-pending or active shortened-policy or deletion fence can cancel an
-unfinalized claim through `RawHandoffLifecycleFenceV1`. Asynchronous message
+disposition. The effective raw-retention cutoff is the hard completion-lease
+deadline: a provisional or finalized claim without a matching terminal
+disposition receives the owner-recorded expiry fence at that cutoff and cannot
+keep raw state eligible indefinitely. A `claim_finalized` result authorizes
+completion through a later project-deletion fence, but not past a raw-expiry
+fence that wins before its terminal disposition. A pending or active
+shortened-policy or deletion fence can cancel an unfinalized claim through
+`RawHandoffLifecycleFenceV1`. An already finalized claim remains authoritative
+for project deletion, but its terminal disposition and resulting
+canonical cleanup are outstanding deletion dependencies. Asynchronous message
 arrival cannot decide the winner.
 
 TUS staging is a separate Ingest-owned boundary from accepted raw state. The
@@ -223,19 +230,24 @@ representation, obtains the claim phase of the owner-mediated arbitration from
 Ingest, and invokes its finalization phase immediately before authoritative
 default-generation promotion. Ingest records the matching provisional
 `RawHandoffCompletionClaimV1` and then serializes finalization with pending and
-active retention/deletion fences. `claim_finalized` permits promotion; a
+active retention/deletion fences. `claim_finalized` permits promotion before a
+raw-expiry fence; a project-deletion fence leaves an already finalized claim
+as a deletion dependency. A
 `lifecycle_fenced` result records `RawHandoffLifecycleFenceV1`, forbids
 promotion, and requires a matching `lifecycle_rejected` disposition. The same
 handshake has a no-op variant for payload-free completion and carries no
 canonical digest or processing generation. A claim granted while the handoff
-is eligible remains eligible across a clock-only cutoff, but a later lifecycle
-fence cancels it if finalization has not won. If a handoff remains unprocessed
-at the seven-day class-default cutoff, the `RawRetentionExpiryV1` sweep
-serializes with the owner-mediated arbitration: a finalized payload or no-op
-claim wins, a provisional claim remains available for finalization, and an
-unclaimed handoff receives `default_expired`. A later claim, fetch, or
-conflicting disposition cannot revive a fenced handoff; a matching expiry or
-lifecycle disposition may close the recorded outcome idempotently.
+is eligible remains eligible until the effective raw-retention cutoff, but a
+later lifecycle fence cancels it if finalization has not won. If a handoff
+remains unresolved at the seven-day class-default cutoff, the
+`RawRetentionExpiryV1` sweep serializes with the owner-mediated arbitration:
+only a matching terminal disposition already recorded before the cutoff keeps
+completion authoritative. A provisional or finalized claim without that
+disposition receives `default_expired` or `policy_rejected`, and Processor
+must discard or remove any unpublished result before acknowledging the matching
+expiry fence. A later claim, fetch, or conflicting disposition cannot revive a
+fenced handoff; a matching expiry or lifecycle disposition may close the
+recorded outcome idempotently.
 
 Canonical ClickHouse tables are partitioned monthly by `accepted_at` and
 ordered by:
@@ -268,9 +280,10 @@ ClickHouse using the partition and sequence identity. After verifying the same
 digest, it marks the staging record `clickhouse_committed`; only that state is
 eligible for durable outbox publication. Processor performs the final
 owner-mediated completion check before committing the row. A matching
-`claim_finalized` result is continued eligibility across a clock-only cutoff; a
-provisional claim without finalization, or a `lifecycle_fenced` result, cannot
-publish. If that check fails before commit without a finalized claim, the
+`claim_finalized` result permits commit only while the handoff remains before
+an expiry or lifecycle fence; a provisional claim without finalization, or a
+`lifecycle_fenced` result, cannot publish. If that check fails before commit
+without a terminally eligible claim, the
 reconciler marks the staged write retention/lifecycle-fenced and, after proving
 that no authoritative row exists, publishes an idempotent no-row
 `CanonicalChangeSkipV1` marker for the reserved sequence through the same
@@ -279,9 +292,10 @@ within its cutoff and publication then failed, recovery verifies its digest,
 retains the row, marks the staging record `clickhouse_committed`, and publishes
 the actual canonical change. If the current cutoff arrives after ClickHouse
 commits the row but before publication, recovery retains and publishes the row
-when a matching claim was finalized while the handoff was eligible; without
-that finalized claim, it marks the staging record retention/lifecycle-expired,
-removes the authoritative row, verifies its absence, and publishes the idempotent no-row
+only when the matching terminal disposition remains authoritative. Without
+that terminal outcome, it marks the staging record
+retention/lifecycle-expired, removes the authoritative row, verifies its
+absence, and publishes the idempotent no-row
 `CanonicalChangeSkipV1` marker. It never publishes a skip while the row exists
 or publishes an expired row. A skip after
 a reconciliation attempt is valid only after the row is durably removed and
@@ -839,8 +853,12 @@ dispatches idempotent owner-specific purge or anonymization commands, retries
 them until completion, and rejects late non-purge execution outcomes that lack
 a previously finalized owner claim. A claim finalized before the active
 deletion fence remains authoritative for that already-authorized in-flight
-completion; the resulting canonical state is still purged or irreversibly
-anonymized by the deletion orchestration. Query invalidates cache entries
+completion, so Jobs records it as an outstanding Processor deletion dependency
+and keeps the project purge open until the matching terminal disposition and
+resulting canonical cleanup are complete. Processor's owner-specific purge
+must be rerun after that completion if an earlier purge attempt preceded it;
+the owner cannot acknowledge deletion completion while such a dependency is
+open. Query invalidates cache entries
 immediately. Active stores, including API's project-scoped control-plane rows,
 export-hold registry entries, and raw, canonical, derived, projections,
 replay batches, export objects, and Jobs project-scoped operational state, are
@@ -899,9 +917,9 @@ Query projection acknowledgement before initial publication, but a missing
 local confirmation is reconciled through `CanonicalPublicationReconcileV1`
 before an expired intent can become a skip. Promotion performs the
 owner-mediated finalization and row-existence check, treating a matching
-`claim_finalized` result granted while the handoff was eligible as continued
-eligibility after a clock-only cutoff. A provisional claim or
-`lifecycle_fenced` result cannot become authoritative. It updates the mapping only
+`claim_finalized` result as eligible only while no expiry or lifecycle fence
+has won. A provisional claim or `lifecycle_fenced` result cannot become
+authoritative. It updates the mapping only
 after every candidate row has publication confirmation and the full range
 succeeds. A partial or failed range, an unconfirmed publication, or a failed
 final eligibility or row-existence check never becomes the default and the
@@ -1507,8 +1525,10 @@ The owning implementation contracts must make these scenarios testable:
    outbox publication, with no duplicate or conflicting sequence; verify a row
    committed while still within its cutoff but delayed by publication is
    reconciled and published as a row, and verify that a winning completion
-   claim finalized while eligible preserves a row and its publication when the
-   cutoff arrives before publication or promotion. Also verify that a
+   claim finalized while eligible publishes only when its terminal disposition
+   remains authoritative before the raw-expiry fence; a stalled finalized
+   claim is fenced and its row is removed when the cutoff arrives before
+   publication or promotion. Also verify that a
    provisional claim canceled by a retention/deletion fence produces no
    canonical row and a matching lifecycle disposition. For an unclaimed row, a
    cutoff reached after ClickHouse commit but before publication removes the
@@ -1523,8 +1543,7 @@ The owning implementation contracts must make these scenarios testable:
    readiness or any new reservation, and leave Processor unready for missing,
    truncated, or conflicting baseline or per-reservation intent evidence; for
    each unresolved intent, publish its retained candidate only while it remains
-   before the cutoff unless a matching `claim_finalized` outcome granted while
-   eligible preserves its eligibility, and otherwise reconcile Query's durable
+   before the cutoff and has a matching terminal outcome; otherwise reconcile Query's durable
    `CanonicalPublicationReconcileV1` outcome before readiness: a matching
    applied row or skip must terminalize the intent without a replacement skip,
    while only an explicit absent outcome plus verified row absence may publish
@@ -1662,8 +1681,11 @@ The owning implementation contracts must make these scenarios testable:
    end-of-month clamping; current-time duration enforcement; baseline
    Jobs schedules for default lifecycles even without a shortened policy;
    recurring Jobs-scheduled, owner-run active purges at each effective cutoff
-   without a grace period; retention of minimal tombstone-keyed Jobs deletion
-   orchestration until every owner confirms purge completion;
+   without a grace period; finalized pre-fence claims remain deletion
+   dependencies until their terminal disposition and resulting canonical purge
+   complete, including an idempotent follow-up purge after an earlier attempt;
+   retention of minimal tombstone-keyed Jobs deletion orchestration until every
+   owner confirms purge completion;
    purge or irreversible anonymization of Jobs project-scoped operational state
    after the minimal tombstone-keyed deletion orchestration completes;
    backup purge or irreversible inaccessibility within 90 days of each applicable

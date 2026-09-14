@@ -23,7 +23,7 @@ domains remain independent.
 
 | Unit | Boundary |
 | --- | --- |
-| `watchtower-ingest` | Public write-only telemetry admission, raw accepted records, and recoverable handoff to processing. |
+| `watchtower-ingest` | Public telemetry admission, bounded TUS status reads, raw accepted records, and recoverable handoff to processing. |
 | `watchtower-api` | Native `/api/v1` control-plane and release/artifact commands, Sentry-compatible management REST, authority, and change events. |
 | `watchtower-processor` | Asynchronous normalization, privacy processing, enrichment, symbolication execution, canonical telemetry, processing state, and derived aggregates. |
 | `watchtower-query` | Native `/api/v1` reads, Prometheus-, Loki-, and Tempo-compatible queries, projections, indexes, caches, and provider query orchestration. |
