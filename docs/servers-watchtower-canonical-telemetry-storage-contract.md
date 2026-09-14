@@ -230,9 +230,10 @@ representation, obtains the claim phase of the owner-mediated arbitration from
 Ingest, and invokes its finalization phase immediately before authoritative
 default-generation promotion. Ingest records the matching provisional
 `RawHandoffCompletionClaimV1` and then serializes finalization with pending and
-active retention/deletion fences. `claim_finalized` permits promotion before a
-raw-expiry fence; a project-deletion fence leaves an already finalized claim
-as a deletion dependency. A
+active retention/deletion fences. `claim_finalized` permits candidate commit
+before a raw-expiry fence, but canonical promotion remains gated on the
+matching terminal disposition acknowledgement; a project-deletion fence leaves
+an already finalized claim as a deletion dependency. A
 `lifecycle_fenced` result records `RawHandoffLifecycleFenceV1`, forbids
 promotion, and requires a matching `lifecycle_rejected` disposition. The same
 handshake has a no-op variant for payload-free completion and carries no
@@ -282,21 +283,24 @@ eligible for durable outbox publication. Processor performs the final
 owner-mediated completion check before committing the row. A matching
 `claim_finalized` result permits commit only while the handoff remains before
 an expiry or lifecycle fence; a provisional claim without finalization, or a
-`lifecycle_fenced` result, cannot publish. If that check fails before commit
+`lifecycle_fenced` result, cannot commit or publish. If that check fails before commit
 without a terminally eligible claim, the
 reconciler marks the staged write retention/lifecycle-fenced and, after proving
 that no authoritative row exists, publishes an idempotent no-row
 `CanonicalChangeSkipV1` marker for the reserved sequence through the same
 canonical-change path. If ClickHouse committed the row while it was still
-within its cutoff and publication then failed, recovery verifies its digest,
-retains the row, marks the staging record `clickhouse_committed`, and publishes
-the actual canonical change. If the current cutoff arrives after ClickHouse
-commits the row but before publication, recovery retains and publishes the row
-only when the matching terminal disposition remains authoritative. Without
-that terminal outcome, it marks the staging record
-retention/lifecycle-expired, removes the authoritative row, verifies its
-absence, and publishes the idempotent no-row
-`CanonicalChangeSkipV1` marker. It never publishes a skip while the row exists
+within its cutoff and canonical publication then failed, recovery verifies its
+digest and marks the staging record `clickhouse_committed`. Processor delivers
+the matching terminal `completed` `RawHandoffDispositionV1` to Ingest and
+waits for Ingest's idempotent durable-recording acknowledgement before
+publishing the actual canonical change. If the current cutoff arrives after
+ClickHouse commits the row but before that acknowledgement, recovery marks
+the staging record retention/lifecycle-expired, removes the authoritative row,
+verifies its absence, and publishes the idempotent no-row
+`CanonicalChangeSkipV1` marker. If the disposition was durably acknowledged
+before the cutoff and canonical publication then failed, recovery retains the
+row and publishes the actual canonical change. Canonical publication cannot
+precede that acknowledgement, so it never publishes a skip while the row exists
 or publishes an expired row. A skip after
 a reconciliation attempt is valid only after the row is durably removed and
 its absence is verified. The marker carries the partition, sequence, retention
@@ -740,8 +744,11 @@ emits the durable project-scoped `RawHandoffExpiryFenceV1` or
 `RawHandoffLifecycleFenceV1` message to Processor. Processor persists
 the highest fence for the handoff and validates the owner-recorded finalization
 or expiry/lifecycle outcome immediately before committing or publishing any
-canonical or derived result. A denied final check records the appropriate
-terminal disposition and cannot publish canonical changes. Jobs
+canonical or derived result. A successful canonical result additionally
+requires Ingest's durable acknowledgement that the matching terminal
+`completed` disposition was recorded before its canonical change may publish.
+A denied final check records the appropriate terminal disposition and cannot
+publish canonical changes. Jobs
 owns a durable recurring
 baseline lifecycle-purge registration for every applicable project and data
 class, even when the project keeps the default policy. Project creation causes
@@ -909,8 +916,10 @@ rejected rather than reprocessed from an unverified or unavailable source.
 
 A new result uses a new UUID v7 `processing_generation` and is a candidate until
 the complete requested range passes integrity validation. Processor commits each
-candidate row to canonical ClickHouse and durably publishes its canonical change
-before it can promote that row's authoritative default-generation mapping.
+candidate row to canonical ClickHouse, obtains Ingest's durable acknowledgement
+for the matching terminal `completed` disposition, and then durably publishes
+its canonical change before it can promote that row's authoritative
+default-generation mapping.
 Publication confirmation is the existing Processor durable canonical publication
 state and published-contiguous watermark. It does not require a successful
 Query projection acknowledgement before initial publication, but a missing
@@ -918,8 +927,9 @@ local confirmation is reconciled through `CanonicalPublicationReconcileV1`
 before an expired intent can become a skip. Promotion performs the
 owner-mediated finalization and row-existence check, treating a matching
 `claim_finalized` result as eligible only while no expiry or lifecycle fence
-has won. A provisional claim or `lifecycle_fenced` result cannot become
-authoritative. It updates the mapping only
+has won, and requires the matching Ingest disposition acknowledgement before
+canonical publication. A provisional claim or `lifecycle_fenced` result cannot
+become authoritative. It updates the mapping only
 after every candidate row has publication confirmation and the full range
 succeeds. A partial or failed range, an unconfirmed publication, or a failed
 final eligibility or row-existence check never becomes the default and the
@@ -1380,8 +1390,8 @@ Raw and export objects are checksum-validated. Reconciliation compares
 like-for-like dimensions: raw acceptance and handoff compare logical
 `watchtower_id` counts and ordered ID digests; before Ingest retires its
 recoverable state, each successfully completed handoff is generation-aware
-reconciled to the authoritative default-generation selection, a matching
-`claim_finalized` outcome, or a durable terminal disposition; canonical
+reconciled to the authoritative default-generation selection and a matching
+Ingest-recorded terminal disposition with its publication acknowledgement; canonical
 histories and replay compare physical
 `(watchtower_id, processing_generation, canonical_content_digest)` counts and
 ordered content-aware digests; and Query projections and canonical exports
@@ -1521,19 +1531,22 @@ The owning implementation contracts must make these scenarios testable:
    spellings to the exact nine-digit UTC `Z` representation before digesting.
 2. Fail S3, PostgreSQL, ClickHouse, and MSK operations before and after local
    commits; verify no false successful acceptance and idempotent recovery,
-   including Processor canonical staging before and after ClickHouse commit and
-   outbox publication, with no duplicate or conflicting sequence; verify a row
-   committed while still within its cutoff but delayed by publication is
-   reconciled and published as a row, and verify that a winning completion
-   claim finalized while eligible publishes only when its terminal disposition
-   remains authoritative before the raw-expiry fence; a stalled finalized
-   claim is fenced and its row is removed when the cutoff arrives before
-   publication or promotion. Also verify that a
+   including Processor canonical staging before and after ClickHouse commit,
+   disposition recording acknowledgement, and outbox publication, with no
+   duplicate or conflicting sequence. Verify that a row committed while still
+   within its cutoff does not publish a canonical change until Ingest records
+   and acknowledges the matching terminal disposition; if that acknowledgement
+   arrives before the cutoff, delayed publication is reconciled and published
+   as a row, while a cutoff before acknowledgement removes the row, verifies
+   its absence, and publishes the idempotent skip. A winning completion claim
+   finalized while eligible is insufficient by itself; a stalled finalized
+   claim is fenced and its row is removed when the cutoff arrives before the
+   disposition acknowledgement. Also verify that a
    provisional claim canceled by a retention/deletion fence produces no
-   canonical row and a matching lifecycle disposition. For an unclaimed row, a
-   cutoff reached after ClickHouse commit but before publication removes the
-   row, verifies its absence, and publishes the idempotent
-   `CanonicalChangeSkipV1` marker. An absent row alone
+   canonical row and a matching lifecycle disposition. For a row without an
+   Ingest-recorded terminal completion before the cutoff, a cutoff reached
+   after ClickHouse commit removes the row, verifies its absence, and publishes
+   the idempotent `CanonicalChangeSkipV1` marker. An absent row alone
    may produce that marker through the full canonical replay horizon, so
    a Query outage longer than the seven-day MSK window cannot leave an
    available-watermark gap blocking later changes. Restore Processor from a

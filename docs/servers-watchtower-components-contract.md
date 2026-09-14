@@ -206,11 +206,12 @@ retrieves bounded authenticated selection pages, derived
    staged live write uses an idempotent no-row `CanonicalChangeSkipV1` marker
    for its reserved sequence only when no authoritative ClickHouse row exists;
    if the row was committed while still within its cutoff and publication then
-   failed, Processor reconciles and publishes the row; if the cutoff arrives
-   after commit but before publication, recovery first reconciles Query's
-   applied row/skip outcome and only when it is explicitly absent removes the
-   row, verifies its absence, and publishes the skip. Live consumers therefore receive
-   contiguous coverage, and Processor persists each live skip marker in the
+   failed, Processor requires the matching Ingest-recorded disposition
+   acknowledgement and publishes the row; if the cutoff arrives after commit
+   but before that acknowledgement, recovery removes the row, verifies its
+   absence, and publishes the skip. Canonical publication cannot precede the
+   acknowledgement, so live consumers receive contiguous coverage, and
+   Processor persists each live skip marker in the
    retained canonical replay class so it remains available through the replay
    horizon.
    Before Processor becomes ready after restoring its processing store, it
@@ -236,8 +237,10 @@ retrieves bounded authenticated selection pages, derived
    or no-op completion serializes with pending and active retention/deletion
    fences. It returns either `claim_finalized` or a matching
    `RawHandoffLifecycleFenceV1` `lifecycle_fenced` outcome. Processor may
-   promote the canonical candidate or finalize a no-op only after
-   `claim_finalized` and before a raw-expiry fence; a pending arbitration or
+   commit the canonical candidate or finalize a no-op only after
+   `claim_finalized` and before a raw-expiry fence. It publishes the canonical
+   change only after Ingest durably records and acknowledges the matching
+   terminal disposition; a pending arbitration, disposition recording, or
    finalization record is retained and reconciled after a crash rather than
    being converted by message-arrival order. A project-deletion fence does not
    cancel a previously finalized claim; Jobs retains it as a deletion
@@ -250,8 +253,10 @@ retrieves bounded authenticated selection pages, derived
    `lifecycle_rejected` raw handoff when it remains authoritative. It suppresses
    late processing for an Ingest expiry or lifecycle fence, persists the highest
    fence for each handoff, and performs the authoritative finalization outcome
-   check immediately before canonical commit and publication. A claim finalized
-   before a later lifecycle fence remains promotable; an unfinalized claim that
+   check immediately before canonical commit. It requires the Ingest
+   disposition acknowledgement immediately before canonical publication. A
+   claim finalized before a later lifecycle fence remains eligible for commit
+   and publication only after that acknowledgement; an unfinalized claim that
    receives `lifecycle_fenced` is never promoted and its candidate is discarded.
    A candidate canonical row without the matching finalized claim is not
    authoritative. Canonical changes use the Processor-owned
@@ -939,13 +944,15 @@ match the successful `claim_finalized` outcome; `policy_rejected` and
 outcome, basis, and applicable policy generation; `lifecycle_rejected` carries
 the matching `RawHandoffLifecycleFenceV1` identity and lifecycle generation.
 Fence dispositions carry no completion-claim fields. Processor publishes a
-completion disposition through its durable outbox only after the canonical
-result or payload-free no-op completion is covered by `claim_finalized`; it
-publishes an expiry or lifecycle disposition only after the owner-recorded
-fence outcome is covered by the matching fence. Transient failures publish no
-terminal disposition. Ingest
-transactionally persists the disposition and idempotency state before retiring
-the matching outbox entry and eligible raw acceptance data. For
+completion disposition through its durable outbox after the canonical result
+or payload-free no-op completion is covered by `claim_finalized` and before
+canonical change publication. It waits for Ingest to transactionally persist
+the disposition and idempotency state and return a durable acknowledgement;
+only then may it publish the canonical change. It publishes an expiry or
+lifecycle disposition only after the owner-recorded fence outcome is covered
+by the matching fence. Transient failures publish no terminal disposition.
+Ingest retires the matching outbox entry and eligible raw acceptance data only
+after its disposition transaction succeeds. For
 `completed_no_op`, the bounded acceptance/retry tombstone remains live and the
 no-op admission reservation stays held until tombstone expiry and confirmed
 physical cleanup release it exactly once.

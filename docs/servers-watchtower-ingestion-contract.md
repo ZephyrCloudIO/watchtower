@@ -999,10 +999,11 @@ eligible indefinitely. A pending or active shortened-policy or deletion fence
 is different: the finalization phase
 serializes with that lifecycle state and either records `claim_finalized` or
 records a matching `RawHandoffLifecycleFenceV1` cancellation outcome. A
-`claim_finalized` result is authoritative for completion and cannot be
-invalidated by a later lifecycle fence; a `lifecycle_fenced` result forbids
-canonical publication and is closed by a matching `lifecycle_rejected`
-disposition. Ingest retires raw state only after that terminal disposition or
+`claim_finalized` result is authoritative for completion arbitration but cannot
+by itself authorize canonical publication; it cannot be invalidated by a later
+lifecycle fence. A `lifecycle_fenced` result forbids canonical publication and
+is closed by a matching `lifecycle_rejected` disposition. Ingest retires raw
+state only after that terminal disposition or
 the matching lifecycle/expiry fence, never from the provisional claim alone.
 A handoff without a terminal disposition at cutoff causes Ingest to record
 `default_expired` or `policy_rejected` and publish `RawHandoffExpiryFenceV1`.
@@ -1030,10 +1031,13 @@ returns either `claim_finalized` or `lifecycle_fenced` with the matching
 `RawHandoffLifecycleFenceV1`. That fence carries the scoped `watchtower_id`,
 fence kind (`retention_policy` or `project_deletion`), lifecycle generation,
 claim identity, correlation identifier, and idempotency key, but no canonical
-result or payload. Processor may promote a canonical candidate or
-finalize a no-op only after `claim_finalized` and before a raw-expiry fence;
-a pending arbitration or finalization record is retried by identity after a
-crash. A project-deletion fence does not cancel a previously finalized claim;
+result or payload. Processor may commit a canonical candidate or finalize a
+no-op only after `claim_finalized` and before a raw-expiry fence. It must then
+deliver the matching terminal `completed` or `completed_no_op`
+`RawHandoffDispositionV1` and wait for Ingest's idempotent durable-recording
+acknowledgement before publishing the corresponding canonical change. A
+pending arbitration, disposition recording, or finalization record is retried
+by identity after a crash. A project-deletion fence does not cancel a previously finalized claim;
 Jobs keeps that claim as an outstanding deletion dependency. An expiry fence
 that wins after a claim was finalized but before its terminal disposition is
 authoritative: Processor discards or removes any
@@ -1044,10 +1048,13 @@ retirement. A
 payload claim carries canonical lowercase UUID v7 `processing_generation` and
 canonical content digest. A no-op claim carries its bounded retry identity and
 semantic `payload_digest`, and explicitly carries neither processing generation
-nor canonical result. The normal `RawHandoffDispositionV1` remains terminal delivery
-on the asynchronous envelope and is idempotent. `completed` and
-`completed_no_op` dispositions must match the corresponding owner-recorded
-`claim_finalized` outcome. `default_expired` and `policy_rejected` dispositions
+nor canonical result. The normal `RawHandoffDispositionV1` remains terminal
+delivery on the asynchronous envelope and is idempotent. Ingest must
+transactionally record a `completed` disposition and return its durable,
+identity-bound acknowledgement before Processor publishes the corresponding
+canonical change; a missing acknowledgement blocks publication and leaves the
+candidate recoverable. `completed` and `completed_no_op` dispositions must
+match the corresponding owner-recorded `claim_finalized` outcome. `default_expired` and `policy_rejected` dispositions
 instead carry and must match the owner-recorded `RawHandoffExpiryFenceV1`
 identity, expiry outcome, basis, and applicable policy generation;
 `lifecycle_rejected` dispositions carry and must match the owner-recorded
@@ -1080,8 +1087,8 @@ Recovery is deterministic across each durable boundary:
 | After PostgreSQL/outbox commit before response | Treat response loss as unknown; retry resolves the one committed acceptance or conflict and reuses one charge. |
 | After local commit before MSK publication | Outbox publication resumes; public success remains durable and recoverable. |
 | After duplicate MSK delivery | Processor applies the same handoff identity idempotently. |
-| After Processor fetch or processing before disposition | Redelivery resumes the same raw-unit outcome; Ingest retains raw state through a provisional or finalized claim until a matching terminal disposition or expiry/lifecycle fence. A completed disposition or `completed_no_op` disposition leaves the minimal admission and parent-binding tombstones through their cutoffs. An expiry-fenced claim publishes no canonical result, and a lifecycle-fenced claim publishes no canonical result. For `completed_no_op`, the no-op reservation remains held until tombstone expiry and confirmed physical cleanup. |
-| After disposition send before Ingest recording | Redelivery is idempotent. A conflicting disposition is quarantined as an integrity failure and pages immediately. |
+| After Processor fetch or processing before disposition | Redelivery resumes the same raw-unit outcome; Ingest retains raw state through a provisional or finalized claim until a matching terminal disposition or expiry/lifecycle fence. Processor publishes no canonical change until Ingest acknowledges the recorded completed disposition. A completed disposition or `completed_no_op` disposition leaves the minimal admission and parent-binding tombstones through their cutoffs. An expiry-fenced claim publishes no canonical result, and a lifecycle-fenced claim publishes no canonical result. For `completed_no_op`, the no-op reservation remains held until tombstone expiry and confirmed physical cleanup. |
+| After disposition send before Ingest recording or acknowledgement | Processor does not publish the canonical change; redelivery records or acknowledges the same disposition idempotently. If the cutoff wins first, the candidate is removed and its reserved sequence receives the matching skip. A conflicting disposition is quarantined as an integrity failure and pages immediately. |
 | During shutdown or restore | Readiness is removed, checkpoints/outboxes are persisted, registry and fence snapshots are reconciled, and accepted work is retried only while eligible. |
 
 Orphan cleanup is bounded, tenant-scoped, digest-verified, and cannot delete a
