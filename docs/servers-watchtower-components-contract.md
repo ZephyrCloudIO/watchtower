@@ -220,9 +220,9 @@ retrieves bounded authenticated selection pages, derived
    committed.
    It publishes a
    terminal
-   `RawHandoffDispositionV1` to Ingest for every completed,
-   shortened-policy-rejected, or default-expired raw handoff when it remains
-   authoritative. It suppresses late processing for an Ingest expiry fence,
+   `RawHandoffDispositionV1` to Ingest for every `completed`,
+   `completed_no_op`, `policy_rejected`, or `default_expired` raw handoff when it
+   remains authoritative. It suppresses late processing for an Ingest expiry fence,
    persists the highest `RawHandoffExpiryFenceV1` for each handoff, and performs
    the authoritative cutoff and local-fence check immediately before canonical
    commit and publication. Canonical changes use the Processor-owned
@@ -866,18 +866,20 @@ publishing canonical changes.
 The raw-handoff completion path is a versioned durable `RawHandoffDispositionV1`
 message from Processor to Ingest using the common asynchronous envelope. Its
 bounded payload contains the canonical lowercase UUID v7 `watchtower_id`, a
-terminal `disposition` of `completed`, `policy_rejected`, or `default_expired`,
-and the generation context for the result: canonical lowercase UUID v7
-`processing_generation` is required for `completed`, `policy_rejected` includes
-the `retention_policy_generation`, and `default_expired` includes a bounded
-rejection reason with `expiry_basis=class_default` and no policy generation.
-The Processor publishes the message through its durable outbox after recording
-the terminal result; transient processing failures publish no terminal
-disposition. Ingest
-transactionally persists the disposition and idempotency state before retiring
-the matching outbox entry and raw acceptance data. Redelivery of the same
-message is idempotent, and a conflicting disposition or generation is an
-integrity failure that cannot retire raw state.
+terminal `disposition` of `completed`, `completed_no_op`, `policy_rejected`, or
+`default_expired`, and the generation context for the result. Canonical
+lowercase UUID v7 `processing_generation` is required only for `completed`;
+`completed_no_op` explicitly omits it and creates no canonical result or
+reference; `policy_rejected` includes the `retention_policy_generation`; and
+`default_expired` includes a bounded rejection reason with
+`expiry_basis=class_default` and no policy generation. The Processor publishes
+the message through its durable outbox after recording the canonical result or
+payload-free no-op completion; transient processing failures publish no
+terminal disposition. Ingest transactionally persists the disposition and
+idempotency state before retiring the matching outbox entry and raw acceptance
+data, releasing the live no-op admission reservation for `completed_no_op`.
+Redelivery of the same message is idempotent, and a conflicting disposition or
+generation is an integrity failure that cannot retire raw state.
 
 The registry-snapshot handoff is a versioned unary Protobuf-over-HTTP call under
 `/internal/v1` from each of Ingest, Processor, Query, and Jobs to API. Each owner

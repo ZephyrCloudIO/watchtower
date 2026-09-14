@@ -119,21 +119,28 @@ relative path. The reference JSON length is not the attachment byte length.
 | Minidump | `multipart/form-data` with a boundary | identity, gzip |
 | TUS `PATCH` | `application/offset+octet-stream` | identity only |
 
-Collection authentication is the first admission step. Ingest authenticates
-the current project-scoped collection DSN before validating the content
-encoding or type or decoding the body. For an authenticated current DSN,
-Ingest then resolves the tenant, project, organization lifecycle, and security
-authority before validating the transport. A disabled project or suspended
-organization returns `403 permission_denied`, and a deleting project returns
-`409 conflict`; only an active project and organization continue to transport
-validation and body decoding. Unsupported `Content-Encoding` is
-`415 unsupported_media_type`; a malformed gzip stream is
-`400 invalid_compression`; malformed multipart boundaries are
-`400 invalid_multipart`; and a mismatched or unsupported content type is
-`415 unsupported_media_type`. After authentication and lifecycle admission,
-these transport failures occur before payload persistence, quota reservation,
-or environment registration, so an invalid DSN retains the #16
-`401 invalid_authentication` precedence even when the body is malformed.
+Before collection authentication, Ingest validates an optional `X-Request-ID`
+header. A supplied value must be a canonical lowercase UUID v7; a malformed,
+non-canonical, or duplicate header returns `400 invalid_request` before
+authentication, lookup, idempotency evaluation, or mutation. When the header
+is absent, Ingest generates a canonical lowercase UUID v7. After this
+header-only validation, collection authentication is the first admission step:
+Ingest authenticates the current project-scoped collection DSN before
+validating the content encoding or type or decoding the body. For an
+authenticated current DSN, Ingest then resolves the tenant, project,
+organization lifecycle, and security authority before validating the
+transport. A disabled project or suspended organization returns
+`403 permission_denied`, and a deleting project returns `409 conflict`; only an
+active project and organization continue to transport validation and body
+decoding. Unsupported `Content-Encoding` is `415 unsupported_media_type`; a
+malformed gzip stream is `400 invalid_compression`; malformed multipart
+boundaries are `400 invalid_multipart`; and a mismatched or unsupported
+content type is `415 unsupported_media_type`. After authentication and
+lifecycle admission, these transport failures occur before payload
+persistence, quota reservation, or environment registration, so an invalid
+DSN retains the #16 `401 invalid_authentication` precedence even when the body
+is malformed; the request-ID validation exception retains its earlier `400`
+precedence.
 
 Envelope framing is newline-delimited JSON headers followed by item payloads.
 The envelope header is required. An item with `length` uses authoritative
@@ -421,10 +428,15 @@ and payload references may retire according to the storage contract, but an
 Ingest-owned non-payload admission tombstone remains through the effective
 raw-retention cutoff. It stores the scoped event identity, admission
 generation, content digest, original acceptance result, and applicable cutoff.
-Parent-binding and attachment identity state remains alongside it until the
-same parent cutoff.
-This state contains no customer payload, credentials, or usable storage
-reference; deletion and lifecycle fences supersede it and cannot be reopened
+Ordinary parent-binding and attachment identity state remains alongside it
+until the same parent cutoff. For a bound TUS attachment, the minimal
+non-payload binding evidence—scoped parent/event identity, upload ID, semantic
+`payload_digest`, attachment digest and length, and original acceptance—remains
+through the effective query-retention alias cutoff while the canonical event is
+queryable. This evidence is sufficient to resolve an exact retry or a binding
+conflict after the raw object has retired; it never retains upload bytes, a
+usable object key or storage reference, credentials, or unrestricted payload.
+Deletion and lifecycle fences supersede all such state and cannot be reopened
 by retry or restore. A supported protocol that permits a missing event ID
 creates a new identity for every submission; later attachment association then
 requires that protocol's supported correlation identifier. Current #16 v1
@@ -526,7 +538,7 @@ The request-to-handoff states are:
 | Raw staged and verified | For a payload-bearing unit, the immutable S3 object is complete and its SHA-256 and exact byte size match the accepted content. A valid no-op or client-report unit allocates no raw object and instead carries only bounded metadata. | No payload-bearing success is reported before verification. Failed or uncertain attempts are cleaned or reconciled. |
 | Acceptance committed | For a payload-bearing unit, PostgreSQL acceptance metadata, final quota charge state, dedup/attachment identity, and transactional outbox commit together. For a no-op or client-report unit, bounded acceptance metadata, its no-op admission reservation/charge state, and a recoverable no-op handoff commit without a raw object. | `200` with empty body and request IDs. |
 | Handoff pending/published | Outbox publication to MSK is retryable and carries only bounded protocol-neutral metadata or an owner-issued raw reference. | Public success remains valid; no synchronous Processor visibility is claimed. |
-| Processor dispositioned | Processor has durably completed or terminally rejected the handoff and Ingest has durably recorded the disposition. | No later public response is generated; raw retirement follows the disposition/fence contract. |
+| Processor dispositioned | Processor has durably completed a canonical result, completed a payload-free no-op, or terminally rejected the handoff and Ingest has durably recorded the disposition. | No later public response is generated; raw retirement and no-op reservation cleanup follow the disposition/fence contract. |
 | Expired/fenced/quarantined | Retention, deletion, or permanent-failure fence prevents stale fetch, disposition, replay, and resurrection. | New requests map to the appropriate #16 `401`, `403`, `409`, or `503`; no payload revival. |
 
 For a payload-bearing unit, public success means only that the immutable raw
@@ -536,7 +548,9 @@ unit, public success means that its bounded acceptance metadata, committed
 `no_op_admission` reservation/charge state, and recoverable no-op handoff are
 committed; it has no raw object or raw-object key, digest, or size, and no
 payload reference; its semantic `payload_digest` remains available for the
-no-op/client-report retry identity.
+no-op/client-report retry identity. A matching `completed_no_op` disposition
+releases the live no-op admission reservation and retires the recoverable
+no-op handoff without creating a canonical generation or result.
 Neither form of success
 means MSK publication, Processor completion, normalization, grouping,
 symbolication, canonical storage, or Query visibility.
@@ -640,9 +654,10 @@ tenant UUID, raw-unit UUID, parent UUID when applicable, accepted time, source
 protocol and format version, content/attachment digests, retention and policy
 generations, correlation/idempotency context, and an opaque owner-issued
 `RawPayloadReferenceV1` for the `RawUnitContainerV1` object. A no-op handoff
-carries bounded disposition metadata and no payload reference. Messages contain
-no Sentry DTO, DSN, credential, private key, unrestricted payload, or usable S3
-grant.
+carries bounded disposition metadata and no payload reference; its successful
+terminal `completed_no_op` disposition carries no `processing_generation` or
+canonical result. Messages contain no Sentry DTO, DSN, credential, private key,
+unrestricted payload, or usable S3 grant.
 
 MSK uses the canonical storage settings: replication factor `3`,
 `min.insync.replicas=2`, producer `acks=all`, and seven-day log retention.
@@ -771,7 +786,7 @@ Recovery is deterministic across each durable boundary:
 | After PostgreSQL/outbox commit before response | Treat response loss as unknown; retry resolves the one committed acceptance or conflict and reuses one charge. |
 | After local commit before MSK publication | Outbox publication resumes; public success remains durable and recoverable. |
 | After duplicate MSK delivery | Processor applies the same handoff identity idempotently. |
-| After Processor fetch or processing before disposition | Redelivery resumes the same raw-unit outcome; Ingest retains raw state until a durable disposition or expiry fence, and a completed disposition leaves the minimal admission and parent-binding tombstones through their cutoffs. |
+| After Processor fetch or processing before disposition | Redelivery resumes the same raw-unit outcome; Ingest retains raw state until a durable disposition or expiry fence, and a `completed` or `completed_no_op` disposition leaves the minimal admission and parent-binding tombstones through their cutoffs while settling any no-op reservation. |
 | After disposition send before Ingest recording | Redelivery is idempotent. A conflicting disposition is quarantined as an integrity failure and pages immediately. |
 | During shutdown or restore | Readiness is removed, checkpoints/outboxes are persisted, registry and fence snapshots are reconciled, and accepted work is retried only while eligible. |
 
@@ -827,12 +842,16 @@ The verification specification must use synthetic fixtures and prove:
 - concurrent identical event IDs, conflicting decompressed bytes, compressed
   retries, whitespace changes, protocol scope, effective raw-cutoff expiry
   without retry extension, query-retention alias fencing while canonical events remain
-  queryable, missing IDs, and deletion/restore fencing;
+  queryable, a bound TUS retry after raw retention but before alias expiry using
+  retained upload/digest evidence, conflicting TUS binding evidence, missing
+  IDs, and deletion/restore fencing;
 - equal and different attachment identities, initial-attachment multiset
   duplicate and conflict behavior, attachment-before-parent `404` handling,
   pre-processing attachment delivery, known expired/deleted/fenced parent
   `409` handling, TUS binding, and parent retention cutoffs;
-- authentication precedence over malformed transport, reservation races,
+- request-ID validation before authentication, including malformed,
+  non-canonical, and duplicate headers with an invalid DSN, authentication
+  precedence over malformed transport, reservation races,
   one-charge duplicate handling, TUS staging byte/count exhaustion,
   no-op/client-report count/rate exhaustion and per-project isolation, repeated
   no-op retries with the same semantic digest, and changed-digest `409`
@@ -849,8 +868,9 @@ The verification specification must use synthetic fixtures and prove:
   mapping, no-op reservation lifecycle and operating-value validation,
   deterministic multipart minidump digests with retained metadata,
   deterministic `RawUnitContainerV1` framing/digests with unknown event-member
-  removal and absent attachment-field omission, completed-disposition
-  tombstones, backlog, quarantine, mandatory
+  removal and absent attachment-field omission, `completed_no_op` without a
+  processing generation or canonical result, no-op reservation release,
+  completed-disposition tombstones, backlog, quarantine, mandatory
   Processor-outage expiry sweeps, retention expiry, and deletion behavior; and
 - safe logs/traces/metrics, immediate risk paging, mTLS/ACL isolation,
   tenant-scoped references, N/N-1 message compatibility, and absence of raw
