@@ -44,7 +44,7 @@ recoverable handoff behavior.
 
 | Component | Public surface and responsibilities | Must not own |
 | --- | --- | --- |
-| `watchtower-ingest` | Public write-only telemetry routes, protocol admission, pre-acceptance TUS staging records and appendable bytes, raw accepted records, and the recoverable handoff/outbox to processing. | Normalization, enrichment, grouping, control-plane state, analytical queries, or another component's storage. |
+| `watchtower-ingest` | Public telemetry routes and protocol-support methods, including bounded TUS status, protocol admission, pre-acceptance TUS staging records and appendable bytes, raw accepted records, and the recoverable handoff/outbox to processing. | Normalization, enrichment, grouping, control-plane state, analytical queries, or another component's storage. |
 | `watchtower-api` | Native `/api/v1` control-plane and release/artifact commands, every Sentry-compatible management REST route, control-plane and artifact authority, versioned change events, and contract-level audit authority. | Telemetry admission, canonical telemetry processing, analytical storage, or direct query-store access. |
 | `watchtower-processor` | Asynchronous normalization, privacy processing, enrichment, symbolication execution, canonical telemetry, processing state, and derived domain aggregates. | Public business routes, control-plane authority, query serving, job scheduling, or another owner's store. |
 | `watchtower-query` | Native `/api/v1` read/query routes, Prometheus-, Loki-, and Tempo-compatible query routes, read projections, search and analytical indexes, caches, and provider query orchestration. | Canonical, control-plane, or raw writes, and fallback persistence access. |

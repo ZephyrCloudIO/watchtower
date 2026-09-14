@@ -145,11 +145,13 @@ precedence.
 
 Envelope framing is newline-delimited JSON headers followed by item payloads.
 The envelope header is required. An item with `length` uses authoritative
-length-delimited framing; the decoded payload must have exactly that length,
-with only the permitted final newline afterward. Without `length`, the
-permitted newline-delimited framing applies. Malformed framing, invalid
-lengths, trailing bytes, duplicate JSON members, and invalid JSON headers
-reject the entire request.
+length-delimited framing: `length` is the number of framed payload bytes as
+received, before any item `content_encoding` is decoded. The adapter consumes
+exactly that encoded section before decoding it; only the permitted final
+newline may follow. Decoded bytes are then checked against the decoded item and
+aggregate limits. Without `length`, the permitted newline-delimited framing
+applies. Malformed framing, invalid lengths, trailing bytes, duplicate JSON
+members, and invalid JSON headers reject the entire request.
 
 Recognized item `content_encoding` values are only `identity` and `gzip`.
 Nested decoding is incremental and counted against decoded limits. Unknown or
@@ -278,8 +280,9 @@ before acceptance, as required by #16. It never returns
 Durable acceptance and a matching duplicate return the #16 success response:
 HTTP `200`, zero-length body, `X-Request-ID`, and `X-Watchtower-Request-ID`.
 A mixed request returns the same `200` response only when no payload-bearing
-unit is rejected and at least one unit is accepted. A valid standalone no-op
-also returns `200` with the same headers.
+unit is rejected and at least one unit is accepted. A standalone no-op that
+passes its `no_op_admission` reservation and other dependency checks also
+returns `200` with the same headers.
 Envelope `OPTIONS` returns `204`. TUS creation returns `201`; successful TUS
 `HEAD` returns `200`; successful TUS `PATCH` returns `204`; each retains the
 exact #16 TUS headers. A failed TUS `HEAD` is bodyless, and a failed TUS
@@ -524,9 +527,24 @@ and quota rules. Attachment length is checked against decoded or dereferenced
 bytes, never against compressed bytes or the TUS reference JSON.
 
 For retained TUS binding evidence, `attachment_identity_digest` is the
-lowercase SHA-256 of the RFC 8785 canonical encoding of that complete
-attachment identity tuple, including the presence or absence of `filename`.
-It is retained independently of the aggregate `payload_digest`; the TUS
+lowercase SHA-256 of the UTF-8 RFC 8785 canonical encoding of this exact JSON
+preimage:
+
+```text
+{
+  "schema": "watchtower.sentry.attachment-identity.v1",
+  "parent_acceptance_id": canonical_lowercase_uuid_v7,
+  "content_type": accepted_string_or_null,
+  "attachment_type": accepted_string_or_null,
+  "sha256": lowercase_hex_sha256(decoded_or_completed_bytes)
+}
+```
+
+When an accepted `filename` is present, the preimage also includes
+`"filename": "<accepted-filename>"`; when it is absent, the `filename` member
+is omitted entirely. It is never encoded as `null`, an empty string, or a
+default value. RFC 8785 orders the complete object before hashing. The digest
+is retained independently of the aggregate `payload_digest`; the TUS
 attachment identity also retains its validated byte length for binding
 comparison.
 
@@ -860,6 +878,17 @@ staging reservation only after confirmed physical deletion. Late fetches and
 dispositions are rejected as stale. Processor performs its final current-cutoff
 and local-fence check immediately before any canonical or derived commit.
 
+At every effective query-retention alias cutoff, Jobs schedules a project-scoped
+alias-retention cleanup run for Ingest. Ingest idempotently enumerates
+compatibility aliases and retained parent-binding/TUS evidence whose aliases
+are no longer queryable, then removes the alias horizon, canonical reference,
+semantic payload digest, upload ID, attachment identity/digest/length, and any
+usable payload reference. Only the permanent payload-free event-ID fence
+remains. The run is replay-safe; uncertain or failed cleanup remains
+reconcilable and retains the evidence until deletion is confirmed. This sweep
+is separate from raw-cutoff cleanup: it does not release TUS staging capacity,
+which remains governed by raw-cutoff cleanup and confirmed physical deletion.
+
 Recovery is deterministic across each durable boundary:
 
 | Failure point | Recovery rule |
@@ -927,7 +956,8 @@ The verification specification must use synthetic fixtures and prove:
 - concurrent identical event IDs, conflicting decompressed bytes, compressed
   retries, whitespace changes, protocol scope, effective raw-cutoff expiry
   without retry extension, query-retention alias fencing while canonical events remain
-  queryable, permanent payload-free event-ID non-reuse after alias expiry, a
+  queryable, idempotent alias-cutoff cleanup of compatibility and retained TUS
+  evidence, permanent payload-free event-ID non-reuse after alias expiry, a
   bound TUS retry after raw retention but before alias expiry using retained
   upload/attachment-identity evidence, a changed filename or attachment type
   conflict, a client-report-only change that preserves the primary binding,
@@ -958,6 +988,7 @@ The verification specification must use synthetic fixtures and prove:
   client-report acceptance without a raw object, client-report cardinality
   mapping, no-op reservation lifecycle and operating-value validation,
   deterministic multipart minidump digests with retained metadata,
+  versioned attachment-identity preimages with present and absent filenames,
   deterministic `RawUnitContainerV1` framing/digests with unknown event-member
   removal, effective media typing for dereferenced TUS minidumps, and absent
   attachment-field omission, `completed_no_op` without a
@@ -985,8 +1016,8 @@ no-op handoff; error units are atomic; concurrent duplicates reuse one
 acceptance and one charge; conflicts reject content; public event aliases stay
 unique while canonical events are queryable; later attachments obey parent
 authorization, identity, deduplication, and retention rules; TUS staging is
-bounded, retained through delayed cleanup, and released or converted exactly
-once after deletion confirmation; quota, unsafe, and overload
+bounded, retained through delayed cleanup, and released exactly once after
+deletion confirmation; quota, unsafe, and overload
 failures have distinguishable retry behavior; accepted work remains recoverable
 through its retention cutoff; and all handoffs remain versioned,
 protocol-neutral, tenant-scoped, and compatible with the existing fetch,

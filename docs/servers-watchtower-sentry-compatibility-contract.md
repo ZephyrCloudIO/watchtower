@@ -232,7 +232,7 @@ to a native route.
 
 | Route | Methods | Authentication | v1 behavior |
 | --- | --- | --- | --- |
-| `/api/<project_id>/envelope/` | `POST` | Collection-only DSN in `X-Sentry-Auth`, DSN query parameters, or the DSN URL used by the pinned SDK | Supported for an active project for error events, attachments, client reports, and native crash items. Every structurally valid, non-conflicting Envelope returns `200` with an empty response body, including accepted, mixed, empty, unsupported-only, and client-report-only Envelopes; durable acceptance is returned before asynchronous processing/query visibility. An idempotency or digest conflict returns the `409 conflict` response defined below instead of the blanket `200`. Disabled and deleting projects use the lifecycle admission responses below before payload acceptance. A deleted project's pre-deletion DSN is no longer current and returns `401 invalid_authentication` before project lookup. |
+| `/api/<project_id>/envelope/` | `POST` | Collection-only DSN in `X-Sentry-Auth`, DSN query parameters, or the DSN URL used by the pinned SDK | Supported for an active project for error events, attachments, client reports, and native crash items. Every structurally valid, non-conflicting Envelope that passes authorization, lifecycle, quota, capacity, and dependency admission returns `200` with an empty response body, including accepted, mixed, empty, unsupported-only, and client-report-only Envelopes; durable acceptance is returned before asynchronous processing/query visibility. An idempotency or digest conflict returns the `409 conflict` response defined below instead of the blanket `200`; an admission failure returns its applicable quota, capacity, or dependency response. Disabled and deleting projects use the lifecycle admission responses below before payload acceptance. A deleted project's pre-deletion DSN is no longer current and returns `401 invalid_authentication` before project lookup. |
 | `/api/<project_id>/envelope/` | `OPTIONS` | Collection-only DSN in the DSN query parameters or DSN URL, project alias, and request `Origin` | Supported only for a configured project-origin CORS preflight. The DSN authenticates and tenant-binds the project alias before the allowlist is read. Returns `204` with no persistence side effect; missing or invalid DSN authentication receives `401 invalid_authentication`, while a missing, malformed, or disallowed origin, including a project with no configured allowlist, receives `403 permission_denied` with no CORS allow headers. |
 | `/api/<project_id>/store/` | `POST` | Collection-only DSN | Supported legacy JSON error path required by a pinned client. The body is converted to one error event and follows Envelope admission semantics. Malformed JSON, an invalid body shape, or invalid required event fields return `400 invalid_envelope` with no acceptance side effect. Successful admission returns `200` with a zero-length body and request-ID headers. |
 | `/api/<project_id>/minidump/` | `POST` | Collection-only DSN | Supported for pinned crash workflows whose fixture specifies the non-Envelope minidump path. `multipart/form-data` and the pinned client field names are accepted. Successful admission returns `200` with a zero-length body and request-ID headers. |
@@ -1876,10 +1876,13 @@ same result applies when either repeated filter exceeds its limit.
 
 An Envelope is newline-delimited JSON headers followed by items. The envelope
 header is required, and each item uses either length-delimited or
-newline-delimited framing. When `length` is present it is authoritative,
-payload bytes must match the declared length, and trailing bytes other than the
-permitted final newline are invalid. When `length` is omitted, the item payload
-uses the permitted newline-delimited framing. When a supported error event item
+newline-delimited framing. When `length` is present it is authoritative: the
+framed payload bytes as received, before any item `content_encoding` decoding,
+must match the declared length. The adapter consumes that exact encoded section
+before decoding it, and trailing bytes other than the permitted final newline
+are invalid. Decoded bytes are checked separately against the decoded item and
+aggregate limits. When `length` is omitted, the item payload uses the permitted
+newline-delimited framing. When a supported error event item
 is present, the envelope's `event_id`, when present, must match that item. If no
 supported error event item is present, a present envelope `event_id` is still
 syntax- and DSN-validated but is not required to match an excluded item and is
@@ -1978,11 +1981,18 @@ not change the attachment's correlated parent or its request-atomic admission
 outcome.
 The envelope-level ID is the scoped external ID of an already accepted parent;
 the attachment item carries no parent or event-ID field. This shape is a
-payload-bearing later-attachment unit, not an attachment-only no-op. The
-parent must be in the same tenant and project, remain authorized and within
-its effective raw-retention cutoff, and be resolved before attachment identity,
-quota, and acceptance are committed. A TUS reference uses the same shape and
-binds the completed project-bound upload to that parent. An attachment-only
+payload-bearing later-attachment unit, not an attachment-only no-op. For a new
+attachment binding, the parent must be in the same tenant and
+project, remain authorized and within its effective raw-retention cutoff, and
+be resolved before attachment identity,
+quota, and acceptance are committed. An exact retry of a previously bound TUS
+reference is checked against retained binding evidence first; while the
+query-retention alias remains live, a matching scoped parent/event identity,
+upload ID, attachment identity digest, attachment digest, length, and original
+acceptance returns the original result even after the parent raw cutoff. It
+does not create a new binding or require live raw parent state, but lifecycle,
+deletion, tenant, and project fences still apply. A TUS reference uses the same
+shape and binds the completed project-bound upload to that parent. An attachment-only
 Envelope that lacks this exact correlation shape remains the documented
 bounded no-op.
 
@@ -2091,12 +2101,14 @@ management schemas remain the explicit exception.
 
 ### Acknowledgement, errors, retries, and idempotency
 
-- Every structurally valid, non-conflicting Envelope `POST`, whether it retains
-  supported items or is an empty/unsupported-only/client-report-only no-op, returns HTTP `200`
-  with a zero-length response body. Request IDs remain response headers, and
-  no `202` or `204` success is used for Envelope admission. A validated
-  idempotency or digest conflict instead returns the standard `409 conflict`
-  body and no new acceptance side effect.
+- After authorization, lifecycle, quota, capacity, and dependency admission
+  succeeds, every structurally valid, non-conflicting Envelope `POST`, whether
+  it retains supported items or is an empty/unsupported-only/client-report-only
+  no-op, returns HTTP `200` with a zero-length response body. Request IDs remain
+  response headers, and no `202` or `204` success is used for Envelope
+  admission. A validated idempotency or digest conflict instead returns the
+  standard `409 conflict` body and no new acceptance side effect; an admission
+  failure returns its applicable quota, capacity, or dependency response.
 - Successful legacy `store` and `minidump` `POST`s use the same `200`-
   empty-body acknowledgement and request-ID headers, including an idempotent
   retry of an already accepted submission.
@@ -3247,8 +3259,9 @@ exercise:
   supported-only, mixed, and correlated later-attachment Envelopes, including
   correlated later attachments with auxiliary client reports,
   unassociated-attachment exclusion, and an envelope-level event ID on an
-  excluded-only Envelope, all expecting the applicable `200`
-  with a zero-length response body, plus malformed, non-canonical, and duplicate
+  excluded-only Envelope, all expecting the applicable `200` after successful
+  admission with a zero-length response body, while exhausted or unavailable
+  no-op capacity expects `429` or `503`; plus malformed, non-canonical, and duplicate
   `X-Request-ID` headers returning `400 invalid_request` before lookup or
   mutation, plus eventless empty/client-report retries with the same client
   `X-Request-ID`, different client IDs, and no client ID;
@@ -3259,8 +3272,9 @@ exercise:
   changed unit-key conflict handling, and the aggregate 1,024-record limit;
   conflicting event/request digests expect the standard `409 conflict` body
   and no new acceptance side effect;
-- nested identity/gzip item payloads at and over the decoded 20,000,000-byte
-  item and 50,000,000-byte aggregate limits, with no partial persistence, plus
+- nested identity/gzip item payloads whose encoded framed lengths differ from
+  decoded sizes, at and over the decoded 20,000,000-byte item and 50,000,000-byte
+  aggregate limits, with no partial persistence, plus
   unknown Envelope-header values at and over the global 16-level JSON nesting
   bound, including ignored over-depth values returning `400 invalid_envelope`
   without acceptance, management JSON and deeply nested deployment metadata at
