@@ -44,7 +44,7 @@ recoverable handoff behavior.
 
 | Component | Public surface and responsibilities | Must not own |
 | --- | --- | --- |
-| `watchtower-ingest` | Public write-only telemetry routes, protocol admission, raw accepted records, and the recoverable handoff/outbox to processing. | Normalization, enrichment, grouping, control-plane state, analytical queries, or another component's storage. |
+| `watchtower-ingest` | Public write-only telemetry routes, protocol admission, pre-acceptance TUS staging records and appendable bytes, raw accepted records, and the recoverable handoff/outbox to processing. | Normalization, enrichment, grouping, control-plane state, analytical queries, or another component's storage. |
 | `watchtower-api` | Native `/api/v1` control-plane and release/artifact commands, every Sentry-compatible management REST route, control-plane and artifact authority, versioned change events, and contract-level audit authority. | Telemetry admission, canonical telemetry processing, analytical storage, or direct query-store access. |
 | `watchtower-processor` | Asynchronous normalization, privacy processing, enrichment, symbolication execution, canonical telemetry, processing state, and derived domain aggregates. | Public business routes, control-plane authority, query serving, job scheduling, or another owner's store. |
 | `watchtower-query` | Native `/api/v1` read/query routes, Prometheus-, Loki-, and Tempo-compatible query routes, read projections, search and analytical indexes, caches, and provider query orchestration. | Canonical, control-plane, or raw writes, and fallback persistence access. |
@@ -64,7 +64,7 @@ They have no public business routes.
 
 | Component | Authoritative state, owned projection, or cache |
 | --- | --- |
-| Ingest | Raw accepted records, recoverable processing handoff/outbox, and local projections of API-published security or control changes. |
+| Ingest | TUS staging records, appendable staging bytes, staging reservations and lifecycle fences, raw accepted records, recoverable processing handoff/outbox, and local projections of API-published security or control changes. |
 | API | Control-plane state, artifact authority, versioned change events describing those authoritative changes, the append-only contract-level audit event boundary, and restore-independent audit, export-hold/expiry, completed-export source-eligibility, authorization-revocation, and active-project lifecycle registry state. |
 | Processor | Canonical telemetry, processing state, and derived domain aggregates. |
 | Query | Query-owned read projections, search and analytical indexes, PostgreSQL export metadata including `snapshot_generation`, caches, and provider query orchestration state. |
@@ -81,7 +81,7 @@ unavailable or older than the 60-second maximum freshness established by
 
 | Component | Independent scaling boundary | Failure behavior and customer-visible owner |
 | --- | --- | --- |
-| Ingest | Protocol admission, raw-record writes, and recoverable handoff capacity. | Ingest owns admission outcomes and stops successful admission when safe capacity is exhausted; accepted raw records and handoffs remain recoverable. |
+| Ingest | Protocol admission, TUS staging and cleanup capacity, raw-record writes, and recoverable handoff capacity. | Ingest owns admission outcomes and stops successful admission when safe capacity is exhausted; staging state, accepted raw records, and handoffs remain recoverable. |
 | API | Control-plane, artifact, release, and Sentry management request load. | API owns control mutations and management compatibility responses; API failure does not stop valid Ingest admission or Query reads while their security projections remain fresh. |
 | Processor | Asynchronous normalization, privacy, enrichment, symbolication, and aggregate processing backlog. | Processor owns processing lag and recovery; failure preserves durable handoff work and does not create public business routes or direct storage fallbacks. |
 | Query | Native and compatible read load, projection consumption, indexes, and caches. | Query owns query results and projection freshness; Query failure stops query routes and Sentry management reads. Ordinary API-owned mutations continue, but mutations that require a synchronous durable fence or acknowledgement from an affected public owner fail closed while that owner is unavailable. |
@@ -379,6 +379,17 @@ The exact acceptance-unit, quota-reservation, duplicate, exclusion, and public
 response rules are owned by the ingestion contract; this boundary continues to
 own component ownership and failure isolation.
 
+TUS creation, append, binding, expiry, and cleanup remain Ingest-owned
+pre-acceptance state. Ingest stores the appendable bytes and staging record in
+its assigned storage boundary, reserves project staging capacity before a
+staging write, and retains that reservation through binding or logical expiry
+until physical deletion is confirmed. Ingest recovery reconciles the staging
+record, staged bytes, reservation, and lifecycle fence conservatively; an
+uncertain or unavailable side remains reserved and inaccessible. Binding may
+create the final attachment charge, but it never transfers or releases staging
+capacity while staging state remains. No other component reads pre-binding
+staging storage directly.
+
 Processor owns asynchronous normalization, privacy processing, enrichment,
 symbolication execution, canonical telemetry, processing state, derived
 aggregates, and the persisted contribution deadlines used to enforce derived
@@ -398,7 +409,8 @@ idempotently and publishes the outcome; Jobs never writes domain-owned storage.
 Diagnostic and recovery ownership follows data ownership:
 
 - The L7 layer owns route selection and edge diagnostics.
-- Ingest owns admission, raw records, handoffs, outboxes, and their recovery.
+- Ingest owns admission, TUS staging records and bytes, staging reservations and
+  lifecycle fences, raw records, handoffs, outboxes, and their recovery.
 - API owns control-plane and artifact authority and its change publication.
 - Processor owns canonical processing and derived aggregate recovery.
 - Query owns projection, index, cache, and provider-query recovery from
@@ -1314,6 +1326,10 @@ become runtime acceptance criteria for the owning implementation issues:
    handoff records, the authenticated `RawPayloadFetchV1` path when a bounded
    payload is insufficient, Processor, its `RawHandoffDispositionV1` completion
    path back to Ingest, Query projection, and visible query results.
+   For a TUS-backed attachment, create and append staging bytes across a
+   request boundary, bind them, restore Ingest before cleanup, and verify that
+   the staging record and bytes remain Ingest-owned and capacity is released
+   only after confirmed deletion.
 2. Stop Processor delivery before and after Ingest acknowledgement; accepted
    data remains recoverable until a matching terminal disposition or the
    Ingest-authoritative project-scoped `RawRetentionExpiryV1` sweep durably

@@ -101,6 +101,7 @@ canonical telemetry.
 | Data class | Writer and authority | Storage boundary | Lifecycle |
 | --- | --- | --- | --- |
 | Raw accepted records and attachments | Ingest; authoritative for raw acceptance units under the [ingestion contract](servers-watchtower-ingestion-contract.md) | Encrypted immutable S3 objects plus Ingest PostgreSQL acceptance metadata and outbox state | Seven days from `accepted_at` by default; a project policy may shorten this cutoff but never extend it, and raw state may remain only until Processor durably confirms handoff completion or Ingest durably records class-default or shortened-policy expiry within that cutoff; never customer-downloadable |
+| TUS staging records and appendable bytes | Ingest; authoritative for pre-acceptance upload lifecycle, append state, binding, staging reservations, and deletion fences | Ingest-owned encrypted mutable S3 staging objects or multipart uploads plus Ingest PostgreSQL staging metadata, reservation state, and lifecycle-fence evidence | Pending and `complete-unbound` uploads retain their declared slot and bytes through the fixed 24-hour lifetime; binding creates the final attachment charge but does not release staging capacity; logical expiry blocks access, and confirmed physical deletion releases the staging reservation exactly once; never customer-, Processor-, or Query-readable |
 | Normalized records | Processor; authoritative only as processing input | Processor-owned encrypted S3 replay-batch prefix, with separate class metadata | Retained as needed for replay; when raw may retire after a successful handoff, a verified normalized representation has a retention floor through the applicable raw-retention cutoff even if a class policy is shorter, and is never retained longer than 90 days |
 | Enriched records | Processor; authoritative only as processing input | Processor-owned encrypted S3 replay-batch prefix, with separate class metadata | Retained only as needed for replay, no longer than 90 days |
 | Canonical telemetry | Processor; authoritative for the four signal histories | Four independent ClickHouse canonical table families | Immutable history for 90 days from `accepted_at` |
@@ -156,7 +157,7 @@ access to another component's storage are prohibited.
 
 | Component | Owned storage and writes |
 | --- | --- |
-| Ingest | Encrypted immutable raw S3 objects, PostgreSQL acceptance metadata, and the transactional processing outbox. |
+| Ingest | Encrypted mutable TUS staging objects or multipart uploads, PostgreSQL TUS staging metadata/reservation/fence state, encrypted immutable raw S3 objects, PostgreSQL acceptance metadata, and the transactional processing outbox. |
 | Processor | The four immutable canonical ClickHouse histories, encrypted project-scoped non-authoritative replay batches, PostgreSQL processing state, and mutable derived aggregates. |
 | Query | Independently owned ClickHouse read projections, Query-owned PostgreSQL export metadata, encrypted non-authoritative cache, and encrypted project-scoped S3 export prefix. |
 | API | Authoritative control-plane and audit state in its own PostgreSQL boundary, plus encrypted immutable S3 control-registry prefixes for restore-independent retention policies, deletion tombstones, API restore audit intents, the API audit journal, export holds, and captured export snapshot payloads. |
@@ -180,6 +181,19 @@ metadata, and recoverable handoff remain until Processor durably confirms
 completion through the versioned `RawHandoffDispositionV1` message or Ingest
 durably records a class-default or shortened-policy expiry fence through
 `RawRetentionExpiryV1`.
+
+TUS staging is a separate Ingest-owned boundary from accepted raw state. The
+staging record is authoritative for the project and upload identity, declared
+length, current offset, lifecycle status, expiry, binding evidence, staging
+reservation, and deletion fence; its appendable bytes remain in the matching
+encrypted S3 staging object or multipart upload. Creation and each append are
+recoverable from these Ingest-owned boundaries without creating an accepted raw
+record or a Processor handoff. After a restore, Ingest reconciles staging
+metadata with the staged object or multipart state, retains the reservation and
+blocks access when either side is uncertain, and releases capacity only after
+confirmed physical deletion. Processor receives bytes only through the normal
+post-acceptance owner-mediated handoff and never reads the staging prefix.
+
 For a `completed` disposition, Processor commits the verified normalized replay
 representation before sending the disposition, so Ingest may retire raw state
 immediately without losing the reprocessing source. Ingest retries and
@@ -1475,7 +1489,11 @@ The owning implementation contracts must make these scenarios testable:
    `RawHandoffExpiryFenceV1` delivery, and Processor's final cutoff/fence check
    before canonical commit and publication, and
    generation-aware reconciliation of each completed handoff to a promoted
-   canonical default or durable terminal disposition before raw retirement.
+   canonical default or durable terminal disposition before raw retirement;
+   create, append, bind, expire, restore, and clean up positive-length TUS
+   staging and verify that its Ingest-owned S3/PostgreSQL boundaries retain
+   capacity through uncertainty and release it exactly once after confirmed
+   deletion.
 4. Rebuild eligible canonical and derived Query projections through an
    authorized, durably acknowledged Query-to-Processor `ProjectionRebuildV1`
    request and Processor republishing without direct Processor storage access;

@@ -1966,8 +1966,9 @@ its accepted event or its resolved existing parent.
 A later-attachment Envelope has a valid normalized envelope-level `event_id`,
 exactly one `attachment` item, zero or more `client_report` items, no `event`
 item, and no other supported item. The `client_report` items are auxiliary
-bounded units; they do not change the attachment's correlated parent or its
-request-atomic admission outcome.
+bounded units, with one bounded client-report admission unit per item; they do
+not change the attachment's correlated parent or its request-atomic admission
+outcome.
 The envelope-level ID is the scoped external ID of an already accepted parent;
 the attachment item carries no parent or event-ID field. This shape is a
 payload-bearing later-attachment unit, not an attachment-only no-op. The
@@ -2227,6 +2228,14 @@ tie-breaker.
   `event: null`, an empty attachment array, and an empty client-report array.
   A client-report-only Envelope uses `event: null`, an empty attachment array,
   and its canonical client-report records.
+
+  For admission accounting, each normalized `client_report` item also retains
+  its item boundary. Its `client_report_item_digest` is the lowercase
+  hexadecimal SHA-256 of the RFC 8785 canonical JSON bytes for that item's
+  normalized `{ "discarded_events": [...] }` object. Its zero-based
+  `client_report_occurrence` is assigned among equal item digests after the
+  item digests are sorted, so reordered items and duplicate items have stable,
+  distinct unit keys.
 - A retained supported event submission uses the #17 raw admission identity:
   `(tenant_id, project_id, source_protocol, external_event_id,
   admission_generation, admission_content_digest)`. Its minimal duplicate and
@@ -2268,6 +2277,12 @@ tie-breaker.
   new no-op/client-report submission. If no client `X-Request-ID` was supplied,
   the generated response request ID is diagnostic only and each retry is a new
   accepted submission; identical payloads are never collapsed by content alone.
+  Each `client_report` item extends this identity for its own reservation and
+  handoff with `unit_kind=client_report`, its `client_report_item_digest`, and
+  its `client_report_occurrence`. A retry must reproduce the complete set of
+  item unit keys; a missing, extra, or changed key under the same request
+  identity is `409 conflict` rather than a partial duplicate. An empty or
+  unsupported-only no-op uses `unit_kind=no_op` instead.
 - Creation, deletion, rotation, release finalization, chunk assembly, and
   deployment writes use the control-plane idempotency tuple. Project creation,
   project deletion, DSN mutation, and release-file deletion reject a missing
@@ -3170,7 +3185,8 @@ exercise:
   the 24-hour pending and complete-unbound lifetimes, no extension by append,
   project-scoped staging byte/count exhaustion, reservation retention through
   delayed physical cleanup, deletion-confirmed idempotent release, and
-  conversion on binding,
+  final attachment charging on binding while retaining the separate
+  `tus_staging` reservation until confirmed physical deletion,
   and exact `now >= expires_at` behavior,
   failed-`HEAD` status/header-only responses with `Content-Length: 0`, the
   exact closed `{url,path}` reference object and relative-path validation,
@@ -3193,7 +3209,9 @@ exercise:
   `X-Request-ID`, different client IDs, and no client ID;
   client reports also cover the exact `discarded_events` shape, token and
   quantity boundaries, duplicate-record digest handling, unknown members,
-  multiple `client_report` items, and the aggregate 1,024-record limit;
+  multiple `client_report` items, distinct per-item reservation keys,
+  reordered and duplicate-item retry stability, changed unit-key conflict
+  handling, and the aggregate 1,024-record limit;
   conflicting event/request digests expect the standard `409 conflict` body
   and no new acceptance side effect;
 - nested identity/gzip item payloads at and over the decoded 20,000,000-byte

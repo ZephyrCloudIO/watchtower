@@ -368,8 +368,9 @@ An acceptance unit is the smallest atomic raw-acceptance transaction:
    error event plus its `event.minidump` attachment.
 3. A later-attachment unit is one new attachment associated with an already
    accepted parent.
-4. A bounded client report or no-op unit contains diagnostic metadata only and
-   never creates an error event or attachment payload.
+4. Each `client_report` item is one bounded client-report unit, and a no-op
+   unit contains diagnostic metadata only; neither creates an error event or
+   attachment payload.
 
 An invalid unit never accepts one of its constituent items. Across separate
 initial-event, native-crash, TUS-binding, later-attachment, and bounded no-op
@@ -717,6 +718,17 @@ handoff/outbox, or retry tombstone remains live. Terminal handoff plus expiry
 and confirmed physical cleanup release it exactly once; delayed or failed
 cleanup continues to consume the project count budget. Rate capacity expires
 at the configured window and is reconciled by the same reservation identity.
+
+For each client-report unit, the reservation and handoff identity additionally
+includes `unit_kind=client_report`, the canonical `client_report_item_digest`,
+and its zero-based occurrence among equal item digests in canonical item order.
+This keeps multiple and duplicate client-report items distinct while making
+reordered retries resolve to the same units. A standalone empty or
+unsupported-only unit uses `unit_kind=no_op`; a durable retry must match the
+complete set of unit keys or it returns `409 conflict` without a new
+reservation. These per-unit identities apply equally to client reports that
+are auxiliary to an accepted event or correlated later attachment.
+
 Exhausted no-op count or rate capacity returns `429 rate_limited`; an absent,
 stale, or unsafe no-op policy returns `503 unavailable`. No-op admission
 reservations are separate from error-quantity and final attachment-byte
@@ -876,6 +888,8 @@ The verification specification must use synthetic fixtures and prove:
   no-op retries with the same semantic digest, and changed-digest `409`
   conflicts; duplicate reservation reuse, delayed-cleanup reservation retention,
   deletion-confirmed release of retained staging capacity, quota exhaustion,
+  distinct client-report item reservations, stable reordered and duplicate-item
+  retries, and changed per-unit-key conflicts,
   environment registration/retirement/reactivation races, unsafe enforcement,
   service overload, and bounded Retry-After behavior;
 - failures before and after S3 verification, PostgreSQL/outbox commit, MSK
