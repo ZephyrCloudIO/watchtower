@@ -266,18 +266,22 @@ never reused. The reconciler then idempotently commits the staged row to
 ClickHouse using the partition and sequence identity. After verifying the same
 digest, it marks the staging record `clickhouse_committed`; only that state is
 eligible for durable outbox publication. Processor performs the current-cutoff
-check before committing the row. If that check fails before commit, the
-reconciler marks the staged write retention-expired and, after proving that no
-authoritative row exists, publishes an idempotent no-row
+check before committing the row, treating a matching owner-recorded
+`RawHandoffCompletionClaimV1` granted while the handoff was eligible as
+continued eligibility. If that check fails before commit without a winning
+claim, the reconciler marks the staged write retention-expired and, after
+proving that no authoritative row exists, publishes an idempotent no-row
 `CanonicalChangeSkipV1` marker for the reserved sequence through the same
 canonical-change path. If ClickHouse committed the row while it was still
 within its cutoff and publication then failed, recovery verifies its digest,
 retains the row, marks the staging record `clickhouse_committed`, and publishes
 the actual canonical change. If the current cutoff arrives after ClickHouse
-commits the row but before publication, recovery marks the staging record
-retention-expired, removes the authoritative row, verifies its absence, and
-publishes the idempotent no-row `CanonicalChangeSkipV1` marker. It never
-publishes a skip while the row exists or publishes an expired row. A skip after
+commits the row but before publication, recovery retains and publishes the row
+when a matching winning claim was granted while the handoff was eligible;
+without that claim, it marks the staging record retention-expired, removes the
+authoritative row, verifies its absence, and publishes the idempotent no-row
+`CanonicalChangeSkipV1` marker. It never publishes a skip while the row exists
+or publishes an expired row. A skip after
 a reconciliation attempt is valid only after the row is durably removed and
 its absence is verified. The marker carries the partition, sequence, retention
 cutoff, expiry basis, marker integrity digest, and idempotency context; Query
@@ -884,13 +888,15 @@ state and published-contiguous watermark. It does not require a successful
 Query projection acknowledgement before initial publication, but a missing
 local confirmation is reconciled through `CanonicalPublicationReconcileV1`
 before an expired intent can become a skip. Promotion also performs the
-current-cutoff and row-existence check and updates the mapping only after every
-candidate row has publication confirmation and the full range succeeds. A
-partial or failed range, an unconfirmed publication, or a failed final
-eligibility check never becomes the default and the prior default result remains
-active; recovery either completes publication and promotion or removes the
-candidate and emits the appropriate skip without leaving a mapping to an
-unavailable generation.
+current-cutoff and row-existence check, treating a matching owner-recorded
+`RawHandoffCompletionClaimV1` granted while the handoff was eligible as
+continued eligibility after the wall-clock cutoff. It updates the mapping only
+after every candidate row has publication confirmation and the full range
+succeeds. A partial or failed range, an unconfirmed publication, or a failed
+final eligibility or row-existence check never becomes the default and the
+prior default result remains active; recovery either completes publication and
+promotion or removes the candidate and emits the appropriate skip without
+leaving a mapping to an unavailable generation.
 Derived aggregate computation and publication use only rows selected by the
 authoritative default-generation mapping; candidate generations are excluded
 until promotion.
@@ -1489,9 +1495,12 @@ The owning implementation contracts must make these scenarios testable:
    including Processor canonical staging before and after ClickHouse commit and
    outbox publication, with no duplicate or conflicting sequence; verify a row
    committed while still within its cutoff but delayed by publication is
-   reconciled and published as a row, while a cutoff reached after ClickHouse
-   commit but before publication removes the row, verifies its absence, and
-   publishes the idempotent `CanonicalChangeSkipV1` marker. An absent row alone
+   reconciled and published as a row, and verify that a winning completion
+   claim granted while eligible preserves a row and its publication when the
+   cutoff arrives before publication or promotion. For an unclaimed row, a
+   cutoff reached after ClickHouse commit but before publication removes the
+   row, verifies its absence, and publishes the idempotent
+   `CanonicalChangeSkipV1` marker. An absent row alone
    may produce that marker through the full canonical replay horizon, so
    a Query outage longer than the seven-day MSK window cannot leave an
    available-watermark gap blocking later changes. Restore Processor from a
@@ -1501,7 +1510,8 @@ The owning implementation contracts must make these scenarios testable:
    readiness or any new reservation, and leave Processor unready for missing,
    truncated, or conflicting baseline or per-reservation intent evidence; for
    each unresolved intent, publish its retained candidate only while it remains
-   before the cutoff, and otherwise reconcile Query's durable
+   before the cutoff unless a matching winning completion claim granted while
+   eligible preserves its eligibility, and otherwise reconcile Query's durable
    `CanonicalPublicationReconcileV1` outcome before readiness: a matching
    applied row or skip must terminalize the intent without a replacement skip,
    while only an explicit absent outcome plus verified row absence may publish
