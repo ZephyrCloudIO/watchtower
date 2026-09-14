@@ -1737,7 +1737,12 @@ new public generation while the older canonical event's alias remains
 queryable; the compatibility record remains authoritative until the
 query-retention alias fence expires. The Ingest admission tombstone retains the
 non-payload digest and identity through the raw fence even if raw state has
-already retired.
+already retired. For a multipart minidump, the compatibility record retains
+the same `minidump_digest` as its `alias_horizon_digest` through that alias
+fence. A matching retry compares that retained digest and returns the original
+acceptance; a changed dump, normalized annotation, or normalized Sentry
+metadata returns `409 conflict`. Multipart framing, part ordering, and
+transport compression remain excluded by the `minidump_digest` preimage.
 
 ### Explicit limits
 
@@ -2003,8 +2008,8 @@ below and are not included in the digest. Missing required members, wrong
 types, empty arrays or tokens, invalid token grammar, quantities outside the
 range, an item record count over 1,024, or an Envelope aggregate over 1,024
 rejects the entire Envelope with `400 invalid_envelope` before acceptance.
-Duplicate records are retained and sorted by canonical JSON for digest
-construction; they are not merged.
+Duplicate records are retained and sorted by canonical JSON for both envelope
+and per-item digest construction; they are not merged.
 
 The adapter counts `event` item headers before accepting or normalizing any item
 payload. An Envelope containing a second `event` item is rejected in its
@@ -2255,13 +2260,20 @@ tie-breaker.
   a matching alias retry when auxiliary reports are added, removed, or
   changed; a primary or attachment change remains `409 conflict`.
 
+  For a multipart minidump, `alias_horizon_digest` is the retained
+  `minidump_digest` defined in the minidump admission section above. Its exact
+  multipart preimage is authoritative for the alias comparison; no
+  `normalized_event_object` or initial-attachment mapping is inferred for that
+  transport.
+
   For admission accounting, each normalized `client_report` item also retains
   its item boundary. Its `client_report_item_digest` is the lowercase
   hexadecimal SHA-256 of the RFC 8785 canonical JSON bytes for that item's
-  normalized `{ "discarded_events": [...] }` object. Its zero-based
+  normalized `{ "discarded_events": [...] }` object after its records are
+  sorted by canonical JSON, with duplicate records retained. Its zero-based
   `client_report_occurrence` is assigned among equal item digests after the
-  item digests are sorted, so reordered items and duplicate items have stable,
-  distinct unit keys.
+  item digests are sorted, so reordered records, reordered items, and duplicate
+  items have stable, distinct unit keys.
 - A retained supported event submission uses the #17 raw admission identity:
   `(tenant_id, project_id, source_protocol, external_event_id,
   admission_generation, admission_content_digest)`. Its minimal duplicate and
@@ -3188,8 +3200,9 @@ exercise:
   cross-transport event-ID compatibility with Envelope/store ingestion,
   deterministic `minidump_digest` equality across multipart boundary and part
   ordering changes, metadata/dump changes returning `409`, effective-cutoff
-  raw-admission duplicate/conflict behavior, and alias retention preventing a
-  new public generation while the canonical event remains queryable;
+  raw-admission duplicate/conflict behavior, post-raw-fence alias retries using
+  the retained `minidump_digest`, and alias retention preventing a new public
+  generation while the canonical event remains queryable;
 - `sdk.native.crash` using the exact multipart minidump request and
   `sdk.native.tus-minidump` using the separate TUS creation/append and Envelope
   `attachment-ref` binding workflow;
@@ -3238,10 +3251,10 @@ exercise:
   mutation, plus eventless empty/client-report retries with the same client
   `X-Request-ID`, different client IDs, and no client ID;
   client reports also cover the exact `discarded_events` shape, token and
-  quantity boundaries, duplicate-record digest handling, unknown members,
-  multiple `client_report` items, distinct per-item reservation keys,
-  reordered and duplicate-item retry stability, changed unit-key conflict
-  handling, and the aggregate 1,024-record limit;
+  quantity boundaries, canonical record ordering within each item, duplicate
+  record retention, unknown members, multiple `client_report` items, distinct
+  per-item reservation keys, reordered and duplicate-item retry stability,
+  changed unit-key conflict handling, and the aggregate 1,024-record limit;
   conflicting event/request digests expect the standard `409 conflict` body
   and no new acceptance side effect;
 - nested identity/gzip item payloads at and over the decoded 20,000,000-byte
